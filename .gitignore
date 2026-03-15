@@ -1,4 +1,7 @@
 docs/site/
+data/mp_20/*.pt
+data/mp_20/*.json
+data/mp_20/*.csv
 
 # test cache
 manual_test/
