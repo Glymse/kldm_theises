@@ -1,11 +1,9 @@
 from __future__ import annotations
 
-from pathlib import Path
-
 import typer
 
 from kldm.data import CSPDataModule, DeNovoDataModule
-from kldm.model import Model
+from kldm.model import ModelKLDM as Model
 
 #uv run train.py --mode csp
 
@@ -15,15 +13,9 @@ def _get_batch(mode: str):
 
     if normalized_mode in {"denovo", "dng"}:
         datamodule = DeNovoDataModule(
-            transform=None,
-            train_path=Path("data/mp_20/train.pt"),
-            val_path=Path("data/mp_20/val.pt"),
-            test_path=Path("data/mp_20/test.pt"),
-            train_batch_size=32,
-            val_batch_size=64,
-            test_batch_size=64,
-            num_workers=0,
-            pin_memory=False,
+            "data/mp_20/train.pt",
+            "data/mp_20/val.pt",
+            batch_size=32,
         )
         return next(iter(datamodule.train_dataloader()))
 
@@ -32,9 +24,6 @@ def _get_batch(mode: str):
             formulas=["SiO2", "LiFePO4", "NaCl"],
             batch_size=8,
             n_samples_per_formula=4,
-            transform=None,
-            num_workers=0,
-            pin_memory=False,
         )
         return next(iter(datamodule.predict_dataloader()))
 

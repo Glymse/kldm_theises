@@ -106,12 +106,10 @@ class ModelKLDM(nn.Module):
         #return (v_t, f_t, l_t), (target_v, target_l)
 
 
-    def loss_from_targets(self, targets: dict[str, Any]) -> torch.Tensor:
-        return F.mse_loss(targets["pred_noise"], targets["noise"])
 
 
 if __name__ == "__main__":
-    model = Model()
+    model = ModelKLDM()
     dummy = Data(pos=torch.randn(8, 3), h=torch.randint(1, 10, (8,)))
     targets = model.training_targets(initial_sample=dummy, task="dng", timestep=42)
     print({k: tuple(v.shape) if hasattr(v, "shape") else v for k, v in targets.items() if k in {"x_t", "noise", "pred_noise", "timestep", "task_ids"}})
