@@ -6,7 +6,7 @@ import torch
 from torch.utils.data import Dataset
 
 from kldm.data import MyDataset
-from kldm.data.data import preprocess_csv
+from kldm.data import preprocess_csv
 from kldm.data.utils import read_json
 
 
