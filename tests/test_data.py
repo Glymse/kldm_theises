@@ -5,9 +5,7 @@ import pytest
 import torch
 from torch.utils.data import Dataset
 
-from kldm.data import MyDataset
-from kldm.data import preprocess_csv
-from kldm.data.utils import read_json
+from kldm.data import StoredCrystalDataset, preprocess_csv
 
 
 def test_my_dataset():
@@ -16,7 +14,7 @@ def test_my_dataset():
     if not split_path.exists():
         pytest.skip("Processed split not found: data/mp_20/train.pt")
 
-    dataset = MyDataset(split_path)
+    dataset = StoredCrystalDataset(split_path)
     assert isinstance(dataset, Dataset)
 
 
@@ -26,7 +24,7 @@ def test_my_dataset_loads_processed_split_shapes():
     if not split_path.exists():
         pytest.skip("Processed split not found: data/processed/mp_20/train.pt")
 
-    dataset = MyDataset(split_path)
+    dataset = StoredCrystalDataset(split_path)
     assert len(dataset) > 0
 
     sample = dataset[0]
@@ -44,7 +42,7 @@ def test_my_dataset_loads_processed_split_shapes():
 
 
 def test_preprocess_csv_smoke(tmp_path: Path):
-    """Smoke test preprocessing on a tiny subset and verify artifacts."""
+    """Smoke test preprocessing on a tiny subset and verify `.pt` output."""
     source_csv = Path("data/mp_20/train.csv")
     if not source_csv.exists():
         pytest.skip("Source MP-20 CSV not found: data/mp_20/train.csv")
@@ -64,19 +62,13 @@ def test_preprocess_csv_smoke(tmp_path: Path):
         csv_folder=input_dir,
         output_folder=output_dir,
         splits=("train",),
-        fmt="numpy",
         max_atoms=40,
     )
 
     split_pt = output_dir / "train.pt"
-    split_stats = output_dir / "train_loc_scale.json"
 
     assert split_pt.exists()
-    assert split_stats.exists()
 
     data_list = torch.load(split_pt, map_location="cpu", weights_only=False)
     assert isinstance(data_list, list)
     assert len(data_list) > 0
-
-    stats = read_json(split_stats)
-    assert isinstance(stats, dict)

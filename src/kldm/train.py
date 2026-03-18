@@ -1,8 +1,8 @@
 from kldm.model import Model
-from kldm.data import MyDataset
+from kldm.data import DNGTask
 
 def train():
-    dataset = MyDataset("data/mp_20/train.pt")
+    dataset = DNGTask().fit_dataset("data/mp_20/train.pt")
     model = Model()
     # add rest of your training code here
 

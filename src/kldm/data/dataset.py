@@ -1,74 +1,136 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Callable, Optional
+from pathlib import Path
+from typing import Callable, Sequence
 
+import numpy as np
 import torch
 from torch.utils.data import Dataset as TorchDataset
 from torch_geometric.data import Batch, Data
 
 
-class Dataset(TorchDataset, ABC):
-    """Abstract KLDM-ready graph dataset.
+Transform = Callable[[Data], Data] | None
 
-    Concrete datasets should only define how a raw sample is created.
-    The base class adds the graph fields needed by KLDM-style diffusion:
-    - `edge_node_index`
-    - `l`
-    """
 
-    def __init__(
-        self,
-        transform: Optional[Callable[[Data], Data]] = None,
-        default_lattice: Optional[torch.Tensor] = None,
-    ) -> None:
+def _to_crystal_data(sample: Data | dict) -> Data:
+    if isinstance(sample, Data):
+        return sample.clone()
+    return Data(
+        pos=torch.as_tensor(sample["pos"], dtype=torch.float32),
+        h=torch.as_tensor(sample["h"], dtype=torch.long),
+        lengths=torch.as_tensor(sample["lengths"], dtype=torch.float32).view(1, -1),
+        angles=torch.as_tensor(sample["angles"], dtype=torch.float32).view(1, -1),
+    )
+
+
+def _random_fractional_positions(num_atoms: int) -> torch.Tensor:
+    return torch.rand(num_atoms, 3)
+
+
+def _formula_to_atomic_numbers(formula: dict[str, float]) -> torch.Tensor:
+    from ase.data import atomic_numbers
+
+    species = [
+        atomic_numbers[element]
+        for element, count in formula.items()
+        for _ in range(int(count))
+    ]
+    return torch.tensor(species, dtype=torch.long)
+
+
+class CrystalDataset(TorchDataset, ABC):
+    """Small PyG-friendly dataset base for clean crystals and sampling priors."""
+
+    def __init__(self, transform: Transform = None) -> None:
         self.transform = transform
-        self.default_lattice = (
-            torch.zeros(1, 6, dtype=torch.float32)
-            if default_lattice is None
-            else default_lattice.view(1, 6).to(dtype=torch.float32)
-        )
 
     @staticmethod
     def collate_fn(samples: list[Data]) -> Batch:
         return Batch.from_data_list(samples)
 
-    @staticmethod
-    def build_complete_graph(num_nodes: int) -> torch.Tensor:
-        mask = ~torch.eye(num_nodes, dtype=torch.bool)
-        return mask.nonzero(as_tuple=False).t().contiguous()
-
-    def apply_transform(self, sample: Data) -> Data:
-        return sample if self.transform is None else self.transform(sample)
-
-    def attach_graph(self, sample: Data) -> Data:
-        if not hasattr(sample, "edge_node_index"):
-            # KLDM uses a node graph in the network forward pass even though the
-            # diffusion state itself is stored in `pos`, `h`, and `l`.
-            sample.edge_node_index = self.build_complete_graph(sample.pos.shape[0])
-
-        if hasattr(sample, "l"):
-            sample.l = sample.l.view(1, 6).to(dtype=torch.float32)
-        elif hasattr(sample, "lengths") and hasattr(sample, "angles"):
-            # The lattice diffusion sees one graph-level 6D vector per crystal.
-            sample.l = torch.cat([sample.lengths, sample.angles], dim=-1).to(dtype=torch.float32)
-        else:
-            # CSP does not start from an observed lattice, so the task dataset
-            # provides only composition/graph structure and the lattice is left
-            # to the model prior unless a downstream transform overrides it.
-            sample.l = self.default_lattice.clone()
-
-        return sample
-
     @abstractmethod
-    def _get_raw_sample(self, idx: int) -> Data:
-        raise NotImplementedError
-
-    @abstractmethod
-    def __len__(self) -> int:
+    def make_data(self, idx: int) -> Data:
         raise NotImplementedError
 
     def __getitem__(self, idx: int) -> Data:
-        sample = self._get_raw_sample(idx)
-        sample = self.attach_graph(sample)
-        return self.apply_transform(sample)
+        data = self.make_data(idx)
+        return data if self.transform is None else self.transform(data)
+
+
+class StoredCrystalDataset(CrystalDataset):
+    """Real crystals loaded from processed MP-20 tensor files."""
+
+    def __init__(self, path: str | Path, transform: Transform = None) -> None:
+        super().__init__(transform=transform)
+        self.path = Path(path)
+        self.samples = torch.load(self.path, map_location="cpu", weights_only=False)
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def make_data(self, idx: int) -> Data:
+        return _to_crystal_data(self.samples[idx])
+
+
+class FormulaDataset(CrystalDataset):
+    """Formula-conditioned prior used for CSP sampling."""
+
+    def __init__(
+        self,
+        formulas: Sequence[str],
+        repeats: int = 1,
+        transform: Transform = None,
+    ) -> None:
+        super().__init__(transform=transform)
+        import chemparse
+
+        self.compositions = [
+            chemparse.parse_formula(formula)
+            for formula in formulas
+            for _ in range(int(repeats))
+        ]
+
+    def __len__(self) -> int:
+        return len(self.compositions)
+
+    def make_data(self, idx: int) -> Data:
+        h = _formula_to_atomic_numbers(self.compositions[idx])
+        return Data(pos=_random_fractional_positions(len(h)), h=h)
+
+
+class SizePriorDataset(CrystalDataset):
+    """Size-conditioned prior used for DNG sampling."""
+
+    def __init__(
+        self,
+        size_distribution: np.ndarray,
+        n_samples: int = 1000,
+        default_atomic_number: int = 6,
+        seed: int = 42,
+        transform: Transform = None,
+    ) -> None:
+        super().__init__(transform=transform)
+        self.default_atomic_number = int(default_atomic_number)
+        rng = np.random.default_rng(seed)
+        self.sizes = rng.choice(len(size_distribution), size=n_samples, p=size_distribution)
+
+    @staticmethod
+    def uniform_size_prior(size_range: str) -> np.ndarray:
+        lower, upper = (int(part) for part in size_range.split("-"))
+        prior = np.zeros(upper + 1, dtype=float)
+        prior[lower:upper] = 1.0
+        return prior / prior.sum()
+
+    def __len__(self) -> int:
+        return len(self.sizes)
+
+    def make_data(self, idx: int) -> Data:
+        num_atoms = int(self.sizes[idx])
+        return Data(
+            pos=_random_fractional_positions(num_atoms),
+            h=torch.full((num_atoms,), self.default_atomic_number, dtype=torch.long),
+        )
+
+
+Dataset = StoredCrystalDataset
