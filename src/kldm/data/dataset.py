@@ -48,10 +48,10 @@ class CrystalDatasetWrapper(Dataset):
         if not isinstance(split, str) or split not in ["train", "val", "test"]:
             raise ValueError("split must be one of 'train', 'val', or 'test'")
 
-        self.root = resolve_data_root(root)
+        self.root = Path(root).expanduser()
         self.split = split
-        self.transforms = list(transforms or [])
-        self.dataset_transforms = list(dataset_transforms or [])
+        self.transforms = transforms if transforms is not None else []
+        self.dataset_transforms = dataset_transforms if dataset_transforms is not None else []
 
         if download:
             self.download()
@@ -67,11 +67,9 @@ class CrystalDatasetWrapper(Dataset):
         return Batch.from_data_list(samples)
 
     def _prepare_df(self) -> tuple[pd.DataFrame, list[str]]:
-        # Load the raw split file and rename columns to the standardized MatterGen keys.
         df = pd.read_csv(self.raw_folder / f"{self.split}.csv")
         df = df.rename(columns=self.properties_map)
 
-        # Convert integer space-group ids to Hermann-Mauguin symbols before caching.
         space_group_map = {
             i: SpaceGroup.from_int_number(i).symbol
             for i in range(1, len(SpaceGroup.full_sg_mapping) + 1)
@@ -86,8 +84,6 @@ class CrystalDatasetWrapper(Dataset):
         processed_path = self.processed_folder / f"{self.split}"
 
         if not self._check_exists_processed():
-            # MatterGen's builder expects a clean cache directory. If a previous run
-            # only wrote part of the cache, remove it and rebuild from scratch.
             if processed_path.exists():
                 shutil.rmtree(processed_path)
             self.processed_folder.mkdir(parents=True, exist_ok=True)
@@ -140,15 +136,21 @@ class CrystalDatasetWrapper(Dataset):
         if not processed_path.exists():
             return False
 
-        required_files = [
+        required_arrays = [
             "atomic_numbers.npy",
             "cell.npy",
             "num_atoms.npy",
             "pos.npy",
             "structure_id.npy",
-            *[f"{prop}.json" for prop in self.properties],
         ]
-        return all((processed_path / filename).exists() for filename in required_files)
+        if any(not (processed_path / filename).exists() for filename in required_arrays):
+            return False
+
+        required_properties = [f"{prop}.json" for prop in self.properties]
+        if any(not (processed_path / filename).exists() for filename in required_properties):
+            return False
+
+        return True
 
     def download(self) -> None:
         if self._check_exists_raw():
@@ -172,16 +174,15 @@ class CrystalDatasetWrapper(Dataset):
                     pbar.update(len(chunk))
 
     def __repr__(self) -> str:
-        body = [
-            f"Number of samples: {self.__len__()}",
-            f"Root location: {self.root}",
-            f"Split: {self.split}",
-        ]
+        head = "Dataset " + self.__class__.__name__
+        body = [f"Number of samples: {self.__len__()}"]
+        body.append(f"Root location: {self.root}")
+        body.append(f"Split: {self.split}")
         if len(self.transforms) > 0:
             body.append(f"Transforms: {self.transforms}")
         if len(self.dataset_transforms) > 0:
             body.append(f"Dataset Transforms: {self.dataset_transforms}")
-        return "\n".join(["Dataset " + self.__class__.__name__] + [" " * 4 + line for line in body])
+        return "\n".join([head] + [" " * 4 + line for line in body])
 
 
 class Carbon24(CrystalDatasetWrapper):
