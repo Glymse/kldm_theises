@@ -1,3 +1,3 @@
-from .scoreNetwork import SimpleScoreGNN
+from .scoreNetwork import CSPVLayer, CSPVNet
 
-__all__ = ["SimpleScoreGNN"]
+__all__ = ["CSPVLayer", "CSPVNet"]

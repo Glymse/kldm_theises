@@ -1,25 +1,50 @@
-// For format details, see https://aka.ms/devcontainer.json. For config options, see the
-// README at: https://github.com/devcontainers/templates/tree/main/src/python
 {
-    "name": "kldm",
-    // Or use a Dockerfile or Docker Compose file. More info: https://containers.dev/guide/dockerfile
-    "image": "mcr.microsoft.com/devcontainers/python:3.12-bullseye",
-    "features": {},
-
-    // Use 'postCreateCommand' to run commands after the container is created.
-    "postCreateCommand": "bash .devcontainer/post_create.sh",
-
-    // Configure tool-specific properties.
-    "customizations": {
-        "vscode": {
-            "extensions": ["ms-python.python", "editorconfig.editorconfig"],
-            "settings": {
-                "python.testing.pytestArgs": ["tests"],
-                "python.testing.unittestEnabled": false,
-                "python.testing.pytestEnabled": true,
-                "python.defaultInterpreterPath": "/workspaces/kldm/.venv/bin/python",
-                "python.testing.pytestPath": "/workspaces/kldm/.venv/bin/pytest"
-            }
-        }
+  "name": "kldm-mattergen",
+  "dockerComposeFile": "docker-compose.yml",
+  "service": "vscode",
+  "runServices": [
+    "vscode"
+  ],
+  "remoteUser": "vscode",
+  "workspaceFolder": "/workspace",
+  "mounts": [
+    {
+      "source": "cache-${devcontainerId}",
+      "target": "/home/${remoteUser}/.cache",
+      "type": "volume"
+    },
+    {
+      "source": "venv-${devcontainerId}",
+      "target": "${containerWorkspaceFolder}/.venv",
+      "type": "volume"
     }
+  ],
+  "containerEnv": {
+    "UV_PROJECT_ENVIRONMENT": "${containerWorkspaceFolder}/.venv",
+    "UV_LINK_MODE": "copy"
+  },
+  "updateContentCommand": "sudo chown -R vscode:vscode /home/vscode/.cache ${containerWorkspaceFolder}/.venv || true",
+  "postCreateCommand": "bash .devcontainer/post_create.sh",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-python.python",
+        "ms-toolsai.jupyter"
+      ],
+      "settings": {
+        "python.defaultInterpreterPath": "/workspace/.venv/bin/python",
+        "python.testing.pytestEnabled": true,
+        "python.testing.unittestEnabled": false,
+        "python.testing.pytestArgs": [
+          "tests"
+        ],
+        "python.testing.pytestPath": "/workspace/.venv/bin/pytest",
+        "python.analysis.extraPaths": [
+          "/workspace/src"
+        ],
+        "jupyter.jupyterServerType": "local",
+        "python.terminal.activateEnvironment": true
+      }
+    }
+  }
 }
