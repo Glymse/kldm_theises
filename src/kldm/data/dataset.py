@@ -15,6 +15,19 @@ from torch_geometric.data import Batch
 from tqdm.auto import tqdm
 
 
+WORKSPACE_ROOT = Path(__file__).resolve().parents[3]
+DEFAULT_DATA_ROOT = WORKSPACE_ROOT / "data"
+
+
+def resolve_data_root(root: str | Path | None = None) -> Path:
+    """Resolve the dataset root.
+
+    If no root is provided, always use the workspace-level `data/` directory
+    instead of a path relative to the caller's current working directory.
+    """
+    return DEFAULT_DATA_ROOT if root is None else Path(root).expanduser()
+
+
 # Inspired by torchvision-style dataset wrappers: keep a small class responsible for
 # download, cache discovery, and handing off to MatterGen's builder.
 class CrystalDatasetWrapper(Dataset):
@@ -35,7 +48,7 @@ class CrystalDatasetWrapper(Dataset):
         if not isinstance(split, str) or split not in ["train", "val", "test"]:
             raise ValueError("split must be one of 'train', 'val', or 'test'")
 
-        self.root = Path(root).expanduser()
+        self.root = resolve_data_root(root)
         self.split = split
         self.transforms = list(transforms or [])
         self.dataset_transforms = list(dataset_transforms or [])

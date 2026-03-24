@@ -4,7 +4,7 @@ from pathlib import Path
 
 from torch.utils.data import DataLoader
 
-from .dataset import MP20
+from .dataset import MP20, resolve_data_root
 from .transform import ContinuousIntervalLattice, CopyProperty, FullyConnectedGraph, TaskMetadata
 
 TASK_CSP = 0
@@ -21,12 +21,12 @@ class CSPTask:
             TaskMetadata(task_id=TASK_CSP, diffuse_h=False),
         ]
 
-    def fit_dataset(self, root: str | Path, split: str = "train", download: bool = False) -> MP20:
-        return MP20(root=root, split=split, transforms=self.transforms, download=download)
+    def fit_dataset(self, root: str | Path | None = None, split: str = "train", download: bool = False) -> MP20:
+        return MP20(root=resolve_data_root(root), split=split, transforms=self.transforms, download=download)
 
     def dataloader(
         self,
-        root: str | Path,
+        root: str | Path | None = None,
         split: str = "train",
         batch_size: int = 32,
         shuffle: bool = True,

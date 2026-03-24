@@ -9,7 +9,7 @@ from torch import nn
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from kldm.data import CSPTask, DNGTask
+from kldm.data import CSPTask, DNGTask, resolve_data_root
 
 
 class ContinuousVPDiffusion(nn.Module):
@@ -158,7 +158,7 @@ def main() -> None:
     # Use the actual diffusion class defined above, then run it on real batches
     # coming from the CSP and DNG MatterGen-backed loaders.
     diffusion = ContinuousVPDiffusion()
-    root = Path("data")
+    root = resolve_data_root()
     base_t = torch.tensor([1], dtype=torch.float32)
 
     print(f"root={root}")

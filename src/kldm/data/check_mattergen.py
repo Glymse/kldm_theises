@@ -8,7 +8,7 @@ if __package__ in {None, ""}:
 
 import torch
 
-from kldm.data import CSPTask, DNGTask, MP20
+from kldm.data import CSPTask, DNGTask, MP20, resolve_data_root
 
 
 def _print_header(title: str) -> None:
@@ -28,7 +28,7 @@ def _tensor_preview(name: str, tensor: torch.Tensor, n: int = 3) -> None:
 
 
 def main() -> None:
-    root = Path("data")
+    root = resolve_data_root()
     root.mkdir(parents=True, exist_ok=True)
 
     _print_header("MatterGen / MP-20 Dataset")
