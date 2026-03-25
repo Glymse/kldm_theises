@@ -11,6 +11,7 @@ if __package__ in {None, ""}:
 
 from kldm.data import CSPTask, DNGTask, resolve_data_root
 
+from kldm.distribution import d_log_wrapped_normal
 
 
 ################################################################
@@ -91,6 +92,8 @@ class TrivialisedDiffusion(nn.Module):
             torch.clamp(2.0 * t + 8.0 / (1.0 + torch.exp(t)) - 4.0, min=self.eps)
         )  # Eq. (23)
 
+
+
     def forward_sample(
         self,
         t: torch.Tensor,
@@ -98,7 +101,7 @@ class TrivialisedDiffusion(nn.Module):
         v0: torch.Tensor | None = None,
         epsilon_v: torch.Tensor | None = None,
         epsilon_r: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
 
         #Now we do T = [0,2] time scaling.
         t = self.time_scaling_T * t
@@ -149,13 +152,46 @@ class TrivialisedDiffusion(nn.Module):
         #Now we calculate displacement, and stay on the manifold.
         f_t = self.wrap(f0  + r_t)                              #Equation: C derivation
 
-        return f_t, v_t, epsilon_v, epsilon_r
+        return f_t, v_t, epsilon_v, epsilon_r, r_t
 
-    def score_target(self, t: torch.Tensor, eps: torch.Tensor) -> torch.Tensor:
+    def score_target(
+        self,
+        t: torch.Tensor,
+        epsilon_v: torch.Tensor,
+        r_t: torch.Tensor,
+        v_t: torch.Tensor,
+        v0: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Return the TDM velocity training target used by KLDM.
 
+        KLDM splits the velocity-space target into two pieces:
 
+        1. the Gaussian score coming from the forward velocity kernel
+        2. the wrapped-normal score contribution induced by the position part
 
-        return NotImplementedError()
+        The second term must be evaluated with the same sampled `r_t`, `mu_r_t`
+        and `sigma_r_t` tensors that were used in the forward transition.
+        Passing the scheduler functions themselves would be incorrect because the
+        wrapped-normal derivative is defined at the sampled distribution
+        parameters, not at the Python callables.
+        """
+        t = self.time_scaling_T * t
+
+        if v0 is None:
+            v0 = torch.zeros_like(v_t)
+
+        sigma_v_t = self._match_dims(self.sigma_v(t), epsilon_v)
+        target_v = -epsilon_v / sigma_v_t
+
+        mu_r_t = self.mu_r_t(t, v_t, v0)
+        sigma_r_t = self._match_dims(self.sigma_r_t(t), r_t)
+        target_s = self._match_dims((1.0 - torch.exp(-t)) / (1.0 + torch.exp(-t)), r_t) * d_log_wrapped_normal(
+            r=r_t,
+            mu=mu_r_t,
+            sigma=sigma_r_t,
+        )
+
+        return target_v + target_s
 
     @staticmethod
     def _match_dims(coeff: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
