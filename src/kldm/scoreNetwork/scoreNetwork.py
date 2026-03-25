@@ -1,14 +1,9 @@
 import torch
 import torch.nn as nn
+from torch_scatter import scatter
 
-from .embedding import FourierEmbedding, SinEmbedding
-from .utils import scatter_center, scatter_mean
-
-
-def scatter(src: torch.Tensor, index: torch.Tensor, dim: int = 0, reduce: str = "mean", dim_size: int | None = None):
-    if reduce != "mean":
-        raise NotImplementedError("This minimal scatter helper only supports reduce='mean'.")
-    return scatter_mean(src, index=index, dim=dim, dim_size=dim_size)
+from kldm.scoreNetwork.embedding import FourierEmbedding, SinEmbedding
+from kldm.scoreNetwork.utils import scatter_center
 
 
 class CSPVLayer(nn.Module):

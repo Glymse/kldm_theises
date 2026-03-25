@@ -5,6 +5,7 @@ import sys
 
 import torch
 from torch import nn
+from torch_geometric.utils import scatter
 
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -19,18 +20,6 @@ from kldm.distribution import d_log_wrapped_normal
 #######       Time is first mapped from normalized time     ####
 #######       t01 in [0,1] to KLDM internal time by         ####
 #######       t = tf * t01.        [Leap of fate]           ####
-#######
-#######       Fractional coordinates are not used directly  ####
-#######       in raw [0,1] space when computing the wrapped ####
-#######       normal score. KLDM first wraps them to a      ####
-#######       centered periodic representation and then     ####
-#######       rescales them by scale_pos = 2*pi.            ####
-#######
-#######       So the wrapped normal score is computed in    ####
-#######       this 2*pi-periodic internal coordinate space, ####
-#######       which is equivalent to a centered angle-like  ####
-#######       representation, and only mapped back to       ####
-#######       fractional coordinates afterward when returned####
 ################################################################
 
 
@@ -67,13 +56,12 @@ class TrivialisedDiffusion(nn.Module):
     wrap = lambda self, x: torch.remainder(x, 1.0)
 
 
+
     # -------------------------------------------------
     # Velocity transition kernel schedulers
     # -------------------------------------------------
 
     # v_t | v_0 ~ N(exp(-t) v_0, (1 - exp(-2t)) I)
-
-
     def alpha_v(self, t: torch.Tensor) -> torch.Tensor:
         """Mean coefficient of the forward kernel."""
         return torch.exp(-t)
@@ -93,14 +81,16 @@ class TrivialisedDiffusion(nn.Module):
         )  # Eq. (23)
 
 
-
+    #TODO: We do not center the distribution around = 0
     def forward_sample(
         self,
+        index: torch.Tensor,
         t: torch.Tensor,
         f0: torch.Tensor,
         v0: torch.Tensor | None = None,
         epsilon_v: torch.Tensor | None = None,
         epsilon_r: torch.Tensor | None = None,
+
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
 
         #Now we do T = [0,2] time scaling.
@@ -120,12 +110,13 @@ class TrivialisedDiffusion(nn.Module):
         #######################
 
         #Vi sætter v0 = 0, [Design choice] at time t = 0
-        if v0 is None:
-            v0 = torch.zeros_like(f0)                           #Equation: Initial zero velocities
+        v0 = torch.zeros_like(f0)                           #Equation: Initial zero velocities
 
         #Sample the Nv(0,I) noise on velocty, epislon_v, i
-        if epsilon_v is None:
-            epsilon_v = torch.randn_like(v0)                        #Equation  Nv is a normal distribution such that ∑vi = 0
+
+        #epsilon_v = torch.randn_like(v0)                        #Equation  Nv is a normal distribution such that ∑vi = 0
+        epsilon_v = torch.randn_like(v0)
+        epsilon_v = epsilon_v - scatter(epsilon_v, index, dim=0, reduce="mean")[index]
 
         #Alpha_v_t = exp(-t)
         alpha_v_t = self._match_dims(self.alpha_v(t), v0)       #Equation 22
@@ -144,18 +135,25 @@ class TrivialisedDiffusion(nn.Module):
         mu_r_t = self.mu_r_t(t, v_t, v0)
         sigma_r_t = self._match_dims(self.sigma_r_t(t), f0)
 
-        if epsilon_r is None:
-            epsilon_r = torch.randn_like(f0)
+        """
+        epsilon_r = torch.randn_like(f0)
 
         r_t = self.wrap(mu_r_t + sigma_r_t * epsilon_r)         #From pseudo code algorithm 1
 
         #Now we calculate displacement, and stay on the manifold.
         f_t = self.wrap(f0  + r_t)                              #Equation: C derivation
+        """
+        epsilon_r = torch.randn_like(f0)
+        r_raw = mu_r_t + sigma_r_t * epsilon_r
+        r_t = r_raw - scatter(r_raw, index, dim=0, reduce="mean")[index]
+        r_t = self.wrap(r_t)
+        f_t = self.wrap(f0 + r_t)
 
         return f_t, v_t, epsilon_v, epsilon_r, r_t
 
     def score_target(
         self,
+        index: torch.Tensor,
         t: torch.Tensor,
         epsilon_v: torch.Tensor,
         r_t: torch.Tensor,
@@ -181,7 +179,7 @@ class TrivialisedDiffusion(nn.Module):
             v0 = torch.zeros_like(v_t)
 
         sigma_v_t = self._match_dims(self.sigma_v(t), epsilon_v)
-        target_v = -epsilon_v / sigma_v_t
+        target_v = -v_t / (sigma_v_t ** 2)
 
         mu_r_t = self.mu_r_t(t, v_t, v0)
         sigma_r_t = self._match_dims(self.sigma_r_t(t), r_t)
@@ -190,6 +188,10 @@ class TrivialisedDiffusion(nn.Module):
             mu=mu_r_t,
             sigma=sigma_r_t,
         )
+
+        target = target_v + target_s
+        target = target - scatter(target, index, dim=0, reduce="mean")[index]
+        return target
 
         return target_v + target_s
 
