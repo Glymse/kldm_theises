@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 import logging
 import sys
-from typing import Any, Callable, Optional, Tuple
+from typing import Callable, Optional
 
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -18,29 +18,13 @@ from kldm.diffusionModels.continuous import ContinuousVPDiffusion
 from kldm.diffusionModels.trivialized_diffusion import TrivialisedDiffusion as TDM
 from kldm.distribution.uniform import sample_uniform
 from kldm.scoreNetwork.scoreNetwork import CSPVNet
-from kldm.scoreNetwork.utils import scatter_center
 
 logger = logging.getLogger(__name__)
 
 
 class ModelKLDM(nn.Module):
-    r"""
-    KLDM (Kinetic Lattice Diffusion Model)
-
-    Implements Algorithms 1-4 from the KLDM paper for crystal structure generation.
-    Key innovations:
-    1. Trivialized momentum for velocity in tangent space
-    2. VP diffusion for lattice parameters and atom types (one-hot-encoded)
-    3. Score-based matching with equivariant GNN (CSPVNet)
-    4. Separate handling of CSP and DNG tasks
-
-    Components:
-    - score_network (CSPVNet): Equivariant graph neural network for score prediction
-    - diffusion_v: Trivialized diffusion for atomic velocities
-    - diffusion_l: VP diffusion for lattice parameters
-    - diffusion_a: VP diffusion for atom types (DNG only)
-
-    Reference: "KLDM: Generative Modeling of Crystal Structure with Continuous Diffusion"
+    """
+    KLDM model
     """
 
     def __init__(
@@ -50,44 +34,30 @@ class ModelKLDM(nn.Module):
         diffusion_l: Optional[ContinuousVPDiffusion] = None,
         diffusion_a: Optional[ContinuousVPDiffusion] = None,
         device: Optional[torch.device] = None,
-        eps = 1e-3,
-
+        eps: float = 1e-3,
     ) -> None:
-        """
-        Initialize KLDM model.
-
-        Args:
-            score_network: Equivariant GNN for score prediction. If None, uses CSPVNet()
-            diffusion_v: Velocity diffusion model. If None, uses TrivialisedDiffusionMomentum()
-            diffusion_l: Lattice diffusion model. If None, uses ContinuousVPDiffusion()
-            diffusion_a: Atom-type diffusion model. If None, uses ContinuousVPDiffusion()
-            eps: Small epsilon for numerical stability
-            device: Device for model. If None, uses CPU
-        """
         super().__init__()
 
-        # Components
         self.score_network = score_network or CSPVNet(
             hidden_dim=128,
             num_layers=4,
-            h_dim=118,  # Number of elements
+            h_dim=118,
             smooth=True,
             pred_v=True,
             pred_l=True,
             pred_h=True,
         )
+
         self.tdm = diffusion_v or TDM(eps=eps)
         self.diffusion_l = diffusion_l or ContinuousVPDiffusion(eps=eps)
         self.diffusion_a = diffusion_a or ContinuousVPDiffusion(eps=eps)
 
         self.device = device or torch.device("cpu")
         self.eps = eps
-
-        # Task detection (set after first batch)
-        self.task_type: Optional[str] = None  # "csp" or "dng"
+        self.task_type: Optional[str] = None
 
     # ============================================================================
-    # ALGORITHM 1: Training Targets
+    # ALGORITHM 1
     # ============================================================================
 
     def algorithm1_training_targets(
@@ -95,6 +65,10 @@ class ModelKLDM(nn.Module):
         batch: Data | Batch,
         t: torch.Tensor,
     ) -> tuple[tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
+        """
+        Algorithm 1 in KLDM:
+        sample noisy variables and score targets.
+        """
         device = next(self.parameters()).device
         batch = batch.to(device)
 
@@ -106,27 +80,29 @@ class ModelKLDM(nn.Module):
         t_node = t_graph[index].squeeze(-1)
         is_dng = hasattr(batch, "task_id") and bool((batch.task_id == 1).all())
 
+        # Diffuse lattice, KLDM Alg. 1
         l_t, eps_l = self.diffusion_l.forward_sample(
             t=t_graph.squeeze(-1),
             x0=batch.l,
         )
         target_l = eps_l
 
+        # Sample (f_t, v_t), KLDM Eqs. (16), (22), (23)
         f_t, v_t, epsilon_v, epsilon_r, r_t = self.tdm.forward_sample(
             t=t_node,
             f0=batch.pos,
-            index=index,
         )
-        f_t = scatter_center(f_t, index=index)
+
+        # Velocity target, KLDM Eq. (19)
         target_v = self.tdm.score_target(
             t=t_node,
             epsilon_v=epsilon_v,
             r_t=r_t,
             v_t=v_t,
-            index=index,
         )
 
         if is_dng:
+            # Diffuse atom types, KLDM Alg. 1
             a_t, eps_a = self.diffusion_a.forward_sample(
                 t=t_node,
                 x0=batch.h,
@@ -136,12 +112,37 @@ class ModelKLDM(nn.Module):
 
         return (v_t, f_t, l_t), (target_v, target_l)
 
-
-
     # ============================================================================
-    # ALGORITHM 2: Denoising Score Matching Loss / Training model
+    # Loss calculators for algorithm 2
     # ============================================================================
 
+    def mse_loss_per_sample(
+        self,
+        pred: torch.Tensor,
+        target: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Plain MSE, averaged over feature dims.
+        """
+        loss = F.mse_loss(pred, target, reduction="none")
+        return loss.reshape(loss.shape[0], -1).mean(dim=1)
+
+
+    @staticmethod
+    def lambda_t(
+        t_node: torch.Tensor,
+        lambda_t_fn: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
+    ) -> torch.Tensor:
+        """
+        Resolve the KLDM velocity weighting lambda(t).
+        """
+        if lambda_t_fn is None:
+            return torch.ones_like(t_node)
+        return lambda_t_fn(t_node).to(t_node.device)
+
+    # ============================================================================
+    # ALGORITHM 2
+    # ============================================================================
 
     def algorithm2_loss(
         self,
@@ -151,16 +152,11 @@ class ModelKLDM(nn.Module):
         lambda_l: float = 1.0,
         lambda_a: float = 1.0,
         lambda_t_fn: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
-
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """
-        Algorithm 2 from KLDM:
-        - get noisy samples + targets from Algorithm 1
-        - run score network
-        - reconstruct full velocity score using Eq. (19)
-        - compute weighted DSM losses
+        Algorithm 2 in KLDM:
+        network prediction + denoising score matching loss.
         """
-
         device = next(self.parameters()).device
         batch = batch.to(device)
 
@@ -172,7 +168,9 @@ class ModelKLDM(nn.Module):
         t_node = t_graph[index].squeeze(-1)
         is_dng = hasattr(batch, "task_id") and bool((batch.task_id == 1).all())
 
+        # Algorithm 1
         noisy, targets = self.algorithm1_training_targets(batch=batch, t=t_graph)
+
         if is_dng:
             v_t, f_t, l_t, a_t = noisy
             target_v, target_l, target_a = targets
@@ -181,6 +179,7 @@ class ModelKLDM(nn.Module):
             target_v, target_l = targets
             a_t = batch.h
 
+        # Network prediction, KLDM Alg. 2
         preds = self.score_network(
             t=t_graph,
             pos=f_t,
@@ -191,38 +190,28 @@ class ModelKLDM(nn.Module):
             edge_node_index=batch.edge_node_index,
         )
 
-        out_v = scatter_center(preds["v"], index=index)
+        ########HERE WE CALCULATE SIMPLIFIED SCORE
+        out_v = preds["v"]
         out_l = preds["l"]
 
+        # Full velocity score, KLDM Eq. (19)
         t_internal = self.tdm.time_scaling_T * t_node
-        prefactor = (1.0 - torch.exp(-t_internal)) / (1.0 + torch.exp(-t_internal))
-        prefactor = self.tdm._match_dims(prefactor, out_v)
+        exp_coef = self.tdm._match_dims((1.0 - torch.exp(-t_internal)) / (1.0 + torch.exp(-t_internal)), out_v)
         sigma_v_sq = self.tdm._match_dims(self.tdm.sigma_v(t_internal) ** 2, out_v)
 
-        score_v = prefactor * out_v - v_t / sigma_v_sq
-        score_v = scatter_center(score_v, index=index)
+        #The simplified score, assuming initial velocity is 0
+        score_v = exp_coef * out_v - v_t / sigma_v_sq
 
-        loss_l = F.mse_loss(out_l, target_l, reduction="none")
-        loss_l = loss_l.reshape(loss_l.shape[0], -1).mean(dim=1).mean()
+        # KLDM: plain squared error for lattice and atom targets.
+        loss_l = self.mse_loss_per_sample(preds["l"], target_l).mean()
 
-        loss_v = F.mse_loss(score_v, target_v, reduction="none")
-        loss_v = loss_v.reshape(loss_v.shape[0], -1).mean(dim=1)
-        if lambda_t_fn is None:
-            lambda_t = torch.ones_like(loss_v)
-        elif callable(lambda_t_fn):
-            lambda_t = lambda_t_fn(t_node).to(loss_v.device)
-        else:
-            lambda_t = torch.as_tensor(lambda_t_fn, device=loss_v.device, dtype=loss_v.dtype)
-            if lambda_t.ndim > 1:
-                lambda_t = lambda_t[index].squeeze(-1) if lambda_t.shape[0] == t_graph.shape[0] else lambda_t.squeeze()
-            if lambda_t.ndim == 0:
-                lambda_t = torch.full_like(loss_v, float(lambda_t))
-        loss_v = (lambda_t * loss_v).mean()
+        # KLDM: lambda(t) * ||score_v - target_v||^2
+        lambda_t = self.lambda_t(t_node=t_node, lambda_t_fn=lambda_t_fn)
+        loss_v = (lambda_t * self.mse_loss_per_sample(score_v, target_v)).mean()
 
         if is_dng:
-            out_a = preds["h"]
-            loss_a = F.mse_loss(out_a, target_a, reduction="none")
-            loss_a = loss_a.reshape(loss_a.shape[0], -1).mean(dim=1).mean()
+            loss_a = self.mse_loss_per_sample(preds["h"], target_a).mean()
+
             total_loss = lambda_v * loss_v + lambda_l * loss_l + lambda_a * loss_a
             return total_loss, {
                 "loss": total_loss.detach(),
@@ -237,94 +226,3 @@ class ModelKLDM(nn.Module):
             "loss_v": loss_v.detach(),
             "loss_l": loss_l.detach(),
         }
-
-
-
-
-def train(
-    model: ModelKLDM,
-    loader,
-    optimizer: torch.optim.Optimizer,
-    device: torch.device,
-    epoch: int | None = None,
-    print_every: int = 20,
-):
-    """Short KLDM training loop using Algorithm 2."""
-    model.train()
-    running = {"loss": 0.0, "loss_v": 0.0, "loss_l": 0.0, "loss_a": 0.0}
-    n_batches = 0
-
-    for step, batch in enumerate(loader):
-        batch = batch.to(device)
-
-        num_graphs = batch.num_graphs
-        t = sample_uniform(lb=model.eps, size=(num_graphs, 1), device=device)
-
-        optimizer.zero_grad()
-
-        loss, metrics = model.algorithm2_loss(
-            batch=batch,
-            t=t,
-            lambda_v=1.0,
-            lambda_l=1.0,
-            lambda_a=1.0,
-            lambda_t_fn=torch.full_like(t, 4.0) # # since time_scaling_T = 2
-        )
-
-        loss.backward()
-        optimizer.step()
-
-        n_batches += 1
-        for k, v in metrics.items():
-            if k in running:
-                running[k] += float(v)
-
-        if step % print_every == 0:
-            prefix = f"epoch={epoch:02d} " if epoch is not None else ""
-            print(
-                f"{prefix}step={step:03d} "
-                f"loss={float(metrics['loss']):.6f} "
-                f"(v={float(metrics['loss_v']):.4f}, "
-                f"l={float(metrics['loss_l']):.4f}, "
-                f"a={float(metrics.get('loss_a', torch.tensor(0.0))):.4f})"
-            )
-
-    for k in running:
-        if n_batches > 0:
-            running[k] /= n_batches
-
-    return running
-
-
-def main() -> None:
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    loader = DNGTask().dataloader(
-        split="train",
-        batch_size=64,
-        shuffle=True,
-        download=True,
-    )
-
-    model = ModelKLDM(device=device).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
-
-    num_epochs = 5
-
-    for epoch in range(num_epochs):
-        stats = train(
-            model=model,
-            loader=loader,
-            optimizer=optimizer,
-            device=device,
-            epoch=epoch,
-            print_every=20,
-        )
-        print(
-            f"epoch={epoch:02d} mean_loss={stats['loss']:.6f} "
-            f"(v={stats['loss_v']:.4f}, l={stats['loss_l']:.4f}, a={stats['loss_a']:.4f})"
-        )
-
-
-if __name__ == "__main__":
-    main()

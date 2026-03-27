@@ -4,7 +4,8 @@ from kldm.data import DNGTask
 def train():
     dataset = DNGTask().fit_dataset("data/mp_20", split="train")
     model = ModelKLDM()
-    # add rest of your training code here
+
+    #For now use ipynb for development, but goal is to implement lightning capabilities here.
 
 if __name__ == "__main__":
     train()

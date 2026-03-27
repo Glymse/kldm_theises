@@ -19,28 +19,14 @@ from kldm.distribution import d_log_wrapped_normal
 ####### NOTE:                                               ####
 #######       Time is first mapped from normalized time     ####
 #######       t01 in [0,1] to KLDM internal time by         ####
-#######       t = tf * t01.        [Leap of fate]           ####
+#######       t = tf * t01.        [Appendix T = 2]         ####
 ################################################################
 
 
 
 class TrivialisedDiffusion(nn.Module):
-    """TDM forward process for positions + velocities.
-
-    Variables:
-        f0 : clean fractional coordinates
-        v0 = 0: clean initial velocity
-
-    Forward process:
-        1) sample noisy velocity
-        2) sample position displacement conditioned on velocity
-        3) wrap back to the torus
-
-    Returns:
-        f_t            : noisy wrapped positions
-        v_t            : noisy velocities
-        score_v_target : Gaussian velocity score target
-        pos_target     : wrapped-position target (here kept minimal)
+    """
+    trivialised diffusion for positions + velocities.
     """
     def __init__(
             self,
@@ -53,12 +39,19 @@ class TrivialisedDiffusion(nn.Module):
     #  Wrapping function.
     # -------------------------------------------------
 
-    wrap = lambda self, x: torch.remainder(x, 1.0)
+    @staticmethod
+    def wrap_fractional(x: torch.Tensor) -> torch.Tensor:
+        """Wrap coordinates into [0, 1)."""
+        return torch.remainder(x, 1.0)
 
-
+    #displacements usually should be in [-0.5,0.5), see report.
+    @staticmethod
+    def wrap_signed_unit(x: torch.Tensor) -> torch.Tensor:
+        """Wrap signed periodic displacements into [-0.5, 0.5)."""
+        return torch.remainder(x + 0.5, 1.0) - 0.5
 
     # -------------------------------------------------
-    # Velocity transition kernel schedulers
+    # Velocity sampling
     # -------------------------------------------------
 
     # v_t | v_0 ~ N(exp(-t) v_0, (1 - exp(-2t)) I)
@@ -81,10 +74,10 @@ class TrivialisedDiffusion(nn.Module):
         )  # Eq. (23)
 
 
-    #TODO: We do not center the distribution around = 0
+    #TODO: We do not center the distribution around = 0 yet. Ask francois.
+
     def forward_sample(
         self,
-        index: torch.Tensor,
         t: torch.Tensor,
         f0: torch.Tensor,
         v0: torch.Tensor | None = None,
@@ -93,16 +86,16 @@ class TrivialisedDiffusion(nn.Module):
 
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
 
-        #Now we do T = [0,2] time scaling.
+        #Now we do T = [0,2] time scaling in order for TDM to converge.
         t = self.time_scaling_T * t
 
         """
         The transition kernel is defined as follow:
             p_t|0 (ft, vt | f0, v0) = WN(r, | mu_r_t, sigma_r_t) * Nv(vt | mu_v_t, sigma_v_r)
 
-            transitioner kernel =     sample r_t                 *           sample v_t
+            transition kernel =          sample r_t              *         sample v_t
 
-            We sample v_t, use it to move on manifold, to samlpe f_t
+            We sample v_t, use it to move f_0 on manifold, to samlpe f_t
         """
 
         #######################
@@ -110,20 +103,17 @@ class TrivialisedDiffusion(nn.Module):
         #######################
 
         #Vi sætter v0 = 0, [Design choice] at time t = 0
-        v0 = torch.zeros_like(f0)                           #Equation: Initial zero velocities
+        v0 = torch.zeros_like(f0)                               #Design choice: Initial zero velocities
 
-        #Sample the Nv(0,I) noise on velocty, epislon_v, i
-
-        #epsilon_v = torch.randn_like(v0)                        #Equation  Nv is a normal distribution such that ∑vi = 0
+        #Sample normal noise for velocity                       #TODO:  Nv is a normal distribution such that ∑vi = 0
         epsilon_v = torch.randn_like(v0)
-        epsilon_v = epsilon_v - scatter(epsilon_v, index, dim=0, reduce="mean")[index]
 
         #Alpha_v_t = exp(-t)
         alpha_v_t = self._match_dims(self.alpha_v(t), v0)       #Equation 22
         #Sigma_v_t = 1-exp(-2t)
         sigma_v_t = self._match_dims(self.sigma_v(t), v0)       #Equation 23
 
-        #Sample v_t
+        #Sample v_t, given initial velocity.
         v_t = alpha_v_t * v0 + sigma_v_t * epsilon_v            #Equation 16: Reparamization sample of Nv(vt | mu_v_t, sigma_v_r)
 
         ######################################
@@ -135,53 +125,43 @@ class TrivialisedDiffusion(nn.Module):
         mu_r_t = self.mu_r_t(t, v_t, v0)
         sigma_r_t = self._match_dims(self.sigma_r_t(t), f0)
 
-        """
-        epsilon_r = torch.randn_like(f0)
+        #Sample normal noise on epsilon
+        epsilon_r = torch.randn_like(f0)                        #TODO: Nr is a normal distribution such that ∑vi = 0
 
-        r_t = self.wrap(mu_r_t + sigma_r_t * epsilon_r)         #From pseudo code algorithm 1
+        r_t = self.wrap_signed_unit(mu_r_t + sigma_r_t * epsilon_r)  # Signed wrapped displacement
 
-        #Now we calculate displacement, and stay on the manifold.
-        f_t = self.wrap(f0  + r_t)                              #Equation: C derivation
-        """
-        epsilon_r = torch.randn_like(f0)
-        r_raw = mu_r_t + sigma_r_t * epsilon_r
-        r_t = r_raw - scatter(r_raw, index, dim=0, reduce="mean")[index]
-        r_t = self.wrap(r_t)
-        f_t = self.wrap(f0 + r_t)
+        #Now we calculate displacement, and while we stay on the manifold.
+        f_t = self.wrap_fractional(f0 + r_t)                               # Map back to [0, 1)
+
 
         return f_t, v_t, epsilon_v, epsilon_r, r_t
 
     def score_target(
         self,
-        index: torch.Tensor,
         t: torch.Tensor,
         epsilon_v: torch.Tensor,
         r_t: torch.Tensor,
         v_t: torch.Tensor,
         v0: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Return the TDM velocity training target used by KLDM.
+        """Return the TDM velocity training target used by KLDM. """
 
-        KLDM splits the velocity-space target into two pieces:
-
-        1. the Gaussian score coming from the forward velocity kernel
-        2. the wrapped-normal score contribution induced by the position part
-
-        The second term must be evaluated with the same sampled `r_t`, `mu_r_t`
-        and `sigma_r_t` tensors that were used in the forward transition.
-        Passing the scheduler functions themselves would be incorrect because the
-        wrapped-normal derivative is defined at the sampled distribution
-        parameters, not at the Python callables.
-        """
+        #We do time scaling.
         t = self.time_scaling_T * t
 
-        if v0 is None:
-            v0 = torch.zeros_like(v_t)
+        #Design choice, makes the target quite simple to calculate.
+        v0 = torch.zeros_like(v_t)
 
         sigma_v_t = self._match_dims(self.sigma_v(t), epsilon_v)
+
+        #Simplified target of normal velocity distribution
         target_v = -v_t / (sigma_v_t ** 2)
 
+        #Now we find target of the wrapped normal fractional distribution
         mu_r_t = self.mu_r_t(t, v_t, v0)
+        #And convert to [-0.5, 0.5]
+        mu_r_t = self.wrap_signed_unit(mu_r_t)
+
         sigma_r_t = self._match_dims(self.sigma_r_t(t), r_t)
         target_s = self._match_dims((1.0 - torch.exp(-t)) / (1.0 + torch.exp(-t)), r_t) * d_log_wrapped_normal(
             r=r_t,
@@ -190,10 +170,9 @@ class TrivialisedDiffusion(nn.Module):
         )
 
         target = target_v + target_s
-        target = target - scatter(target, index, dim=0, reduce="mean")[index]
+
         return target
 
-        return target_v + target_s
 
     @staticmethod
     def _match_dims(coeff: torch.Tensor, x: torch.Tensor) -> torch.Tensor:

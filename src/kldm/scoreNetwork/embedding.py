@@ -75,7 +75,7 @@ class TimeEmbedding(nn.Module):
         x = torch.cat((torch.cos(x), torch.sin(x)), dim=1)
         return x
 
-
+"""
 class AnalogBitsEmbedding(nn.Module):
     def __init__(
             self,
@@ -112,3 +112,4 @@ class AnalogBitsEmbedding(nn.Module):
     @property
     def embedding_dim(self):
         return self.n_bits
+"""

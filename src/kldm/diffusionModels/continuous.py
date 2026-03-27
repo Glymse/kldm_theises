@@ -64,8 +64,7 @@ class ContinuousVPDiffusion(nn.Module):
 
             x_t = alpha(t) x_0 + sigma(t) eps
 
-        where eps ~ N(0, I). Returning eps as well is useful because many
-        training objectives are written in terms of the sampled noise.
+        where eps ~ N(0, I).
         """
         if noise is None:
             noise = torch.randn_like(x0)  # Sample epsilon ~ N(0, I).
