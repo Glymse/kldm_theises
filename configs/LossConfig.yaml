@@ -1,0 +1,18 @@
+# Loss Configuration
+
+# Loss weighting
+weight_v: 1.0
+weight_l: 1.0
+weight_a: 1.0
+
+# Loss type
+loss_type: score_matching
+
+# Regularization
+use_time_weighting: true
+use_snr_weighting: false
+min_snr: 5.0
+
+# Numerical stability
+eps: 1.0e-8
+clip_grad: 1.0

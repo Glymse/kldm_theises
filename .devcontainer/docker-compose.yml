@@ -1,0 +1,11 @@
+services:
+  vscode:
+    image: kldm-mattergen:local
+    build:
+      context: ..
+      dockerfile: .devcontainer/Dockerfile
+    init: true
+    command: sleep infinity
+    volumes:
+      - ..:/workspace:cached
+    working_dir: /workspace

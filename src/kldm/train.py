@@ -1,10 +1,11 @@
-from kldm.model import Model
-from kldm.data import MyDataset
+from kldm.kldm import ModelKLDM
+from kldm.data import DNGTask
 
 def train():
-    dataset = MyDataset("data/raw")
-    model = Model()
-    # add rest of your training code here
+    dataset = DNGTask().fit_dataset("data/mp_20", split="train")
+    model = ModelKLDM()
+
+    #For now use ipynb for development, but goal is to implement lightning capabilities here.
 
 if __name__ == "__main__":
     train()

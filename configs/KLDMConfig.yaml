@@ -1,0 +1,36 @@
+class KLDMConfig:
+
+    # Model
+    hidden_dim: int = 128
+    num_layers: int = 4
+    num_radial: int = 16
+    num_spherical: int = 7
+
+    # Diffusion
+    eps: float = 1e-6
+    t_min: float = 1e-3
+    t_max: float = 1.0
+
+    # Training
+    learning_rate: float = 1e-3
+    batch_size: int = 32
+    num_epochs: int = 100
+    warmup_epochs: int = 10
+    weight_decay: float = 1e-4
+
+    # Loss weights
+    loss_weight_v: float = 1.0
+    loss_weight_l: float = 1.0
+    loss_weight_a: float = 1.0
+
+    # Data
+    data_path: str = "data/mp_20"
+    task: str = "dng"  # "csp" or "dng"
+    species_mode: str = "atomic_numbers"
+
+    # Device
+    device: str = "cuda"
+
+    # Checkpoint
+    checkpoint_dir: str = "models/kldm_checkpoints"
+    save_every: int = 10
