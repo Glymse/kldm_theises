@@ -1,5 +1,6 @@
 import torch
 from torch_scatter import scatter_mean
+from pathlib import Path
 
 
 def scatter_center(pos, index):

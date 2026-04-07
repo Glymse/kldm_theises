@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 from pathlib import Path
 import sys
 from typing import Any
@@ -158,13 +159,27 @@ def export_final_model(
     )
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Train KLDM on the DNG task.")
+    parser.add_argument(
+        "--epoch",
+        "--epochs",
+        dest="epochs",
+        type=int,
+        default=2,
+        help="Number of training epochs.",
+    )
+    return parser.parse_args()
+
+
 def train() -> None:
+    args = parse_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     root = resolve_data_root()
 
     config = {
         "task": "DNG",
-        "epochs": 500,
+        "epochs": args.epochs,
         "batch_size": 64,
         "lr": 1e-3,
         "lambda_v": 1.0,
@@ -193,7 +208,7 @@ def train() -> None:
     run = wandb.init(
         project="kldm-dng",
         config=config,
-        name="dng_500_epochs",
+        name=f"dng_{config['epochs']}_epochs",
     )
 
     output_path = Path("artifacts") / "dng_final_model.pt"

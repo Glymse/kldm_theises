@@ -100,6 +100,27 @@ class ContinuousVPDiffusion(nn.Module):
             coeff = coeff.unsqueeze(-1)
         return coeff
 
+    #Reverse euler- maryauma
+    def reverse_em_step(
+        self,
+        t: torch.Tensor,
+        x_t: torch.Tensor,
+        score_x: torch.Tensor,
+        dt: float,
+    ) -> torch.Tensor:
+        """
+        One reverse Euler-Maruyama step for the VP SDE
+
+            dx = -x dt + sqrt(2) dW
+
+        reverse-time discretization:
+            x_prev = x_t + (x_t - 2 score_x) dt + sqrt(2 dt) z
+        """
+        del t  # not explicitly needed in this simple constant-beta reverse step
+
+        noise = torch.randn_like(x_t)
+        x_prev = x_t + (x_t - 2.0 * score_x) * dt + (2.0 * dt) ** 0.5 * noise
+        return x_prev
 
 
 
