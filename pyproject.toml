@@ -32,7 +32,9 @@ dependencies = [
   "setuptools>=70,<82",
   "torch==2.2.1; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   "torch-geometric==2.5.3",
+  "torch-scatter==2.1.2; sys_platform == 'linux' and platform_machine == 'x86_64'",
   "tqdm",
+  "wandb>=0.25.1",
 ]
 
 [dependency-groups]
