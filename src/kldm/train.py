@@ -167,7 +167,7 @@ def train() -> None:
     config = {
         "task": "CSP",
         "epochs": args.epochs,
-        "batch_size": 64,
+        "batch_size": 256,
         "lr": 1e-3,
         "lambda_v": 1.0,
         "lambda_l": 1.0,

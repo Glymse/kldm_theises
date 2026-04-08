@@ -114,12 +114,12 @@ class ContinuousVPDiffusion(nn.Module):
             dx = -x dt + sqrt(2) dW
 
         reverse-time discretization:
-            x_prev = x_t + (x_t - 2 score_x) dt + sqrt(2 dt) z
+            x_prev = x_t + (x_t + 2 score_x) dt + sqrt(2 dt) z
         """
         del t  # not explicitly needed in this simple constant-beta reverse step
 
         noise = torch.randn_like(x_t)
-        x_prev = x_t + (x_t - 2.0 * score_x) * dt + (2.0 * dt) ** 0.5 * noise
+        x_prev = x_t + (x_t + 2.0 * score_x) * dt + (2.0 * dt) ** 0.5 * noise
         return x_prev
 
 

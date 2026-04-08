@@ -74,7 +74,6 @@ class TrivialisedDiffusion(nn.Module):
         )  # Eq. (23)
 
 
-    #TODO: We do not center the distribution around = 0 yet. Ask francois.
 
     def forward_sample(
         self,
@@ -193,32 +192,3 @@ class TrivialisedDiffusion(nn.Module):
         while coeff.ndim < x.ndim:
             coeff = coeff.unsqueeze(-1)
         return coeff
-
-
-    #Sampling - Reverse eueler-maryuama
-    def reverse_em_step(
-        self,
-        t: torch.Tensor,
-        f_t: torch.Tensor,
-        v_t: torch.Tensor,
-        score_v: torch.Tensor,
-        dt: float,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        One reverse Euler-Maruyama step for KLDM coordinates/velocities.
-
-        Uses:
-            dv = (v_t - 2 * score_v) dt + sqrt(2 dt) dW
-            df = -v_t dt, followed by wrapping back to [0,1)
-
-        Notes:
-        - input t is normalized time in [0,1]
-        - this method internally maps to KLDM time when needed
-        """
-        del t  # not needed explicitly in this simple reverse step
-
-        noise_v = torch.randn_like(v_t)
-        v_prev = v_t + (v_t - 2.0 * score_v) * dt + (2.0 * dt) ** 0.5 * noise_v
-        f_prev = self.wrap_fractional(f_t - v_prev * dt)
-
-        return f_prev, v_prev
