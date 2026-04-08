@@ -9,14 +9,18 @@ from typing import Any, Callable, Optional
 import numpy as np
 import torch
 
+#TODO: Print amount of valid samples to benchmark.  (percantage)
+#og de 4 der
+
 from kldm.data.transform import ContinuousIntervalLattice, DEFAULT_ATOMIC_VOCAB
 
 try:
     from pymatgen.analysis.local_env import MinimumDistanceNN
     from pymatgen.core import Element, Lattice, Structure
     from pymatgen.analysis.structure_matcher import StructureMatcher
+    from pymatgen.io.ase import AseAtomsAdaptor
 except ImportError:  # pragma: no cover - depends on local environment
-    Element = Lattice = Structure = MinimumDistanceNN = StructureMatcher = None
+    Element = Lattice = Structure = MinimumDistanceNN = StructureMatcher = AseAtomsAdaptor = None
 
 try:
     import smact
@@ -46,6 +50,7 @@ CompFP = ElementProperty.from_preset("magpie") if ElementProperty is not None el
 class SampleEvaluationResult:
     is_valid: bool
     metrics: dict[str, Any]
+    metric_status: dict[str, str]
     basic_validity: dict[str, Any]
     geometric_sanity: dict[str, Any]
     chemical_sanity: dict[str, Any]
@@ -253,6 +258,219 @@ def _compute_rmsd_angstrom(
         return None
 
 
+def make_mattersim_relax_fn(
+    *,
+    steps: int = 500,
+    optimizer: str = "BFGS",
+    cell_filter: str = "ExpCellFilter",
+    constrain_symmetry: bool = True,
+    potential_load_path: Optional[str] = None,
+    device: Optional[str] = None,
+    hull_fn: Optional[Callable[[Structure, Optional[float]], Optional[float]]] = None,
+    novelty_fn: Optional[Callable[[Structure], Optional[bool]]] = None,
+) -> Callable[[Structure], dict[str, Any]]:
+    """
+    Build a one-sample MatterSim-backed relaxation function.
+
+    Returns a callable that maps a pymatgen Structure to a dict with keys such as:
+      - relaxed_structure
+      - energy_per_atom
+      - energy_above_hull
+      - stable
+      - unique
+      - novel
+      - sun
+
+    Notes:
+    - MatterSim is only used for relaxation and energy prediction here.
+    - `hull_fn` and `novelty_fn` are optional hooks for the parts that depend on
+      external reference data.
+    """
+    if AseAtomsAdaptor is None:
+        raise ImportError("pymatgen's ASE adaptor is required to use make_mattersim_relax_fn().")
+
+    try:
+        from mattersim.applications.relax import Relaxer
+        from mattersim.forcefield.potential import MatterSimCalculator
+    except ImportError as exc:  # pragma: no cover - depends on environment
+        raise ImportError(
+            "MatterSim is not installed in the active environment, so a MatterSim-backed "
+            "relax_fn cannot be created."
+        ) from exc
+
+    calculator_kwargs: dict[str, Any] = {}
+    if potential_load_path is not None:
+        calculator_kwargs["potential_load_path"] = potential_load_path
+    if device is not None:
+        calculator_kwargs["device"] = device
+
+    relaxer = Relaxer(
+        optimizer=optimizer,
+        filter=cell_filter,
+        constrain_symmetry=constrain_symmetry,
+    )
+    adaptor = AseAtomsAdaptor()
+
+    def relax_fn(structure: Structure) -> dict[str, Any]:
+        atoms = adaptor.get_atoms(structure)
+        atoms.calc = MatterSimCalculator(**calculator_kwargs)
+        try:
+            relaxed = relaxer.relax(atoms, steps=steps, verbose=False)
+        except TypeError:
+            try:
+                relaxed = relaxer.relax(atoms, steps=steps, logfile=None)
+            except TypeError:
+                relaxed = relaxer.relax(atoms, steps=steps)
+        relax_debug = {
+            "type": type(relaxed).__name__,
+            "module": type(relaxed).__module__,
+        }
+
+        relaxed_atoms = None
+        if hasattr(relaxed, "get_positions"):
+            relaxed_atoms = relaxed
+        elif isinstance(relaxed, dict):
+            relax_debug["keys"] = sorted(relaxed.keys())
+            for key in ("final_atoms", "atoms", "relaxed_atoms"):
+                if key in relaxed and hasattr(relaxed[key], "get_positions"):
+                    relaxed_atoms = relaxed[key]
+                    break
+            if relaxed_atoms is None:
+                relaxed_structure = relaxed.get("relaxed_structure")
+                if isinstance(relaxed_structure, Structure):
+                    energy_per_atom = relaxed.get("energy_per_atom")
+                    if energy_per_atom is None and relaxed.get("energy") is not None:
+                        energy_per_atom = float(relaxed["energy"]) / len(relaxed_structure)
+                    energy_above_hull = hull_fn(relaxed_structure, energy_per_atom) if hull_fn is not None else None
+                    stable = energy_above_hull <= 0.1 if energy_above_hull is not None else None
+                    novel = novelty_fn(relaxed_structure) if novelty_fn is not None else None
+                    unique = True
+                    sun = None if stable is None or novel is None else bool(stable and unique and novel)
+                    return {
+                        "relaxed_structure": relaxed_structure,
+                        "energy_per_atom": energy_per_atom,
+                        "energy_above_hull": energy_above_hull,
+                        "stable": stable,
+                        "unique": unique,
+                        "novel": novel,
+                        "sun": sun,
+                        "_relax_debug": relax_debug,
+                    }
+        else:
+            public_attrs = [name for name in dir(relaxed) if not name.startswith("_")]
+            relax_debug["public_attrs"] = public_attrs[:100]
+            for key in ("final_atoms", "atoms", "relaxed_atoms"):
+                candidate = getattr(relaxed, key, None)
+                if candidate is not None and hasattr(candidate, "get_positions"):
+                    relaxed_atoms = candidate
+                    break
+            if relaxed_atoms is None:
+                relaxed_structure = getattr(relaxed, "relaxed_structure", None)
+                if isinstance(relaxed_structure, Structure):
+                    total_energy = getattr(relaxed, "energy", None)
+                    energy_per_atom = getattr(relaxed, "energy_per_atom", None)
+                    if energy_per_atom is None and total_energy is not None:
+                        energy_per_atom = float(total_energy) / len(relaxed_structure)
+                    energy_above_hull = hull_fn(relaxed_structure, energy_per_atom) if hull_fn is not None else None
+                    stable = energy_above_hull <= 0.1 if energy_above_hull is not None else None
+                    novel = novelty_fn(relaxed_structure) if novelty_fn is not None else None
+                    unique = True
+                    sun = None if stable is None or novel is None else bool(stable and unique and novel)
+                    return {
+                        "relaxed_structure": relaxed_structure,
+                        "energy_per_atom": energy_per_atom,
+                        "energy_above_hull": energy_above_hull,
+                        "stable": stable,
+                        "unique": unique,
+                        "novel": novel,
+                        "sun": sun,
+                        "_relax_debug": relax_debug,
+                    }
+
+        if relaxed_atoms is None:
+            raise RuntimeError(
+                "MatterSim relaxation returned an unsupported object; could not extract relaxed atoms. "
+                f"debug={relax_debug}"
+            )
+
+        relaxed_structure = adaptor.get_structure(relaxed_atoms)
+        total_energy = None
+        try:
+            total_energy = float(relaxed_atoms.get_potential_energy())
+        except Exception:
+            total_energy = None
+        energy_per_atom = None if total_energy is None else total_energy / len(relaxed_structure)
+        energy_above_hull = hull_fn(relaxed_structure, energy_per_atom) if hull_fn is not None else None
+        stable = energy_above_hull <= 0.1 if energy_above_hull is not None else None
+        novel = novelty_fn(relaxed_structure) if novelty_fn is not None else None
+        unique = True
+        sun = None if stable is None or novel is None else bool(stable and unique and novel)
+
+        return {
+            "relaxed_structure": relaxed_structure,
+            "energy_per_atom": energy_per_atom,
+            "energy_above_hull": energy_above_hull,
+            "stable": stable,
+            "unique": unique,
+            "novel": novel,
+            "sun": sun,
+            "_relax_debug": relax_debug,
+        }
+
+    return relax_fn
+
+
+def aggregate_csp_metrics(results: list[SampleEvaluationResult]) -> dict[str, Any]:
+    """Aggregate KLDM-style metrics over many CSP samples."""
+    if not results:
+        return {
+            "num_samples": 0,
+            "validity_structure_percent": None,
+            "validity_composition_percent": None,
+            "rmsd_angstrom": None,
+            "avg_above_hull_ev_atom": None,
+            "stable_percent": None,
+            "sun_percent": None,
+        }
+
+    def _mean_optional(values: list[Optional[float]]) -> Optional[float]:
+        present = [float(v) for v in values if v is not None]
+        if not present:
+            return None
+        return float(sum(present) / len(present))
+
+    validity_structure = [
+        _single_sample_percentage(r.metrics.get("validity_structure"))
+        for r in results
+    ]
+    validity_composition = [
+        _single_sample_percentage(r.metrics.get("validity_composition"))
+        for r in results
+    ]
+
+    return {
+        "num_samples": len(results),
+        "validity_structure_percent": _mean_optional(validity_structure),
+        "validity_composition_percent": _mean_optional(validity_composition),
+        "rmsd_angstrom": _mean_optional([r.metrics.get("rmsd_angstrom") for r in results]),
+        "avg_above_hull_ev_atom": _mean_optional([r.metrics.get("avg_above_hull_ev_atom") for r in results]),
+        "stable_percent": _mean_optional([_single_sample_percentage(r.metrics.get("stable_flag")) for r in results]),
+        "sun_percent": _mean_optional(
+            [_single_sample_percentage(r.stability_proxy.get("relaxation_result", {}).get("sun") if isinstance(r.stability_proxy.get("relaxation_result"), dict) else None) for r in results]
+        ),
+    }
+
+
+def aggregate_dng_metrics(results: list[SampleEvaluationResult]) -> dict[str, Any]:
+    """
+    Backward-compatible alias for the previous name.
+
+    The aggregation logic is task-agnostic, but CSP now uses the same metric
+    summary path.
+    """
+    return aggregate_csp_metrics(results)
+
+
 def evaluate_sample(
     f: torch.Tensor | list[list[float]],
     l: torch.Tensor | list[float] | list[list[float]],
@@ -399,10 +617,7 @@ def evaluate_sample(
     geometry_ok = structure is not None and not geometric_sanity.get("reject_too_close", False) and bool(
         geometric_sanity.get("structure_valid", structure is not None)
     )
-    composition_valid = chemical_sanity.get("composition_valid")
-    chemistry_ok = basic_validity["all_species_valid"] and structure is not None and (
-        composition_valid is not False
-    )
+    chemistry_ok = basic_validity["all_species_valid"] and structure is not None
 
     metrics = {
         "validity_structure": geometric_sanity.get("structure_valid"),
@@ -414,8 +629,14 @@ def evaluate_sample(
         "fp_structural_available": chemical_sanity.get("structure_fingerprint") is not None,
         "rmsd_angstrom": None,
         "avg_above_hull_ev_atom": None,
-        "stable_percent": None,
-        "sun_percent": None,
+        "stable_flag": None,
+        "novel_flag": None,
+    }
+    metric_status = {
+        "rmsd_angstrom": "unavailable: requires relaxed_structure from relax_fn or a reference structure",
+        "avg_above_hull_ev_atom": "unavailable: requires energy_above_hull/e_above_hull from relax_fn or hull backend",
+        "stable_flag": "unavailable: requires stable flag or energy_above_hull from relax_fn",
+        "novel_flag": "unavailable: requires novelty backend outside per-sample evaluation",
     }
 
     relaxation_result = stability_proxy.get("relaxation_result")
@@ -428,14 +649,26 @@ def evaluate_sample(
         stable_flag = relaxation_result.get("stable")
         if stable_flag is None and e_above_hull is not None:
             stable_flag = float(e_above_hull) <= 0.1
-        sun_flag = relaxation_result.get("sun")
-        if sun_flag is None:
-            sun_flag = relaxation_result.get("structure_unrelaxed_and_novel")
+        novel_flag = relaxation_result.get("novel")
 
         metrics["rmsd_angstrom"] = rmsd_angstrom
         metrics["avg_above_hull_ev_atom"] = None if e_above_hull is None else float(e_above_hull)
-        metrics["stable_percent"] = _single_sample_percentage(stable_flag)
-        metrics["sun_percent"] = _single_sample_percentage(sun_flag)
+        metrics["stable_flag"] = None if stable_flag is None else bool(stable_flag)
+        metrics["novel_flag"] = None if novel_flag is None else bool(novel_flag)
+        metric_status["rmsd_angstrom"] = "ok" if rmsd_angstrom is not None else metric_status["rmsd_angstrom"]
+        if rmsd_angstrom is None and relaxed_structure is not None:
+            metric_status["rmsd_angstrom"] = (
+                "unavailable: relaxed_structure exists but StructureMatcher could not compute RMSD"
+            )
+        metric_status["avg_above_hull_ev_atom"] = (
+            "ok" if metrics["avg_above_hull_ev_atom"] is not None else metric_status["avg_above_hull_ev_atom"]
+        )
+        metric_status["stable_flag"] = (
+            "ok" if metrics["stable_flag"] is not None else metric_status["stable_flag"]
+        )
+        metric_status["novel_flag"] = (
+            "ok" if metrics["novel_flag"] is not None else metric_status["novel_flag"]
+        )
 
     if build_error is not None:
         geometric_sanity["build_error"] = build_error
@@ -443,6 +676,7 @@ def evaluate_sample(
     return SampleEvaluationResult(
         is_valid=all_basic and geometry_ok and chemistry_ok,
         metrics=metrics,
+        metric_status=metric_status,
         basic_validity=basic_validity,
         geometric_sanity=geometric_sanity,
         chemical_sanity=chemical_sanity,

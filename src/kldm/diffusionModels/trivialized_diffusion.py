@@ -13,7 +13,7 @@ if __package__ in {None, ""}:
 from kldm.data import CSPTask, DNGTask, resolve_data_root
 
 from kldm.distribution import d_log_wrapped_normal
-
+from kldm.scoreNetwork.utils import scatter_center
 
 ################################################################
 ####### NOTE:                                               ####
@@ -80,11 +80,12 @@ class TrivialisedDiffusion(nn.Module):
         self,
         t: torch.Tensor,
         f0: torch.Tensor,
+        index: torch.Tensor,
         v0: torch.Tensor | None = None,
         epsilon_v: torch.Tensor | None = None,
         epsilon_r: torch.Tensor | None = None,
-
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+
 
         #Now we do T = [0,2] time scaling in order for TDM to converge.
         t = self.time_scaling_T * t
@@ -103,10 +104,15 @@ class TrivialisedDiffusion(nn.Module):
         #######################
 
         #Vi sætter v0 = 0, [Design choice] at time t = 0
-        v0 = torch.zeros_like(f0)                               #Design choice: Initial zero velocities
+        if v0 is None:
+            v0 = torch.zeros_like(f0)                               #Design choice: Initial zero velocities
 
-        #Sample normal noise for velocity                       #TODO:  Nv is a normal distribution such that ∑vi = 0
-        epsilon_v = torch.randn_like(v0)
+        #TODO: Scatter center mean free, også det de gør i KLDM
+
+        #Sample normal noise for velocity                       # Nv is a normal distribution such that ∑vi = 0
+        if epsilon_v is None:
+            epsilon_v = torch.randn_like(v0)
+        epsilon_v = scatter_center(epsilon_v, index=index) #Zero mean
 
         #Alpha_v_t = exp(-t)
         alpha_v_t = self._match_dims(self.alpha_v(t), v0)       #Equation 22
@@ -126,22 +132,28 @@ class TrivialisedDiffusion(nn.Module):
         sigma_r_t = self._match_dims(self.sigma_r_t(t), f0)
 
         #Sample normal noise on epsilon
-        epsilon_r = torch.randn_like(f0)                        #TODO: Nr is a normal distribution such that ∑vi = 0
+        if epsilon_r is None:
+            epsilon_r = torch.randn_like(f0)                        # Nr is a normal distribution such that ∑vi = 0
+        epsilon_r = scatter_center(epsilon_r, index=index)
 
         r_t = self.wrap_signed_unit(mu_r_t + sigma_r_t * epsilon_r)  # Signed wrapped displacement
 
         #Now we calculate displacement, and while we stay on the manifold.
         f_t = self.wrap_fractional(f0 + r_t)                               # Map back to [0, 1)
 
+        #Center again
+        f_t = scatter_center(f_t, index=index)
+        f_t = self.wrap_fractional(f_t)
 
         return f_t, v_t, epsilon_v, epsilon_r, r_t
 
     def score_target(
         self,
         t: torch.Tensor,
-        epsilon_v: torch.Tensor,
+        # epsilon_v: torch.Tensor, not needed due to our initial velocity assumption
         r_t: torch.Tensor,
         v_t: torch.Tensor,
+        index: torch.Tensor,
         v0: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Return the TDM velocity training target used by KLDM. """
@@ -150,12 +162,12 @@ class TrivialisedDiffusion(nn.Module):
         t = self.time_scaling_T * t
 
         #Design choice, makes the target quite simple to calculate.
-        v0 = torch.zeros_like(v_t)
+        v0 = torch.zeros_like(v_t) if v0 is None else v0
 
-        sigma_v_t = self._match_dims(self.sigma_v(t), epsilon_v)
+        sigma_v_t = self._match_dims(self.sigma_v(t), v_t)
 
         #Simplified target of normal velocity distribution
-        target_v = -v_t / (sigma_v_t ** 2)
+        gaussian_target = -v_t / sigma_v_t.clamp_min(self.eps).pow(2)
 
         #Now we find target of the wrapped normal fractional distribution
         mu_r_t = self.mu_r_t(t, v_t, v0)
@@ -163,15 +175,16 @@ class TrivialisedDiffusion(nn.Module):
         mu_r_t = self.wrap_signed_unit(mu_r_t)
 
         sigma_r_t = self._match_dims(self.sigma_r_t(t), r_t)
-        target_s = self._match_dims((1.0 - torch.exp(-t)) / (1.0 + torch.exp(-t)), r_t) * d_log_wrapped_normal(
+        wrapped_normal_target = self._match_dims((1.0 - torch.exp(-t)) / (1.0 + torch.exp(-t)), r_t) * d_log_wrapped_normal(
             r=r_t,
             mu=mu_r_t,
             sigma=sigma_r_t,
         )
+        wrapped_normal_target = scatter_center(wrapped_normal_target, index=index)
 
-        target = target_v + target_s
-
+        target = gaussian_target + wrapped_normal_target
         return target
+        #return target_s
 
 
     @staticmethod
@@ -180,3 +193,32 @@ class TrivialisedDiffusion(nn.Module):
         while coeff.ndim < x.ndim:
             coeff = coeff.unsqueeze(-1)
         return coeff
+
+
+    #Sampling - Reverse eueler-maryuama
+    def reverse_em_step(
+        self,
+        t: torch.Tensor,
+        f_t: torch.Tensor,
+        v_t: torch.Tensor,
+        score_v: torch.Tensor,
+        dt: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        One reverse Euler-Maruyama step for KLDM coordinates/velocities.
+
+        Uses:
+            dv = (v_t - 2 * score_v) dt + sqrt(2 dt) dW
+            df = -v_t dt, followed by wrapping back to [0,1)
+
+        Notes:
+        - input t is normalized time in [0,1]
+        - this method internally maps to KLDM time when needed
+        """
+        del t  # not needed explicitly in this simple reverse step
+
+        noise_v = torch.randn_like(v_t)
+        v_prev = v_t + (v_t - 2.0 * score_v) * dt + (2.0 * dt) ** 0.5 * noise_v
+        f_prev = self.wrap_fractional(f_t - v_prev * dt)
+
+        return f_prev, v_prev

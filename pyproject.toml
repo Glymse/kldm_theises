@@ -37,6 +37,7 @@ dependencies = [
   "wandb>=0.25.1",
   "smact>=3.2.0",
   "matminer>=0.9.3",
+  "mattersim>=1.1.2",
 ]
 
 [dependency-groups]
