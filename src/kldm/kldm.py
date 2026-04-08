@@ -13,7 +13,7 @@ import torch.nn.functional as F
 from torch import nn
 from torch_geometric.data import Data, Batch
 
-from kldm.data import DNGTask, CSPTask
+from kldm.data import CSPTask
 from kldm.diffusionModels.continuous import ContinuousVPDiffusion
 from kldm.diffusionModels.trivialized_diffusion import TrivialisedDiffusion as TDM
 from kldm.distribution.uniform import sample_uniform
@@ -33,7 +33,7 @@ class ModelKLDM(nn.Module):
         score_network: Optional[CSPVNet] = None,
         diffusion_v: Optional[TDM] = None,
         diffusion_l: Optional[ContinuousVPDiffusion] = None,
-        diffusion_a: Optional[ContinuousVPDiffusion] = None,
+        #diffusion_h: Optional[ContinuousVPDiffusion] = None, Deactive when DNG ready
         device: Optional[torch.device] = None,
         eps: float = 1e-3,
     ) -> None:
@@ -43,16 +43,15 @@ class ModelKLDM(nn.Module):
             hidden_dim=128,
             num_layers=4,
             h_dim=118,
-            smooth=True,
+            smooth=False,
             pred_v=True,
             pred_l=True,
-            pred_h=True,
+            pred_h=False,
+            zero_cog=True # center-of-mass / zero mean per graph.
         )
 
         self.tdm = diffusion_v or TDM(eps=eps)
         self.diffusion_l = diffusion_l or ContinuousVPDiffusion(eps=eps)
-        self.diffusion_a = diffusion_a or ContinuousVPDiffusion(eps=eps)
-
         self.device = device or torch.device("cpu")
         self.eps = eps
         self.task_type: Optional[str] = None
@@ -79,8 +78,6 @@ class ModelKLDM(nn.Module):
 
         index = batch.batch
         t_node = t_graph[index].squeeze(-1)
-        is_dng = hasattr(batch, "task_id") and bool((batch.task_id == 1).all())
-
         # Diffuse lattice, KLDM Alg. 1
         l_t, eps_l = self.diffusion_l.forward_sample(
             t=t_graph.squeeze(-1),
@@ -88,28 +85,19 @@ class ModelKLDM(nn.Module):
         )
         target_l = eps_l
 
-        # Sample (f_t, v_t), KLDM Eqs. (16), (22), (23)
         f_t, v_t, epsilon_v, epsilon_r, r_t = self.tdm.forward_sample(
             t=t_node,
             f0=batch.pos,
+            index=index,
         )
 
-        # Velocity target, KLDM Eq. (19)
         target_v = self.tdm.score_target(
             t=t_node,
-            epsilon_v=epsilon_v,
             r_t=r_t,
             v_t=v_t,
+            index=index,
         )
 
-        if is_dng:
-            # Diffuse atom types, KLDM Alg. 1
-            a_t, eps_a = self.diffusion_a.forward_sample(
-                t=t_node,
-                x0=batch.h,
-            )
-            target_a = eps_a
-            return (v_t, f_t, l_t, a_t), (target_v, target_l, target_a)
 
         return (v_t, f_t, l_t), (target_v, target_l)
 
@@ -134,9 +122,6 @@ class ModelKLDM(nn.Module):
         t_node: torch.Tensor,
         lambda_t_fn: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
     ) -> torch.Tensor:
-        """
-        Resolve the KLDM velocity weighting lambda(t).
-        """
         if lambda_t_fn is None:
             return torch.ones_like(t_node)
         return lambda_t_fn(t_node).to(t_node.device)
@@ -177,7 +162,6 @@ class ModelKLDM(nn.Module):
         t: torch.Tensor,
         lambda_v: float = 1.0,
         lambda_l: float = 1.0,
-        lambda_a: float = 20, #Appendix, page 29
         lambda_t_fn: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """
@@ -193,18 +177,12 @@ class ModelKLDM(nn.Module):
 
         index = batch.batch
         t_node = t_graph[index].squeeze(-1)
-        is_dng = hasattr(batch, "task_id") and bool((batch.task_id == 1).all())
-
         # Algorithm 1
         noisy, targets = self.algorithm1_training_targets(batch=batch, t=t_graph)
 
-        if is_dng:
-            v_t, f_t, l_t, a_t = noisy
-            target_v, target_l, target_a = targets
-        else:
-            v_t, f_t, l_t = noisy
-            target_v, target_l = targets
-            a_t = batch.h
+        v_t, f_t, l_t = noisy
+        target_v, target_l = targets
+        a_t = batch.h
 
         # Network prediction, KLDM Alg. 2
         preds = self.score_network(
@@ -222,30 +200,19 @@ class ModelKLDM(nn.Module):
         out_l = preds["l"]
 
         # Full velocity score, KLDM Eq. (19)
-        t_internal = self.tdm.time_scaling_T * t_node
+        t_internal = self.tdm.time_scaling_T * t_node #Time scaling for TDM
         exp_coef = self.tdm._match_dims((1.0 - torch.exp(-t_internal)) / (1.0 + torch.exp(-t_internal)), out_v)
         sigma_v_sq = self.tdm._match_dims(self.tdm.sigma_v(t_internal) ** 2, out_v)
 
         #The simplified score, assuming initial velocity is 0
-        score_v = exp_coef * out_v - v_t / sigma_v_sq
+        score_v = exp_coef * out_v - v_t / sigma_v_sq.clamp_min(1e-8)
 
-        # KLDM: plain squared error for lattice and atom targets.
+        # KLDM: plain squared error for lattice targets.
         loss_l = self.mse_loss_per_sample(preds["l"], target_l).mean()
 
         # KLDM: lambda(t) * ||score_v - target_v||^2
         lambda_t = self.lambda_t(t_node=t_node, lambda_t_fn=lambda_t_fn)
         loss_v = (lambda_t * self.mse_loss_per_sample(score_v, target_v)).mean()
-
-        if is_dng:
-            loss_a = self.mse_loss_per_sample(preds["h"], target_a).mean()
-
-            total_loss = lambda_v * loss_v + lambda_l * loss_l + lambda_a * loss_a
-            return total_loss, {
-                "loss": total_loss.detach(),
-                "loss_v": loss_v.detach(),
-                "loss_l": loss_l.detach(),
-                "loss_a": loss_a.detach(),
-            }
 
         total_loss = lambda_v * loss_v + lambda_l * loss_l
         return total_loss, {
@@ -259,7 +226,7 @@ class ModelKLDM(nn.Module):
     # ============================================================================
     # ALGORITHM 3 - Sampling algorithm
     # ============================================================================
-    def _load_dng_checkpoint(self, checkpoint_path: str = "artifacts/dng_final_model.pt") -> "ModelKLDM":
+    def _load_csp_checkpoint(self, checkpoint_path: str = "artifacts/csp_final_model.pt") -> "ModelKLDM":
         device = next(self.parameters()).device
         checkpoint = torch.load(checkpoint_path, map_location=device)
         model = ModelKLDM(device=device).to(device)
@@ -323,17 +290,18 @@ class ModelKLDM(nn.Module):
         )
         return prefactor * pred_v - v_t / sigma_v_sq.clamp_min(1e-8)
 
-    def sample_DNG_algorithm3(
+    def sample_CSP_algorithm3(
         self,
         n_steps: int,
         batch: Batch | Data,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        Algorithm 3 in KLDM paper for the DNG task.
+        Algorithm 3-style sampling for the CSP task.
 
         Returns:
-            f_0, v_t, l_0, a_0
+            f_0, v_t, l_0, h
         """
+
         device = next(self.parameters()).device
         batch = batch.to(device)
 
@@ -345,10 +313,10 @@ class ModelKLDM(nn.Module):
         f_t = torch.rand_like(batch.pos)
         v_t = torch.randn_like(batch.pos)
         l_t = torch.randn_like(batch.l)
-        a_t = torch.randn_like(batch.h)
+        h = batch.h
 
         # Load trained score model s_theta
-        trained_model = self._load_dng_checkpoint("artifacts/dng_final_model.pt")
+        trained_model = self._load_csp_checkpoint("artifacts/csp_final_model.pt")
 
         # Reverse-time grid: 1 -> eps
         ts = torch.linspace(1.0, self.eps, n_steps + 1, device=device)
@@ -367,7 +335,7 @@ class ModelKLDM(nn.Module):
                     t=t_graph,
                     pos=f_t,
                     v=v_t,
-                    h=a_t,
+                    h=h,
                     l=l_t,
                     node_index=node_index,
                     edge_node_index=edge_node_index,
@@ -375,7 +343,6 @@ class ModelKLDM(nn.Module):
 
                 out_v = preds["v"]
                 out_l = preds["l"]
-                out_a = preds["h"]
 
                 # Step 3: construct velocity score, KLDM Eq. (19)
                 score_v = self._construct_velocity_score(
@@ -404,23 +371,14 @@ class ModelKLDM(nn.Module):
                     diffusion=self.diffusion_l,
                 )
 
-                a_t = self._vp_reverse_step_from_eps(
-                    x_t=a_t,
-                    pred_eps=out_a,
-                    t_now=t_node,
-                    t_next=t_node_next,
-                    diffusion=self.diffusion_a,
-                )
-
             # Final denoising step at t = eps
             t_graph = torch.full((num_graphs, 1), self.eps, device=device)
-            t_node = t_graph[node_index].squeeze(-1)
 
             final_preds = trained_model.score_network(
                 t=t_graph,
                 pos=f_t,
                 v=v_t,
-                h=a_t,
+                h=h,
                 l=l_t,
                 node_index=node_index,
                 edge_node_index=edge_node_index,
@@ -433,16 +391,9 @@ class ModelKLDM(nn.Module):
                 diffusion=self.diffusion_l,
             )
 
-            a_0 = self._vp_denoise_x0_from_eps(
-                x_t=a_t,
-                pred_eps=final_preds["h"],
-                t=t_node,
-                diffusion=self.diffusion_a,
-            )
-
             f_0 = self.tdm.wrap_fractional(f_t)
 
-        return f_0, v_t, l_0, a_0
+        return f_0, v_t, l_0, h
 
 
 
@@ -452,7 +403,7 @@ def main() -> None:
     from kldm.data import resolve_data_root
     root = resolve_data_root()
 
-    loader = DNGTask().dataloader(
+    loader = CSPTask().dataloader(
         root=root,
         split="val",
         batch_size=1,
@@ -463,12 +414,12 @@ def main() -> None:
 
     model = ModelKLDM(device=device).to(device)
 
-    pos_t, v_t, l_t, h_t = model.sample_DNG_algorithm3(
-        N=1000,
+    pos_t, v_t, l_t, h_t = model.sample_CSP_algorithm3(
+        n_steps=1000,
         batch=batch,
     )
 
-    print("Sampled one DNG crystal")
+    print("Sampled one CSP crystal")
     print("pos shape:", tuple(pos_t.shape))
     print("v shape:", tuple(v_t.shape))
     print("l shape:", tuple(l_t.shape))

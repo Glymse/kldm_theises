@@ -5,7 +5,7 @@ from pathlib import Path
 from torch.utils.data import DataLoader
 
 from .dataset import MP20, resolve_data_root
-from .transform import ContinuousIntervalLattice, CopyProperty, FullyConnectedGraph, TaskMetadata
+from .transform import ContinuousIntervalLattice, CopyProperty, DEFAULT_ATOMIC_VOCAB, FullyConnectedGraph, OneHot, TaskMetadata
 
 TASK_CSP = 0
 
@@ -13,7 +13,8 @@ TASK_CSP = 0
 class CSPTask:
     """Return CSP-ready MatterGen batches."""
 
-    def __init__(self) -> None:
+    def __init__(self, species_vocab: list[int] | None = None) -> None:
+        self.species_vocab = species_vocab or DEFAULT_ATOMIC_VOCAB
         self.transforms = [
             FullyConnectedGraph(),
             ContinuousIntervalLattice(),

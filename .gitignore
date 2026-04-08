@@ -2,6 +2,7 @@ docs/site/
 data/*
 wandb
 
+src/facitKLDM/*
 
 # test cache
 manual_test/

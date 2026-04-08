@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 from pathlib import Path
 import sys
 from typing import Any
@@ -9,9 +10,8 @@ if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import torch
-from torch import nn
 
-from kldm.data import DNGTask, resolve_data_root
+from kldm.data import CSPTask, resolve_data_root
 from kldm.distribution.uniform import sample_uniform
 from kldm.kldm import ModelKLDM
 
@@ -21,21 +21,10 @@ except ImportError as exc:  # pragma: no cover
     raise ImportError("wandb is required for src/kldm/train.py") from exc
 
 
+#TDM paper, benchmark this against baseline KLDM paper version.
 def tdm_paper_lambda(model: ModelKLDM, t_node: torch.Tensor) -> torch.Tensor:
     """Velocity weighting used by the current KLDM training path."""
     return torch.full_like(t_node, model.tdm.time_scaling_T ** 2)
-
-
-def reconstruct_clean_atom_logits(
-    model: ModelKLDM,
-    a_t: torch.Tensor,
-    pred_eps_a: torch.Tensor,
-    t_node: torch.Tensor,
-) -> torch.Tensor:
-    """Estimate clean atom logits from the noisy atom channel."""
-    alpha_t = model.diffusion_a._match_dims(model.diffusion_a.alpha(t_node), a_t)
-    sigma_t = model.diffusion_a._match_dims(model.diffusion_a.sigma(t_node), a_t)
-    return (a_t - sigma_t * pred_eps_a) / alpha_t
 
 
 def validation_step(
@@ -47,7 +36,6 @@ def validation_step(
     batch = batch.to(device)
 
     t_graph = sample_uniform(lb=model.diffusion_l.eps, size=(batch.num_graphs, 1), device=device)
-    t_node = t_graph[batch.batch].squeeze(-1)
 
     with torch.no_grad():
         loss, metrics = model.algorithm2_loss(
@@ -55,37 +43,13 @@ def validation_step(
             t=t_graph,
             lambda_v=1.0,
             lambda_l=1.0,
-            lambda_a=1.0,
-            lambda_t_fn=lambda x: tdm_paper_lambda(model, x),
+            lambda_t_fn=None#lambda x: tdm_paper_lambda(model, x),
         )
-
-        (v_t, f_t, l_t, a_t), _ = model.algorithm1_training_targets(batch, t_graph)
-        preds = model.score_network(
-            t=t_graph,
-            pos=f_t,
-            v=v_t,
-            h=a_t,
-            l=l_t,
-            node_index=batch.batch,
-            edge_node_index=batch.edge_node_index,
-        )
-
-        clean_atom_logits = reconstruct_clean_atom_logits(
-            model=model,
-            a_t=a_t,
-            pred_eps_a=preds["h"],
-            t_node=t_node,
-        )
-        pred_labels = clean_atom_logits.argmax(dim=-1)
-        true_labels = batch.h.argmax(dim=-1)
-        val_accuracy = (pred_labels == true_labels).float().mean()
 
     return {
         "loss": float(loss),
         "loss_v": float(metrics["loss_v"]),
         "loss_l": float(metrics["loss_l"]),
-        "loss_a": float(metrics["loss_a"]),
-        "val_accuracy": float(val_accuracy),
     }
 
 
@@ -94,12 +58,12 @@ def train_epoch(
     loader,
     optimizer: torch.optim.Optimizer,
     device: torch.device,
-    epoch: int,
 ) -> dict[str, float]:
     model.train()
-    running = {"loss": 0.0, "loss_v": 0.0, "loss_l": 0.0, "loss_a": 0.0}
+    running = {"loss": 0.0, "loss_v": 0.0, "loss_l": 0.0}
+    num_batches = 0
 
-    for step, batch in enumerate(loader):
+    for batch in loader:
         batch = batch.to(device)
         t_graph = sample_uniform(lb=model.diffusion_l.eps, size=(batch.num_graphs, 1), device=device)
 
@@ -109,18 +73,20 @@ def train_epoch(
             t=t_graph,
             lambda_v=1.0,
             lambda_l=1.0,
-            lambda_a=1.0,
-            lambda_t_fn=lambda x: tdm_paper_lambda(model, x),
+            lambda_t_fn=None,
         )
         loss.backward()
         optimizer.step()
 
         for key in running:
             running[key] += float(metrics[key])
+        num_batches += 1
 
-    num_steps = step + 1
+    if num_batches == 0:
+        raise RuntimeError("Training loader is empty; cannot compute epoch metrics.")
+
     for key in running:
-        running[key] /= num_steps
+        running[key] /= num_batches
     return running
 
 
@@ -129,17 +95,38 @@ def evaluate(
     loader,
     device: torch.device,
 ) -> dict[str, float]:
-    totals = {"loss": 0.0, "loss_v": 0.0, "loss_l": 0.0, "loss_a": 0.0, "val_accuracy": 0.0}
+    totals = {"loss": 0.0, "loss_v": 0.0, "loss_l": 0.0}
+    num_batches = 0
 
-    for step, batch in enumerate(loader):
+    for batch in loader:
         metrics = validation_step(model=model, batch=batch, device=device)
         for key in totals:
             totals[key] += metrics[key]
+        num_batches += 1
 
-    num_steps = step + 1
+    if num_batches == 0:
+        raise RuntimeError("Validation loader is empty; cannot compute epoch metrics.")
+
     for key in totals:
-        totals[key] /= num_steps
+        totals[key] /= num_batches
     return totals
+
+
+def export_history(history: list[dict[str, float]], output_path: Path) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = [
+        "epoch",
+        "train_loss",
+        "train_loss_v",
+        "train_loss_l",
+        "val_loss",
+        "val_loss_v",
+        "val_loss_l",
+    ]
+    with output_path.open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(history)
 
 
 def export_final_model(
@@ -160,7 +147,7 @@ def export_final_model(
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train KLDM on the DNG task.")
+    parser = argparse.ArgumentParser(description="Train KLDM on the CSP task.")
     parser.add_argument(
         "--epoch",
         "--epochs",
@@ -178,23 +165,22 @@ def train() -> None:
     root = resolve_data_root()
 
     config = {
-        "task": "DNG",
+        "task": "CSP",
         "epochs": args.epochs,
         "batch_size": 64,
         "lr": 1e-3,
         "lambda_v": 1.0,
         "lambda_l": 1.0,
-        "lambda_a": 1.0,
     }
 
-    train_loader = DNGTask().dataloader(
+    train_loader = CSPTask().dataloader(
         root=root,
         split="train",
         batch_size=config["batch_size"],
         shuffle=True,
         download=True,
     )
-    val_loader = DNGTask().dataloader(
+    val_loader = CSPTask().dataloader(
         root=root,
         split="val",
         batch_size=config["batch_size"],
@@ -206,46 +192,72 @@ def train() -> None:
     optimizer = torch.optim.Adam(model.parameters(), lr=config["lr"])
 
     run = wandb.init(
-        project="kldm-dng",
+        project="kldm-csp",
         config=config,
-        name=f"dng_{config['epochs']}_epochs",
+        name=f"csp_{config['epochs']}_epochs",
     )
 
-    output_path = Path("artifacts") / "dng_final_model.pt"
+    output_path = Path("artifacts") / "csp_final_model.pt"
+    history_path = Path("artifacts") / "csp_training_history.csv"
+    best_output_path = Path("artifacts") / "csp_best_model.pt"
+    history: list[dict[str, float]] = []
+    best_val_loss = float("inf")
 
-    for epoch in range(config["epochs"]):
+    for epoch_idx in range(config["epochs"]):
+        epoch = epoch_idx + 1
         train_metrics = train_epoch(
             model=model,
             loader=train_loader,
             optimizer=optimizer,
             device=device,
-            epoch=epoch,
         )
         val_metrics = evaluate(model=model, loader=val_loader, device=device)
 
+        epoch_record = {
+            "epoch": float(epoch),
+            "train_loss": train_metrics["loss"],
+            "train_loss_v": train_metrics["loss_v"],
+            "train_loss_l": train_metrics["loss_l"],
+            "val_loss": val_metrics["loss"],
+            "val_loss_v": val_metrics["loss_v"],
+            "val_loss_l": val_metrics["loss_l"],
+        }
+        history.append(epoch_record)
+
         log_metrics = {
             "epoch": epoch,
+            "train/epoch_loss": train_metrics["loss"],
+            "train/epoch_loss_v": train_metrics["loss_v"],
+            "train/epoch_loss_l": train_metrics["loss_l"],
+            "val/epoch_loss": val_metrics["loss"],
+            "val/epoch_loss_v": val_metrics["loss_v"],
+            "val/epoch_loss_l": val_metrics["loss_l"],
             "train/loss": train_metrics["loss"],
             "train/loss_v": train_metrics["loss_v"],
             "train/loss_l": train_metrics["loss_l"],
-            "train/loss_a": train_metrics["loss_a"],
             "val/loss": val_metrics["loss"],
             "val/loss_v": val_metrics["loss_v"],
             "val/loss_l": val_metrics["loss_l"],
-            "val/loss_a": val_metrics["loss_a"],
-            "val/accuracy": val_metrics["val_accuracy"],
         }
         wandb.log(log_metrics)
 
         print(
-            f"epoch={epoch:03d} "
+            f"epoch={epoch:03d}/{config['epochs']:03d} "
             f"train_loss={train_metrics['loss']:.6f} "
-            f"(v={train_metrics['loss_v']:.4f}, l={train_metrics['loss_l']:.4f}, a={train_metrics['loss_a']:.4f}) "
+            f"(v={train_metrics['loss_v']:.4f}, l={train_metrics['loss_l']:.4f}) "
             f"val_loss={val_metrics['loss']:.6f} "
-            f"(v={val_metrics['loss_v']:.4f}, l={val_metrics['loss_l']:.4f}, a={val_metrics['loss_a']:.4f}) "
-            f"val_acc={val_metrics['val_accuracy']:.4f} "
+            f"(v={val_metrics['loss_v']:.4f}, l={val_metrics['loss_l']:.4f}) "
             f"device={device.type}"
         )
+
+        if val_metrics["loss"] < best_val_loss:
+            best_val_loss = val_metrics["loss"]
+            export_final_model(
+                model=model,
+                optimizer=optimizer,
+                output_path=best_output_path,
+                config=config | {"best_val_loss": best_val_loss, "best_epoch": epoch},
+            )
 
     export_final_model(
         model=model,
@@ -253,8 +265,13 @@ def train() -> None:
         output_path=output_path,
         config=config,
     )
-    artifact = wandb.Artifact("dng_final_model", type="model")
+    export_history(history=history, output_path=history_path)
+    artifact = wandb.Artifact("csp_final_model", type="model")
     artifact.add_file(str(output_path))
+    if best_output_path.exists():
+        artifact.add_file(str(best_output_path))
+    if history_path.exists():
+        artifact.add_file(str(history_path))
     run.log_artifact(artifact)
     wandb.finish()
 
