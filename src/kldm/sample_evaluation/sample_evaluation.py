@@ -62,11 +62,20 @@ class SampleEvaluationResult:
     structure: Any = None
 
 
+@dataclass
+class CSPReconstructionResult:
+    valid: bool
+    match: bool
+    rmse: Optional[float]
+    predicted_structure: Any
+    target_structure: Any
+    formula: Optional[str] = None
+
+
 def validity_structure(structure: Structure, cutoff: float = 0.5, max_length: float = 40.0, min_volume: float = 0.1) -> bool:
     try:
-        distance_matrix = structure.distance_matrix
-    except Exception as exc:
-        warnings.warn(f"In the structure validity the following error occurred: {exc}")
+        distance_matrix = np.asarray(structure.distance_matrix, dtype=float)
+    except Exception:
         return False
 
     distance_matrix = distance_matrix + np.diag(np.ones(distance_matrix.shape[0]) * (cutoff + 10.0))
@@ -227,6 +236,52 @@ def decode_lattice(
     return lengths, angles_deg
 
 
+def build_structure_from_sample(
+    f: torch.Tensor | list[list[float]],
+    l: torch.Tensor | list[float] | list[list[float]],
+    a: torch.Tensor | list[int] | list[list[float]],
+    *,
+    species_vocab: Optional[list[int]] = None,
+    lattice_transform: Optional[ContinuousIntervalLattice] = None,
+    sort_structure: bool = True,
+) -> Structure:
+    _require_pymatgen()
+
+    frac_coords = _to_2d_tensor(f)
+    if frac_coords.shape[-1] != 3:
+        raise ValueError(f"Expected fractional coordinates with last dim 3, got shape {tuple(frac_coords.shape)}")
+
+    n_atoms = int(frac_coords.shape[0])
+    _, species = decode_atom_types(a=a, species_vocab=species_vocab)
+    lengths, angles_deg = decode_lattice(l=l, n_atoms=n_atoms, lattice_transform=lattice_transform)
+    if not torch.isfinite(frac_coords).all():
+        raise ValueError("Predicted fractional coordinates contain non-finite values.")
+    if not torch.isfinite(lengths).all() or not torch.isfinite(angles_deg).all():
+        raise ValueError("Decoded lattice contains non-finite lengths or angles.")
+    if not (lengths > 0.0).all():
+        raise ValueError("Decoded lattice contains non-positive lengths.")
+    if not _angles_define_physical_cell(angles_deg):
+        raise ValueError("Decoded lattice angles do not define a physical cell.")
+
+    lattice = Lattice.from_parameters(
+        a=float(lengths[0].item()),
+        b=float(lengths[1].item()),
+        c=float(lengths[2].item()),
+        alpha=float(angles_deg[0].item()),
+        beta=float(angles_deg[1].item()),
+        gamma=float(angles_deg[2].item()),
+    )
+    structure = Structure(
+        lattice=lattice,
+        species=species,
+        coords=(frac_coords % 1.0).detach().cpu().tolist(),
+        coords_are_cartesian=False,
+    )
+    if sort_structure:
+        structure = structure.get_sorted_structure()
+    return structure
+
+
 def _angles_define_physical_cell(angles_deg: torch.Tensor) -> bool:
     alpha, beta, gamma = [float(x) for x in angles_deg.tolist()]
     if not (0.0 < alpha < 180.0 and 0.0 < beta < 180.0 and 0.0 < gamma < 180.0):
@@ -248,6 +303,102 @@ def _compute_rmsd_angstrom(
 ) -> Optional[float]:
     if structure is None or relaxed_structure is None or StructureMatcher is None:
         return None
+
+
+def evaluate_csp_reconstruction(
+    *,
+    pred_f: torch.Tensor | list[list[float]],
+    pred_l: torch.Tensor | list[float] | list[list[float]],
+    pred_a: torch.Tensor | list[int] | list[list[float]],
+    target_f: torch.Tensor | list[list[float]],
+    target_l: torch.Tensor | list[float] | list[list[float]],
+    target_a: torch.Tensor | list[int] | list[list[float]],
+    species_vocab: Optional[list[int]] = None,
+    lattice_transform: Optional[ContinuousIntervalLattice] = None,
+    stol: float = 0.5,
+    angle_tol: float = 10.0,
+    ltol: float = 0.3,
+) -> CSPReconstructionResult:
+    try:
+        pred_structure = build_structure_from_sample(
+            f=pred_f,
+            l=pred_l,
+            a=pred_a,
+            species_vocab=species_vocab,
+            lattice_transform=lattice_transform,
+        )
+    except Exception:
+        return CSPReconstructionResult(
+            valid=False,
+            match=False,
+            rmse=None,
+            predicted_structure=None,
+            target_structure=None,
+            formula=None,
+        )
+
+    try:
+        target_structure = build_structure_from_sample(
+            f=target_f,
+            l=target_l,
+            a=target_a,
+            species_vocab=species_vocab,
+            lattice_transform=lattice_transform,
+        )
+    except Exception:
+        return CSPReconstructionResult(
+            valid=False,
+            match=False,
+            rmse=None,
+            predicted_structure=pred_structure,
+            target_structure=None,
+            formula=pred_structure.composition.formula if pred_structure is not None else None,
+        )
+
+    valid = validity_structure(pred_structure)
+    match = False
+    rmse = None
+
+    if valid:
+        try:
+            matcher = StructureMatcher(stol=stol, angle_tol=angle_tol, ltol=ltol)
+            rms = matcher.get_rms_dist(pred_structure, target_structure)
+            match = rms is not None
+            if rms is not None:
+                rmse = float(rms[0])
+        except Exception:
+            match = False
+            rmse = None
+
+    return CSPReconstructionResult(
+        valid=valid,
+        match=match,
+        rmse=rmse,
+        predicted_structure=pred_structure,
+        target_structure=target_structure,
+        formula=pred_structure.composition.formula if pred_structure is not None else None,
+    )
+
+
+def aggregate_csp_reconstruction_metrics(results: list[CSPReconstructionResult]) -> dict[str, Any]:
+    if not results:
+        return {
+            "num_samples": 0,
+            "valid": None,
+            "match_rate": None,
+            "rmse": None,
+        }
+
+    valid_values = [1.0 if r.valid else 0.0 for r in results]
+    match_values = [1.0 if r.match else 0.0 for r in results]
+    rmses = [r.rmse for r in results if r.rmse is not None]
+
+    return {
+        "num_samples": len(results),
+        "valid": float(sum(valid_values) / len(valid_values)),
+        "match_rate": float(sum(match_values) / len(match_values)),
+        "rmse": None if not rmses else float(sum(rmses) / len(rmses)),
+    }
     try:
         matcher = StructureMatcher(primitive_cell=False, scale=True)
         rmsd = matcher.get_rms_dist(structure, relaxed_structure)

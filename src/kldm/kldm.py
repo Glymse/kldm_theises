@@ -18,6 +18,7 @@ from kldm.diffusionModels.continuous import ContinuousVPDiffusion
 from kldm.diffusionModels.trivialized_diffusion import TrivialisedDiffusion as TDM
 from kldm.distribution.uniform import sample_uniform
 from kldm.scoreNetwork.scoreNetwork import CSPVNet
+from kldm.scoreNetwork.utils import scatter_center
 
 
 logger = logging.getLogger(__name__)
@@ -55,6 +56,8 @@ class ModelKLDM(nn.Module):
         self.device = device or torch.device("cpu")
         self.eps = eps
         self.task_type: Optional[str] = None
+        self._cached_sampling_checkpoint_path: Optional[str] = None
+        self._cached_sampling_score_network: Optional[CSPVNet] = None
 
     # ============================================================================
     # ALGORITHM 1
@@ -126,30 +129,6 @@ class ModelKLDM(nn.Module):
             return torch.ones_like(t_node)
         return lambda_t_fn(t_node).to(t_node.device)
 
-    def _tdm_reverse_exp_step(
-        self,
-        t_node: torch.Tensor,
-        f_t: torch.Tensor,
-        v_t: torch.Tensor,
-        score_v: torch.Tensor,
-        dt: float,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Reverse exponential-integrator step for the TDM velocity process.
-        """
-        del t_node
-
-        dt_t = torch.as_tensor(dt, device=v_t.device, dtype=v_t.dtype)
-        noise_v = torch.randn_like(v_t)
-
-        exp_dt = torch.exp(dt_t)
-        expm1_dt = torch.expm1(dt_t)
-        noise_scale = torch.sqrt(torch.expm1(2.0 * dt_t))
-
-        v_prev = exp_dt * v_t + 2.0 * expm1_dt * score_v + noise_scale * noise_v
-        f_prev = self.tdm.wrap_fractional(f_t - dt_t * v_prev)
-
-        return f_prev, v_prev
 
 
     # ============================================================================
@@ -226,52 +205,24 @@ class ModelKLDM(nn.Module):
     # ============================================================================
     # ALGORITHM 3 - Sampling algorithm
     # ============================================================================
-    def _load_csp_checkpoint(self, checkpoint_path: str = "artifacts/csp_final_model.pt") -> "ModelKLDM":
+    def _load_csp_score_network(self, checkpoint_path: str = "artifacts/csp_final_model.pt") -> CSPVNet:
         device = next(self.parameters()).device
+        if (
+            self._cached_sampling_score_network is not None
+            and self._cached_sampling_checkpoint_path == checkpoint_path
+        ):
+            return self._cached_sampling_score_network
+
         checkpoint = torch.load(checkpoint_path, map_location=device)
         model = ModelKLDM(device=device).to(device)
         model.load_state_dict(checkpoint["model_state_dict"])
-        model.eval()
-        return model
+        score_network = model.score_network.to(device)
+        score_network.eval()
 
-    def _vp_denoise_x0_from_eps(
-        self,
-        x_t: torch.Tensor,
-        pred_eps: torch.Tensor,
-        t: torch.Tensor,
-        diffusion: ContinuousVPDiffusion,
-    ) -> torch.Tensor:
-        alpha_t = diffusion._match_dims(diffusion.alpha(t), x_t)
-        sigma_t = diffusion._match_dims(diffusion.sigma(t), x_t)
-        return (x_t - sigma_t * pred_eps) / alpha_t.clamp_min(1e-8)
+        self._cached_sampling_checkpoint_path = checkpoint_path
+        self._cached_sampling_score_network = score_network
+        return score_network
 
-    def _vp_reverse_step_from_eps(
-        self,
-        x_t: torch.Tensor,
-        pred_eps: torch.Tensor,
-        t_now: torch.Tensor,
-        t_next: torch.Tensor,
-        diffusion: ContinuousVPDiffusion,
-    ) -> torch.Tensor:
-        """
-        Stable VP reverse step using the model's epsilon prediction.
-
-        We first estimate x0 from the current noisy state, then sample the next
-        time level from the closed-form VP marginal at t_next:
-
-            x0_hat = (x_t - sigma(t_now) * eps_hat) / alpha(t_now)
-            x_{t_next} = alpha(t_next) * x0_hat + sigma(t_next) * z
-        """
-        x0_hat = self._vp_denoise_x0_from_eps(
-            x_t=x_t,
-            pred_eps=pred_eps,
-            t=t_now,
-            diffusion=diffusion,
-        )
-        alpha_next = diffusion._match_dims(diffusion.alpha(t_next), x_t)
-        sigma_next = diffusion._match_dims(diffusion.sigma(t_next), x_t)
-        noise = torch.randn_like(x_t)
-        return alpha_next * x0_hat + sigma_next * noise
 
     def _construct_velocity_score(
         self,
@@ -290,18 +241,50 @@ class ModelKLDM(nn.Module):
         )
         return prefactor * pred_v - v_t / sigma_v_sq.clamp_min(1e-8)
 
+    def _tdm_reverse_exp_step(
+        self,
+        t_node: torch.Tensor,
+        f_t: torch.Tensor,
+        v_t: torch.Tensor,
+        score_v: torch.Tensor,
+        index: torch.Tensor,
+        dt: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        del t_node
+
+        dt_t = torch.as_tensor(dt, device=v_t.device, dtype=v_t.dtype)
+        noise_v = scatter_center(torch.randn_like(v_t), index=index)
+
+        exp_dt = torch.exp(dt_t)
+        exp_2dt_minus_1 = torch.exp(2.0 * dt_t) - 1.0
+        noise_scale = torch.sqrt(exp_2dt_minus_1.clamp_min(1e-8))
+
+        v_prev = exp_dt * v_t + 2.0 * exp_2dt_minus_1 * score_v + noise_scale * noise_v
+        f_prev = self.tdm.wrap_fractional(f_t - dt_t * v_prev)
+
+        return f_prev, v_prev
+
+    def _vp_score_from_eps(
+        self,
+        pred_eps: torch.Tensor,
+        t: torch.Tensor,
+        diffusion: ContinuousVPDiffusion,
+    ) -> torch.Tensor:
+        sigma_t = diffusion._match_dims(diffusion.sigma(t), pred_eps)
+        return -pred_eps / sigma_t.clamp_min(1e-8)
+
     def sample_CSP_algorithm3(
         self,
         n_steps: int,
         batch: Batch | Data,
+        checkpoint_path: str = "artifacts/csp_final_model.pt",
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        Algorithm 3-style sampling for the CSP task.
+        Algorithm 3 sampling for CSP, KLDM-epsilon version.
 
         Returns:
-            f_0, v_t, l_0, h
+            f_N, v_N, l_N, a
         """
-
         device = next(self.parameters()).device
         batch = batch.to(device)
 
@@ -309,92 +292,72 @@ class ModelKLDM(nn.Module):
         edge_node_index = batch.edge_node_index
         num_graphs = batch.num_graphs
 
-        # Step 1: sample priors
-        f_t = torch.rand_like(batch.pos)
-        v_t = torch.randn_like(batch.pos)
+        # Algorithm 3 priors:
+        # v_T ~ N_v(0, I) with zero-net translation
+        # f_T ~ U(0, 1)
+        # l_T ~ N(0, I)
+        v_t = scatter_center(torch.randn_like(batch.pos), index=node_index)
+        f_t = self.tdm.wrap_fractional(torch.rand_like(batch.pos))
         l_t = torch.randn_like(batch.l)
-        h = batch.h
+        a_t = batch.h  # CSP conditioning
 
-        # Load trained score model s_theta
-        trained_model = self._load_csp_checkpoint("artifacts/csp_final_model.pt")
+        score_network = self._load_csp_score_network(checkpoint_path)
 
-        # Reverse-time grid: 1 -> eps
-        ts = torch.linspace(1.0, self.eps, n_steps + 1, device=device)
+        dt = 1.0 / n_steps
 
         with torch.no_grad():
-            for i in range(n_steps):
-                t_now = ts[i]
-                t_next = ts[i + 1]
-                dt = float((t_now - t_next).item())  # positive step size
-
-                t_graph = torch.full((num_graphs, 1), float(t_now.item()), device=device)
+            for n in range(1, n_steps + 1):
+                t_scalar = 1.0 - (n - 1) * dt
+                t_graph = torch.full((num_graphs, 1), t_scalar, device=device)
                 t_node = t_graph[node_index].squeeze(-1)
 
-                # Step 2: network prediction
-                preds = trained_model.score_network(
+                preds = score_network(
                     t=t_graph,
                     pos=f_t,
                     v=v_t,
-                    h=h,
+                    h=a_t,
                     l=l_t,
                     node_index=node_index,
                     edge_node_index=edge_node_index,
                 )
 
-                out_v = preds["v"]
-                out_l = preds["l"]
+                pred_v = preds["v"]
+                pred_l = preds["l"]
 
-                # Step 3: construct velocity score, KLDM Eq. (19)
+                # Eq. (19): construct KLDM simplified velocity score
                 score_v = self._construct_velocity_score(
                     t_node=t_node,
                     v_t=v_t,
-                    pred_v=out_v,
+                    pred_v=pred_v,
                 )
 
-                # Step 5: reverse updates
+                # Update v and f with exponential integrator
                 f_t, v_t = self._tdm_reverse_exp_step(
                     t_node=t_node,
                     f_t=f_t,
                     v_t=v_t,
                     score_v=score_v,
+                    index=node_index,
                     dt=dt,
                 )
 
-                t_graph_next = torch.full((num_graphs, 1), float(t_next.item()), device=device)
-                t_node_next = t_graph_next[node_index].squeeze(-1)
-
-                l_t = self._vp_reverse_step_from_eps(
-                    x_t=l_t,
-                    pred_eps=out_l,
-                    t_now=t_graph.squeeze(-1),
-                    t_next=t_graph_next.squeeze(-1),
+                # KLDM-epsilon lattice branch:
+                # Algorithm 3 does EM on l using the score corresponding to out_l
+                score_l = self._vp_score_from_eps(
+                    pred_eps=pred_l,
+                    t=t_graph.squeeze(-1),
                     diffusion=self.diffusion_l,
                 )
 
-            # Final denoising step at t = eps
-            t_graph = torch.full((num_graphs, 1), self.eps, device=device)
+                l_t = self.diffusion_l.reverse_em_step(
+                    t=t_graph.squeeze(-1),
+                    x_t=l_t,
+                    score_x=score_l,
+                    dt=dt,
+                )
 
-            final_preds = trained_model.score_network(
-                t=t_graph,
-                pos=f_t,
-                v=v_t,
-                h=h,
-                l=l_t,
-                node_index=node_index,
-                edge_node_index=edge_node_index,
-            )
-
-            l_0 = self._vp_denoise_x0_from_eps(
-                x_t=l_t,
-                pred_eps=final_preds["l"],
-                t=t_graph.squeeze(-1),
-                diffusion=self.diffusion_l,
-            )
-
-            f_0 = self.tdm.wrap_fractional(f_t)
-
-        return f_0, v_t, l_0, h
-
+            # For KLDM-epsilon Algorithm 3, return the final sampled l_N directly
+            return f_t, v_t, l_t, a_t
 
 
 def main() -> None:
