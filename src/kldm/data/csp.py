@@ -31,7 +31,7 @@ class CSPTask:
         split: str = "train",
         batch_size: int = 32,
         shuffle: bool = True,
-        num_workers: int = 0,
+        num_workers: int = 2,
         download: bool = False,
     ) -> DataLoader:
         dataset = self.fit_dataset(root=root, split=split, download=download)
