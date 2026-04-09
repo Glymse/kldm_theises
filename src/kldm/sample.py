@@ -64,6 +64,34 @@ def print_invalid_sample_diagnostic(
     print("volume:", float(structure.volume))
     print("min_interatomic_distance:", min_dist)
 
+def print_matching_sample(
+    *,
+    sample_idx: int,
+    pred_f: torch.Tensor,
+    pred_v: torch.Tensor,
+    pred_l: torch.Tensor,
+    pred_a: torch.Tensor,
+    result,
+) -> None:
+    atom_type_index = pred_a if pred_a.ndim == 1 else pred_a.argmax(dim=-1)
+
+    print(f"\nMatching CSP sample {sample_idx + 1:03d}")
+    print("pos shape:", tuple(pred_f.shape))
+    print("v shape:", tuple(pred_v.shape))
+    print("l shape:", tuple(pred_l.shape))
+    print("h shape:", tuple(pred_a.shape))
+    print("atom_type_index shape:", tuple(atom_type_index.shape))
+    print("First 3 sampled fractional coordinates:")
+    print(pred_f[:3])
+    print("Predicted atom type indices:")
+    print(atom_type_index)
+    print("Sampled lattice:")
+    print(pred_l)
+    print("valid:", result.valid)
+    print("match:", result.match)
+    print("RMSE:", result.rmse)
+    print("formula:", result.formula)
+
 
 def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -78,12 +106,11 @@ def main() -> None:
     )
 
     model = ModelKLDM(device=device).to(device)
-    max_samples = 10
+    max_samples = 100
     n_steps = 1000
     reconstruction_results = []
     oracle_lattice_results = []
     oracle_coordinate_results = []
-    invalid_diagnostics_printed = 0
     template_iter = itertools.cycle(loader)
 
     for sample_idx in range(max_samples):
@@ -104,7 +131,7 @@ def main() -> None:
                 target_a=batch.h,
             )
         except Exception as exc:
-            print(f"[sample {sample_idx:03d}] evaluation_error: {exc}")
+            print(f"[sample {sample_idx:15d}] evaluation_error: {exc}")
             continue
 
         try:
@@ -118,7 +145,7 @@ def main() -> None:
             )
             oracle_lattice_results.append(oracle_lattice_result)
         except Exception as exc:
-            print(f"[sample {sample_idx:03d}] oracle_lattice_error: {exc}")
+            print(f"[sample {sample_idx:15d}] oracle_lattice_error: {exc}")
 
         try:
             oracle_coordinate_result = evaluate_csp_reconstruction(
@@ -131,41 +158,30 @@ def main() -> None:
             )
             oracle_coordinate_results.append(oracle_coordinate_result)
         except Exception as exc:
-            print(f"[sample {sample_idx:03d}] oracle_coordinate_error: {exc}")
+            print(f"[sample {sample_idx:15d}] oracle_coordinate_error: {exc}")
 
         reconstruction_results.append(result)
-        atom_type_index = h_t if h_t.ndim == 1 else h_t.argmax(dim=-1)
 
         if not result.match:
-            if invalid_diagnostics_printed < 3:
-                print_invalid_sample_diagnostic(
-                    sample_idx=sample_idx,
-                    pred_f=pos_t,
-                    pred_l=l_t[0],
-                    pred_a=h_t,
-                )
-                print("valid:", result.valid)
-                print("match:", result.match)
-                print("RMSE:", result.rmse)
-                invalid_diagnostics_printed += 1
+            print_invalid_sample_diagnostic(
+                sample_idx=sample_idx,
+                pred_f=pos_t,
+                pred_l=l_t[0],
+                pred_a=h_t,
+            )
+            print("valid:", result.valid)
+            print("match:", result.match)
+            print("RMSE:", result.rmse)
             continue
 
-        print(f"\nMatching CSP sample {sum(r.match for r in reconstruction_results):03d} / {sample_idx + 1:03d}")
-        print("pos shape:", tuple(pos_t.shape))
-        print("v shape:", tuple(v_t.shape))
-        print("l shape:", tuple(l_t.shape))
-        print("h shape:", tuple(h_t.shape))
-        print("atom_type_index shape:", tuple(atom_type_index.shape))
-        print("First 3 sampled fractional coordinates:")
-        print(pos_t[:3])
-        print("Predicted atom type indices:")
-        print(atom_type_index)
-        print("Sampled lattice:")
-        print(l_t)
-        print("valid:", result.valid)
-        print("match:", result.match)
-        print("RMSE:", result.rmse)
-        print("formula:", result.formula)
+        print_matching_sample(
+            sample_idx=sample_idx,
+            pred_f=pos_t,
+            pred_v=v_t,
+            pred_l=l_t,
+            pred_a=h_t,
+            result=result,
+        )
 
     summary = aggregate_csp_reconstruction_metrics(reconstruction_results)
     oracle_lattice_summary = aggregate_csp_reconstruction_metrics(oracle_lattice_results)
