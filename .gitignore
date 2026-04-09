@@ -4,7 +4,7 @@ src/diffCSP/*
 src/facitKLDM
 wandb
 artifacts/*
-
+møde.txt
 # test cache
 manual_test/
 
