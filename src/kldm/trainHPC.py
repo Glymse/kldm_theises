@@ -7,17 +7,13 @@ from pathlib import Path
 import sys
 from typing import Any
 
-#uv run src/kldm/trainHPC.py --epoch 500
-
-
-#uv run src/kldm/trainHPC.py --epoch 800 --resume-checkpoint artifacts/checkpoints/train_checkpoint_epoch_500.pt
-
-#--validate-every 100
-#--sampling-samples 50
-#--sampling-steps 1000
-#--batch-size 256
-#--lr 1e-3
-
+# uv run src/kldm/trainHPC.py --epoch 500
+# uv run src/kldm/trainHPC.py --epoch 800 --resume-checkpoint artifacts/checkpoints/train_checkpoint_epoch_500.pt
+# --validate-every 100
+# --sampling-samples 50
+# --sampling-steps 1000
+# --batch-size 256
+# --lr 1e-3
 
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -51,7 +47,11 @@ def validation_step(
     model.eval()
     batch = batch.to(device)
 
-    t_graph = sample_uniform(lb=model.diffusion_l.eps, size=(batch.num_graphs, 1), device=device)
+    t_graph = sample_uniform(
+        lb=model.diffusion_l.eps,
+        size=(batch.num_graphs, 1),
+        device=device,
+    )
 
     with torch.no_grad():
         loss, metrics = model.algorithm2_loss(
@@ -81,7 +81,11 @@ def train_epoch(
 
     for batch in loader:
         batch = batch.to(device)
-        t_graph = sample_uniform(lb=model.diffusion_l.eps, size=(batch.num_graphs, 1), device=device)
+        t_graph = sample_uniform(
+            lb=model.diffusion_l.eps,
+            size=(batch.num_graphs, 1),
+            device=device,
+        )
 
         optimizer.zero_grad()
         loss, metrics = model.algorithm2_loss(
@@ -94,8 +98,9 @@ def train_epoch(
         loss.backward()
         optimizer.step()
 
-        for key in running:
-            running[key] += float(metrics[key])
+        running["loss"] += float(loss)
+        running["loss_v"] += float(metrics["loss_v"])
+        running["loss_l"] += float(metrics["loss_l"])
         num_batches += 1
 
     if num_batches == 0:
@@ -174,8 +179,18 @@ def maybe_plot_sampling_metrics(rows: list[dict[str, Any]], output_path: Path) -
     axes[1].set_ylabel("RMSE")
     axes[1].grid(True, alpha=0.3)
 
-    axes[2].plot(epochs, [row["oracle_lattice_match_rate"] for row in rows], marker="o", label="Oracle Lattice MR")
-    axes[2].plot(epochs, [row["oracle_coordinate_match_rate"] for row in rows], marker="o", label="Oracle Coord MR")
+    axes[2].plot(
+        epochs,
+        [row["oracle_lattice_match_rate"] for row in rows],
+        marker="o",
+        label="Oracle Lattice MR",
+    )
+    axes[2].plot(
+        epochs,
+        [row["oracle_coordinate_match_rate"] for row in rows],
+        marker="o",
+        label="Oracle Coord MR",
+    )
     axes[2].set_xlabel("Epoch")
     axes[2].set_ylabel("Oracle MR")
     axes[2].legend()
@@ -200,13 +215,17 @@ def run_sampling_evaluation(
     oracle_coordinate_results = []
     template_iter = itertools.cycle(loader)
 
+    model.eval()
+
     for _ in range(num_samples):
         batch = next(template_iter).to(device)
-        pos_t, v_t, l_t, h_t = model.sample_CSP_algorithm3(
-            n_steps=n_steps,
-            batch=batch,
-            checkpoint_path=str(checkpoint_path),
-        )
+
+        with torch.no_grad():
+            pos_t, v_t, l_t, h_t = model.sample_CSP_algorithm3(
+                n_steps=n_steps,
+                batch=batch,
+                checkpoint_path=str(checkpoint_path),
+            )
 
         result = evaluate_csp_reconstruction(
             pred_f=pos_t,
@@ -269,18 +288,24 @@ def maybe_resume(
     optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
     start_epoch = int(checkpoint.get("epoch", 0))
     checkpoint_config = checkpoint.get("config", {})
+
+    print(f"Resumed from checkpoint: {checkpoint_path}")
+    print(f"Checkpoint epoch: {start_epoch}")
+
     return start_epoch, checkpoint_config
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train KLDM on the CSP task with periodic checkpoint sampling.")
+    parser = argparse.ArgumentParser(
+        description="Train KLDM on the CSP task with validation and sampling every N epochs."
+    )
     parser.add_argument(
         "--epoch",
         "--epochs",
         dest="epochs",
         type=int,
         default=100,
-        help="Number of training epochs.",
+        help="Total number of training epochs.",
     )
     parser.add_argument(
         "--resume-checkpoint",
@@ -292,7 +317,7 @@ def parse_args() -> argparse.Namespace:
         "--validate-every",
         type=int,
         default=100,
-        help="Run sampling validation every N epochs.",
+        help="Run loss validation + sampling validation every N epochs.",
     )
     parser.add_argument(
         "--sampling-samples",
@@ -310,7 +335,7 @@ def parse_args() -> argparse.Namespace:
         "--batch-size",
         type=int,
         default=256,
-        help="Training and loss-validation batch size.",
+        help="Training and validation batch size.",
     )
     parser.add_argument(
         "--lr",
@@ -363,6 +388,7 @@ def train() -> None:
 
     model = ModelKLDM(device=device).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=config["lr"])
+
     start_epoch, resume_config = maybe_resume(
         model=model,
         optimizer=optimizer,
@@ -370,10 +396,22 @@ def train() -> None:
         device=device,
     )
 
+    if start_epoch >= config["epochs"]:
+        raise ValueError(
+            f"Resumed checkpoint is already at epoch {start_epoch}, "
+            f"but requested total epochs is only {config['epochs']}."
+        )
+
+    run_name = (
+        f"csp_hpc_resume_from_{start_epoch}_to_{config['epochs']}"
+        if args.resume_checkpoint is not None
+        else f"csp_hpc_{config['epochs']}_epochs"
+    )
+
     run = wandb.init(
         project="kldm-csp-hpc",
-        config=config | {"resume_config": resume_config},
-        name=f"csp_hpc_{config['epochs']}_epochs",
+        config=config | {"resume_config": resume_config, "start_epoch": start_epoch},
+        name=run_name,
     )
 
     artifacts_dir = Path("artifacts")
@@ -388,59 +426,76 @@ def train() -> None:
     sampling_history: list[dict[str, Any]] = []
     best_val_loss = float("inf")
 
+    if best_model_path.exists() and args.resume_checkpoint is None:
+        best_model_path.unlink()
+
     for epoch_idx in range(start_epoch, config["epochs"]):
         epoch = epoch_idx + 1
+
         train_metrics = train_epoch(
             model=model,
             loader=train_loader,
             optimizer=optimizer,
             device=device,
         )
-        val_metrics = evaluate_loss(model=model, loader=val_loader, device=device)
 
-        epoch_record = {
+        should_validate = (epoch % config["validate_every"] == 0) or (epoch == config["epochs"])
+
+        log_data = {
             "epoch": epoch,
-            "train_loss": train_metrics["loss"],
-            "train_loss_v": train_metrics["loss_v"],
-            "train_loss_l": train_metrics["loss_l"],
-            "val_loss": val_metrics["loss"],
-            "val_loss_v": val_metrics["loss_v"],
-            "val_loss_l": val_metrics["loss_l"],
+            "train/epoch_loss": train_metrics["loss"],
+            "train/epoch_loss_v": train_metrics["loss_v"],
+            "train/epoch_loss_l": train_metrics["loss_l"],
         }
-        history.append(epoch_record)
-
-        wandb.log(
-            {
-                "epoch": epoch,
-                "train/epoch_loss": train_metrics["loss"],
-                "train/epoch_loss_v": train_metrics["loss_v"],
-                "train/epoch_loss_l": train_metrics["loss_l"],
-                "val/epoch_loss": val_metrics["loss"],
-                "val/epoch_loss_v": val_metrics["loss_v"],
-                "val/epoch_loss_l": val_metrics["loss_l"],
-            }
-        )
 
         print(
             f"epoch={epoch:04d}/{config['epochs']:04d} "
             f"train_loss={train_metrics['loss']:.6f} "
-            f"(v={train_metrics['loss_v']:.4f}, l={train_metrics['loss_l']:.4f}) "
-            f"val_loss={val_metrics['loss']:.6f} "
-            f"(v={val_metrics['loss_v']:.4f}, l={val_metrics['loss_l']:.4f})"
+            f"(v={train_metrics['loss_v']:.6f}, l={train_metrics['loss_l']:.6f})"
         )
 
-        if val_metrics["loss"] < best_val_loss:
-            best_val_loss = val_metrics["loss"]
-            export_model_checkpoint(
+        if should_validate:
+            val_metrics = evaluate_loss(
                 model=model,
-                optimizer=optimizer,
-                output_path=best_model_path,
-                config=config | {"best_val_loss": best_val_loss, "best_epoch": epoch},
-                epoch=epoch,
+                loader=val_loader,
+                device=device,
             )
 
-        should_validate_sampling = (epoch % config["validate_every"] == 0) or (epoch == config["epochs"])
-        if should_validate_sampling:
+            epoch_record = {
+                "epoch": epoch,
+                "train_loss": train_metrics["loss"],
+                "train_loss_v": train_metrics["loss_v"],
+                "train_loss_l": train_metrics["loss_l"],
+                "val_loss": val_metrics["loss"],
+                "val_loss_v": val_metrics["loss_v"],
+                "val_loss_l": val_metrics["loss_l"],
+            }
+            history.append(epoch_record)
+
+            log_data.update(
+                {
+                    "val/epoch_loss": val_metrics["loss"],
+                    "val/epoch_loss_v": val_metrics["loss_v"],
+                    "val/epoch_loss_l": val_metrics["loss_l"],
+                }
+            )
+
+            print(
+                f"validation_epoch={epoch:04d} "
+                f"val_loss={val_metrics['loss']:.6f} "
+                f"(v={val_metrics['loss_v']:.6f}, l={val_metrics['loss_l']:.6f})"
+            )
+
+            if val_metrics["loss"] < best_val_loss:
+                best_val_loss = val_metrics["loss"]
+                export_model_checkpoint(
+                    model=model,
+                    optimizer=optimizer,
+                    output_path=best_model_path,
+                    config=config | {"best_val_loss": best_val_loss, "best_epoch": epoch},
+                    epoch=epoch,
+                )
+
             checkpoint_path = checkpoints_dir / f"train_checkpoint_epoch_{epoch}.pt"
             export_model_checkpoint(
                 model=model,
@@ -450,7 +505,10 @@ def train() -> None:
                 epoch=epoch,
             )
 
-            checkpoint_artifact = wandb.Artifact(f"train_checkpoint_epoch_{epoch}", type="model")
+            checkpoint_artifact = wandb.Artifact(
+                f"train_checkpoint_epoch_{epoch}",
+                type="model",
+            )
             checkpoint_artifact.add_file(str(checkpoint_path))
             run.log_artifact(checkpoint_artifact)
 
@@ -462,12 +520,12 @@ def train() -> None:
                 num_samples=config["sampling_samples"],
                 n_steps=config["sampling_steps"],
             )
+
             sampling_record = {"epoch": epoch, **sampling_metrics}
             sampling_history.append(sampling_record)
 
-            wandb.log(
+            log_data.update(
                 {
-                    "epoch": epoch,
                     "sampling/valid": sampling_metrics["sampling_valid"],
                     "sampling/match_rate": sampling_metrics["sampling_match_rate"],
                     "sampling/rmse": sampling_metrics["sampling_rmse"],
@@ -487,11 +545,13 @@ def train() -> None:
                 f"sample_rmse={sampling_metrics['sampling_rmse']!s}"
             )
 
+        wandb.log(log_data)
+
     export_model_checkpoint(
         model=model,
         optimizer=optimizer,
         output_path=final_model_path,
-        config=config,
+        config=config | {"completed_epochs": config["epochs"]},
         epoch=config["epochs"],
     )
 
@@ -508,6 +568,7 @@ def train() -> None:
             "val_loss_l",
         ],
     )
+
     export_csv(
         rows=sampling_history,
         output_path=sampling_history_path,
@@ -525,10 +586,12 @@ def train() -> None:
             "oracle_coordinate_rmse",
         ],
     )
+
     plot_path = maybe_plot_sampling_metrics(sampling_history, sampling_plot_path)
 
     final_artifact = wandb.Artifact("csp_final_model_hpc", type="model")
     final_artifact.add_file(str(final_model_path))
+
     if best_model_path.exists():
         final_artifact.add_file(str(best_model_path))
     if history_path.exists():
@@ -537,6 +600,7 @@ def train() -> None:
         final_artifact.add_file(str(sampling_history_path))
     if plot_path is not None and plot_path.exists():
         final_artifact.add_file(str(plot_path))
+
     run.log_artifact(final_artifact)
     wandb.finish()
 
