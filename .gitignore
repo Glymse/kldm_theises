@@ -1,8 +1,9 @@
 docs/site/
 data/*
+src/diffCSP/*
+src/facitKLDM
 wandb
-
-src/facitKLDM/*
+artifacts/*
 
 # test cache
 manual_test/
