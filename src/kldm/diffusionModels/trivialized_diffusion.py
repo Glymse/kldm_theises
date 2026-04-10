@@ -45,6 +45,8 @@ class TrivialisedDiffusion(nn.Module):
         return torch.remainder(x, 1.0)
 
     #displacements usually should be in [-0.5,0.5), see report.
+    #
+    #Måske ikke nødvendigt.
     @staticmethod
     def wrap_signed_unit(x: torch.Tensor) -> torch.Tensor:
         """Wrap signed periodic displacements into [-0.5, 0.5)."""
@@ -185,18 +187,59 @@ class TrivialisedDiffusion(nn.Module):
         #Now we find target of the wrapped normal fractional distribution
         mu_r_t = self.mu_r_t(t, v_t, v0)
 
-
         sigma_r_t = self._match_dims(self.sigma_r_t(t), r_t)
+
         wrapped_normal_target = self._match_dims((1.0 - torch.exp(-t)) / (1.0 + torch.exp(-t)), r_t) * d_log_wrapped_normal(
             r=r_t,
             mu=mu_r_t,
             sigma=sigma_r_t,
         )
+
         wrapped_normal_target = scatter_center(wrapped_normal_target, index=index)
 
         target = gaussian_target + wrapped_normal_target
         return target
         #return target_s
+
+    def construct_velocity_score(
+        self,
+        t: torch.Tensor,
+        v_t: torch.Tensor,
+        pred_v: torch.Tensor,
+    ) -> torch.Tensor:
+        """Construct the full KLDM velocity score from the network prediction."""
+        t_internal = self.time_scaling_T * t
+        sigma_v_sq = self._match_dims(self.sigma_v(t_internal) ** 2, pred_v)
+
+        return self._match_dims(
+            (1.0 - torch.exp(-t_internal)) / (1.0 + torch.exp(-t_internal)),
+            pred_v,
+        ) * pred_v - v_t / sigma_v_sq.clamp_min(self.eps)
+
+    def reverse_exp_step(
+        self,
+        f_t: torch.Tensor,
+        v_t: torch.Tensor,
+        score_v: torch.Tensor,
+        index: torch.Tensor,
+        dt: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """One exponential-integrator reverse step for the TDM process."""
+        dt_t = torch.as_tensor(
+            self.time_scaling_T * dt,
+            device=v_t.device,
+            dtype=v_t.dtype,
+        )
+        noise_v = scatter_center(torch.randn_like(v_t), index=index)
+
+        exp_dt = torch.exp(dt_t)
+        exp_2dt_minus_1 = torch.exp(2.0 * dt_t) - 1.0
+        noise_scale = torch.sqrt(exp_2dt_minus_1.clamp_min(self.eps))
+
+        v_prev = exp_dt * v_t + 2.0 * exp_2dt_minus_1 * score_v + noise_scale * noise_v
+        f_prev = self.wrap_fractional(f_t - dt_t * v_prev)
+
+        return f_prev, v_prev
 
 
     @staticmethod

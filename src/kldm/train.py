@@ -20,13 +20,6 @@ try:
 except ImportError as exc:  # pragma: no cover
     raise ImportError("wandb is required for src/kldm/train.py") from exc
 
-
-#TDM paper, benchmark this against baseline KLDM paper version.
-def tdm_paper_lambda(model: ModelKLDM, t_node: torch.Tensor) -> torch.Tensor:
-    """Velocity weighting used by the current KLDM training path."""
-    return torch.full_like(t_node, model.tdm.time_scaling_T ** 2)
-
-
 def validation_step(
     model: ModelKLDM,
     batch,
@@ -43,7 +36,6 @@ def validation_step(
             t=t_graph,
             lambda_v=1.0,
             lambda_l=1.0,
-            lambda_t_fn=None#lambda x: tdm_paper_lambda(model, x),
         )
 
     return {
@@ -73,7 +65,6 @@ def train_epoch(
             t=t_graph,
             lambda_v=1.0,
             lambda_l=1.0,
-            lambda_t_fn=None,
         )
         loss.backward()
         optimizer.step()

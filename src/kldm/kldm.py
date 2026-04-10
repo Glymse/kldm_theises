@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 import logging
 import sys
-from typing import Callable, Optional
+from typing import Optional
 
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -119,18 +119,6 @@ class ModelKLDM(nn.Module):
         loss = F.mse_loss(pred, target, reduction="none")
         return loss.reshape(loss.shape[0], -1).mean(dim=1)
 
-
-    @staticmethod
-    def lambda_t(
-        t_node: torch.Tensor,
-        lambda_t_fn: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
-    ) -> torch.Tensor:
-        if lambda_t_fn is None:
-            return torch.ones_like(t_node)
-        return lambda_t_fn(t_node).to(t_node.device)
-
-
-
     # ============================================================================
     # ALGORITHM 2
     # ============================================================================
@@ -141,7 +129,6 @@ class ModelKLDM(nn.Module):
         t: torch.Tensor,
         lambda_v: float = 1.0,
         lambda_l: float = 1.0,
-        lambda_t_fn: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """
         Algorithm 2 in KLDM:
@@ -189,9 +176,8 @@ class ModelKLDM(nn.Module):
         # KLDM: plain squared error for lattice targets.
         loss_l = self.mse_loss_per_sample(preds["l"], target_l).mean()
 
-        # KLDM: lambda(t) * ||score_v - target_v||^2
-        lambda_t = self.lambda_t(t_node=t_node, lambda_t_fn=lambda_t_fn)
-        loss_v = (lambda_t * self.mse_loss_per_sample(score_v, target_v)).mean()
+        # KLDM: plain squared error for velocity targets.
+        loss_v = self.mse_loss_per_sample(score_v, target_v).mean()
 
         total_loss = lambda_v * loss_v + lambda_l * loss_l
         return total_loss, {
@@ -228,56 +214,6 @@ class ModelKLDM(nn.Module):
         self._cached_sampling_checkpoint_path = checkpoint_path
         self.__dict__["_cached_sampling_score_network_obj"] = score_network
         return score_network
-
-
-    def _construct_velocity_score(
-        self,
-        t_node: torch.Tensor,
-        v_t: torch.Tensor,
-        pred_v: torch.Tensor,
-    ) -> torch.Tensor:
-        t_internal = self.tdm.time_scaling_T * t_node
-        prefactor = self.tdm._match_dims(
-            (1.0 - torch.exp(-t_internal)) / (1.0 + torch.exp(-t_internal)),
-            pred_v,
-        )
-        sigma_v_sq = self.tdm._match_dims(
-            self.tdm.sigma_v(t_internal) ** 2,
-            pred_v,
-        )
-        return prefactor * pred_v - v_t / sigma_v_sq.clamp_min(1e-8)
-
-    def _tdm_reverse_exp_step(
-        self,
-        t_node: torch.Tensor,
-        f_t: torch.Tensor,
-        v_t: torch.Tensor,
-        score_v: torch.Tensor,
-        index: torch.Tensor,
-        dt: float,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        del t_node
-
-        dt_t = torch.as_tensor(dt, device=v_t.device, dtype=v_t.dtype)
-        noise_v = scatter_center(torch.randn_like(v_t), index=index)
-
-        exp_dt = torch.exp(dt_t)
-        exp_2dt_minus_1 = torch.exp(2.0 * dt_t) - 1.0
-        noise_scale = torch.sqrt(exp_2dt_minus_1.clamp_min(1e-8))
-
-        v_prev = exp_dt * v_t + 2.0 * exp_2dt_minus_1 * score_v + noise_scale * noise_v
-        f_prev = self.tdm.wrap_fractional(f_t - dt_t * v_prev)
-
-        return f_prev, v_prev
-
-    def _vp_score_from_eps(
-        self,
-        pred_eps: torch.Tensor,
-        t: torch.Tensor,
-        diffusion: ContinuousVPDiffusion,
-    ) -> torch.Tensor:
-        sigma_t = diffusion._match_dims(diffusion.sigma(t), pred_eps)
-        return -pred_eps / sigma_t.clamp_min(1e-8)
 
     def sample_CSP_algorithm3(
         self,
@@ -338,35 +274,30 @@ class ModelKLDM(nn.Module):
                     pred_l = preds["l"]
 
                     # Eq. (19): construct KLDM simplified velocity score
-                    score_v = self._construct_velocity_score(
-                        t_node=t_node,
+                    # Full velocity score:
+                    # s_v(x_t, t) = ((1 - exp(-t)) / (1 + exp(-t))) * s_f_theta(x_t, t) - v_t / sigma_v(t)^2
+
+                    score_v = self.tdm.construct_velocity_score(
+                        t=t_node,
                         v_t=v_t,
                         pred_v=pred_v,
                     )
 
                     # Update v and f with exponential integrator
-                    # We need to remmeber to make this t * T=2, due to how we defined internal time in TDM
-                    f_t, v_t = self._tdm_reverse_exp_step(
-                        t_node=t_node,
+                    f_t, v_t = self.tdm.reverse_exp_step(
                         f_t=f_t,
                         v_t=v_t,
                         score_v=score_v,
                         index=node_index,
-                        dt=dt * 2, #Time scaling T= 2
+                        dt=dt, #This is scaled internally.
                     )
 
                     # KLDM-epsilon lattice branch:
                     # Algorithm 3 does EM on l using the score corresponding to out_l
-                    score_l = self._vp_score_from_eps(
-                        pred_eps=pred_l,
-                        t=t_graph.squeeze(-1),
-                        diffusion=self.diffusion_l,
-                    )
-
-                    l_t = self.diffusion_l.reverse_em_step(
+                    l_t = self.diffusion_l.reverse_em_step_from_eps(
                         t=t_graph.squeeze(-1),
                         x_t=l_t,
-                        score_x=score_l,
+                        pred_eps=pred_l,
                         dt=dt,
                     )
 
