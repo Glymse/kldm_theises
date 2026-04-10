@@ -345,13 +345,14 @@ class ModelKLDM(nn.Module):
                     )
 
                     # Update v and f with exponential integrator
+                    # We need to remmeber to make this t * T=2, due to how we defined internal time in TDM
                     f_t, v_t = self._tdm_reverse_exp_step(
                         t_node=t_node,
                         f_t=f_t,
                         v_t=v_t,
                         score_v=score_v,
                         index=node_index,
-                        dt=dt,
+                        dt=dt * 2, #Time scaling T= 2
                     )
 
                     # KLDM-epsilon lattice branch:

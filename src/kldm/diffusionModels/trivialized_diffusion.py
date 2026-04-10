@@ -74,6 +74,7 @@ class TrivialisedDiffusion(nn.Module):
         )  # Eq. (23)
 
 
+    #TODO: We do not center the distribution around = 0 yet. Ask francois.
 
     def forward_sample(
         self,
@@ -135,6 +136,8 @@ class TrivialisedDiffusion(nn.Module):
             epsilon_r = torch.randn_like(f0)                        # Nr is a normal distribution such that ∑vi = 0
         epsilon_r = scatter_center(epsilon_r, index=index)
 
+
+        """ OLD VERSION, CHAT MIGHT SAY IT IS A PROBLEM
         r_t = self.wrap_signed_unit(mu_r_t + sigma_r_t * epsilon_r)  # Signed wrapped displacement
 
         #Now we calculate displacement, and while we stay on the manifold.
@@ -143,6 +146,17 @@ class TrivialisedDiffusion(nn.Module):
         #Center again
         f_t = scatter_center(f_t, index=index)
         f_t = self.wrap_fractional(f_t)
+        """
+        #Move to [-0.5, 0.5]
+
+        #PSEUDO: rt = w(µrt(t, v0, vt) + σrt, (t, v0, vt) · ϵrt ) ▷ w indicates the wrap function. ft = w(f0 + rt) ft = center(ft) ▷ center(·) keeps the center of gravity fixed
+        r_t = self.wrap_signed_unit(mu_r_t + sigma_r_t * epsilon_r)
+        #Remove mean
+        r_t = scatter_center(r_t, index=index)
+        r_t = self.wrap_signed_unit(r_t)
+        f_t = self.wrap_fractional(f0 + r_t)
+
+
 
         return f_t, v_t, epsilon_v, epsilon_r, r_t
 
@@ -170,8 +184,7 @@ class TrivialisedDiffusion(nn.Module):
 
         #Now we find target of the wrapped normal fractional distribution
         mu_r_t = self.mu_r_t(t, v_t, v0)
-        #And convert to [-0.5, 0.5]
-        mu_r_t = self.wrap_signed_unit(mu_r_t)
+
 
         sigma_r_t = self._match_dims(self.sigma_r_t(t), r_t)
         wrapped_normal_target = self._match_dims((1.0 - torch.exp(-t)) / (1.0 + torch.exp(-t)), r_t) * d_log_wrapped_normal(

@@ -375,8 +375,8 @@ def run_sampling_evaluation(
     def percentage(count: int) -> float:
         return 100.0 * float(count) / float(num_samples)
 
-    def zero_if_none(x: float | None) -> float:
-        return 0.0 if x is None else float(x)
+    def nan_if_none(x: float | None) -> float:
+        return float("nan") if x is None else float(x)
 
     valid_true_count = count_valid(reconstruction_results)
     match_true_count = count_match(reconstruction_results)
@@ -391,17 +391,17 @@ def run_sampling_evaluation(
         "valid_percentage": percentage(valid_true_count),
         "match_true_count": match_true_count,
         "match_rate_percentage": percentage(match_true_count),
-        "mean_rmse": zero_if_none(summary["rmse"]),
+        "mean_rmse": nan_if_none(summary["rmse"]),
         "oracle_lattice_valid_true_count": oracle_lattice_valid_true_count,
         "oracle_lattice_valid_percentage": percentage(oracle_lattice_valid_true_count),
         "oracle_lattice_match_true_count": oracle_lattice_match_true_count,
         "oracle_lattice_match_rate_percentage": percentage(oracle_lattice_match_true_count),
-        "oracle_lattice_mean_rmse": zero_if_none(oracle_lattice_summary["rmse"]),
+        "oracle_lattice_mean_rmse": nan_if_none(oracle_lattice_summary["rmse"]),
         "oracle_coordinate_valid_true_count": oracle_coordinate_valid_true_count,
         "oracle_coordinate_valid_percentage": percentage(oracle_coordinate_valid_true_count),
         "oracle_coordinate_match_true_count": oracle_coordinate_match_true_count,
         "oracle_coordinate_match_rate_percentage": percentage(oracle_coordinate_match_true_count),
-        "oracle_coordinate_mean_rmse": zero_if_none(oracle_coordinate_summary["rmse"]),
+        "oracle_coordinate_mean_rmse": nan_if_none(oracle_coordinate_summary["rmse"]),
     }
 
 
