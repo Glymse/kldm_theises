@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import itertools
 from pathlib import Path
 import signal
 import sys
@@ -89,6 +90,7 @@ def validation_step(
             t=t_graph,
             lambda_v=1.0,
             lambda_l=1.0,
+            lambda_t_fn=None,
         )
 
     return {
@@ -125,6 +127,7 @@ def train_epoch(
             t=t_graph,
             lambda_v=1.0,
             lambda_l=1.0,
+            lambda_t_fn=None,
         )
         loss.backward()
         optimizer.step()
@@ -321,17 +324,12 @@ def run_sampling_evaluation(
     reconstruction_results = []
     oracle_lattice_results = []
     oracle_coordinate_results = []
-    template_iter = iter(loader)
+    template_iter = itertools.cycle(loader)
 
     model.eval()
 
     for _ in range(num_samples):
-        try:
-            batch = next(template_iter)
-        except StopIteration:
-            template_iter = iter(loader)
-            batch = next(template_iter)
-        batch = batch.to(device)
+        batch = next(template_iter).to(device)
 
         with torch.no_grad():
             pos_t, v_t, l_t, h_t = model.sample_CSP_algorithm3(
@@ -533,12 +531,12 @@ def train() -> None:
         root=root,
         split="val",
         batch_size=1,
-        shuffle=True,
+        shuffle=False,
         download=True,
     )
 
     model = ModelKLDM(device=device).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=config["lr"])
+    optimizer = torch.optim.AdamW(model.parameters(), lr=config["lr"])
 
     start_epoch, resume_config = maybe_resume(
         model=model,
@@ -608,7 +606,7 @@ def train() -> None:
 
             val_metrics = evaluate_loss(model=model, loader=val_loader, device=device)
 
-            #Add metric here, ground truth vs predicted.
+            #Add metric here, ground truth vs predicted.  ASE libary.
             if should_record_loss:
                 history.append(
                     {

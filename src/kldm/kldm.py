@@ -42,7 +42,10 @@ class ModelKLDM(nn.Module):
 
         self.score_network = score_network or CSPVNet(
             hidden_dim=128,
+            time_dim=128,
             num_layers=4,
+            num_freqs=128,
+            ln=True,
             h_dim=118,
             smooth=False,
             pred_v=True,
@@ -168,7 +171,7 @@ class ModelKLDM(nn.Module):
         # Full velocity score, KLDM Eq. (19)
         t_internal = self.tdm.time_scaling_T * t_node #Time scaling for TDM
         exp_coef = self.tdm._match_dims((1.0 - torch.exp(-t_internal)) / (1.0 + torch.exp(-t_internal)), out_v)
-        sigma_v_sq = self.tdm._match_dims(self.tdm.sigma_v(t_internal) ** 2, out_v)
+        sigma_v_sq = self.tdm._match_dims(self.tdm.gaussian_velocity_sigma(t_internal) ** 2, out_v)
 
         #The simplified score, assuming initial velocity is 0
         score_v = exp_coef * out_v - v_t / sigma_v_sq.clamp_min(1e-8)
@@ -239,7 +242,7 @@ class ModelKLDM(nn.Module):
         # f_T ~ U(0, 1)
         # l_T ~ N(0, I)
         v_t = scatter_center(torch.randn_like(batch.pos), index=node_index)
-        f_t = self.tdm.wrap_fractional(torch.rand_like(batch.pos))
+        f_t = self.tdm.wrap_positions(torch.rand_like(batch.pos))
         l_t = torch.randn_like(batch.l)
         a_t = batch.h  # CSP conditioning
 

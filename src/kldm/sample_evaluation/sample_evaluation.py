@@ -215,22 +215,12 @@ def decode_lattice(
     if l_tensor.shape[-1] != 6:
         raise ValueError(f"Expected lattice tensor with last dim 6, got shape {tuple(l_tensor.shape)}")
 
-    raw_lengths = l_tensor[..., :3].squeeze(0)
-    raw_angles = l_tensor[..., 3:].squeeze(0)
-
-    lengths = raw_lengths.clone()
-    if n_atoms in lattice_transform.lengths_loc_scale:
-        loc, scale = lattice_transform.lengths_loc_scale[n_atoms]
-        lengths = lengths * scale.to(lengths.device) + loc.to(lengths.device)
-    lengths = torch.exp(lengths)
-    if lattice_transform.normalize_lengths_by_num_atoms:
-        lengths = lengths * (n_atoms ** (1.0 / 3.0))
-
-    angles = raw_angles.clone()
-    if lattice_transform.angles_loc_scale is not None:
-        loc, scale = lattice_transform.angles_loc_scale
-        angles = angles * scale.to(angles.device) + loc.to(angles.device)
-    angles_rad = torch.atan(angles) + torch.pi / 2
+    lengths, angles_rad = lattice_transform.invert_to_lengths_angles(
+        l=l_tensor,
+        num_atoms=n_atoms,
+    )
+    lengths = lengths.squeeze(0)
+    angles_rad = angles_rad.squeeze(0)
     angles_deg = torch.rad2deg(angles_rad)
 
     return lengths, angles_deg

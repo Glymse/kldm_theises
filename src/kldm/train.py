@@ -10,6 +10,7 @@ if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import torch
+from torch.utils.data import DataLoader, Subset
 
 from kldm.data import CSPTask, resolve_data_root
 from kldm.distribution.uniform import sample_uniform
@@ -127,9 +128,14 @@ def export_final_model(
     config: dict[str, Any],
 ) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    clean_state_dict = {
+        key: value
+        for key, value in model.state_dict().items()
+        if not key.startswith("_cached_sampling_score_network")
+    }
     torch.save(
         {
-            "model_state_dict": model.state_dict(),
+            "model_state_dict": clean_state_dict,
             "optimizer_state_dict": optimizer.state_dict(),
             "config": config,
         },
@@ -147,6 +153,40 @@ def parse_args() -> argparse.Namespace:
         default=2,
         help="Number of training epochs.",
     )
+    parser.add_argument(
+        "--batch-size",
+        dest="batch_size",
+        type=int,
+        default=None,
+        help="Optional batch size override. Defaults to 256 on GPU and 16 on CPU.",
+    )
+    parser.add_argument(
+        "--num-workers",
+        dest="num_workers",
+        type=int,
+        default=0,
+        help="DataLoader worker count. Defaults to 0 for safer local execution.",
+    )
+    parser.add_argument(
+        "--train-fraction",
+        dest="train_fraction",
+        type=float,
+        default=1.0,
+        help="Fraction of the training split to use, e.g. 0.2 for 20%%.",
+    )
+    parser.add_argument(
+        "--subset-seed",
+        dest="subset_seed",
+        type=int,
+        default=7,
+        help="Random seed used when selecting a training subset.",
+    )
+    parser.add_argument(
+        "--no-wandb",
+        dest="no_wandb",
+        action="store_true",
+        help="Disable Weights & Biases logging for this run.",
+    )
     return parser.parse_args()
 
 
@@ -154,39 +194,65 @@ def train() -> None:
     args = parse_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     root = resolve_data_root()
+    batch_size = args.batch_size if args.batch_size is not None else (256 if device.type == "cuda" else 16)
+    if not (0.0 < args.train_fraction <= 1.0):
+        raise ValueError("--train-fraction must be in the interval (0, 1].")
 
     config = {
         "task": "CSP",
         "epochs": args.epochs,
-        "batch_size": 256,
+        "batch_size": batch_size,
+        "num_workers": args.num_workers,
+        "train_fraction": args.train_fraction,
+        "subset_seed": args.subset_seed,
+        "wandb_enabled": not args.no_wandb,
         "lr": 1e-3,
         "lambda_v": 1.0,
         "lambda_l": 1.0,
     }
 
-    train_loader = CSPTask().dataloader(
+    csp_task = CSPTask()
+    base_train_dataset = csp_task.fit_dataset(
         root=root,
         split="train",
+        download=True,
+    )
+    train_dataset = base_train_dataset
+    if config["train_fraction"] < 1.0:
+        subset_size = max(1, int(len(train_dataset) * config["train_fraction"]))
+        subset_generator = torch.Generator().manual_seed(config["subset_seed"])
+        subset_indices = torch.randperm(len(train_dataset), generator=subset_generator)[:subset_size].tolist()
+        train_dataset = Subset(train_dataset, subset_indices)
+
+    train_loader = DataLoader(
+        train_dataset,
         batch_size=config["batch_size"],
         shuffle=True,
-        download=True,
+        num_workers=config["num_workers"],
+        collate_fn=base_train_dataset.collate_fn,
     )
     val_loader = CSPTask().dataloader(
         root=root,
         split="val",
         batch_size=config["batch_size"],
         shuffle=False,
+        num_workers=config["num_workers"],
         download=True,
     )
 
     model = ModelKLDM(device=device).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=config["lr"])
 
-    run = wandb.init(
-        project="kldm-csp",
-        config=config,
-        name=f"csp_{config['epochs']}_epochs",
-    )
+    run = None
+    if config["wandb_enabled"]:
+        run = wandb.init(
+            project="kldm-csp",
+            config=config,
+            name=f"csp_{config['epochs']}_epochs",
+        )
+        wandb.define_metric("epoch")
+        wandb.define_metric("train/*", step_metric="epoch")
+        wandb.define_metric("val/*", step_metric="epoch")
 
     output_path = Path("artifacts") / "csp_final_model.pt"
     history_path = Path("artifacts") / "csp_training_history.csv"
@@ -194,77 +260,89 @@ def train() -> None:
     history: list[dict[str, float]] = []
     best_val_loss = float("inf")
 
-    for epoch_idx in range(config["epochs"]):
-        epoch = epoch_idx + 1
-        train_metrics = train_epoch(
-            model=model,
-            loader=train_loader,
-            optimizer=optimizer,
-            device=device,
-        )
-        val_metrics = evaluate(model=model, loader=val_loader, device=device)
+    print(
+        f"starting training epochs={config['epochs']} batch_size={config['batch_size']} "
+        f"lr={config['lr']} device={device.type} train_fraction={config['train_fraction']}",
+        flush=True,
+    )
 
-        epoch_record = {
-            "epoch": float(epoch),
-            "train_loss": train_metrics["loss"],
-            "train_loss_v": train_metrics["loss_v"],
-            "train_loss_l": train_metrics["loss_l"],
-            "val_loss": val_metrics["loss"],
-            "val_loss_v": val_metrics["loss_v"],
-            "val_loss_l": val_metrics["loss_l"],
-        }
-        history.append(epoch_record)
+    try:
+        for epoch_idx in range(config["epochs"]):
+            epoch = epoch_idx + 1
+            print(f"starting epoch {epoch}/{config['epochs']}", flush=True)
 
-        log_metrics = {
-            "epoch": epoch,
-            "train/epoch_loss": train_metrics["loss"],
-            "train/epoch_loss_v": train_metrics["loss_v"],
-            "train/epoch_loss_l": train_metrics["loss_l"],
-            "val/epoch_loss": val_metrics["loss"],
-            "val/epoch_loss_v": val_metrics["loss_v"],
-            "val/epoch_loss_l": val_metrics["loss_l"],
-            "train/loss": train_metrics["loss"],
-            "train/loss_v": train_metrics["loss_v"],
-            "train/loss_l": train_metrics["loss_l"],
-            "val/loss": val_metrics["loss"],
-            "val/loss_v": val_metrics["loss_v"],
-            "val/loss_l": val_metrics["loss_l"],
-        }
-        wandb.log(log_metrics)
-
-        print(
-            f"epoch={epoch:03d}/{config['epochs']:03d} "
-            f"train_loss={train_metrics['loss']:.6f} "
-            f"(v={train_metrics['loss_v']:.4f}, l={train_metrics['loss_l']:.4f}) "
-            f"val_loss={val_metrics['loss']:.6f} "
-            f"(v={val_metrics['loss_v']:.4f}, l={val_metrics['loss_l']:.4f}) "
-            f"device={device.type}"
-        )
-
-        if val_metrics["loss"] < best_val_loss:
-            best_val_loss = val_metrics["loss"]
-            export_final_model(
+            train_metrics = train_epoch(
                 model=model,
+                loader=train_loader,
                 optimizer=optimizer,
-                output_path=best_output_path,
-                config=config | {"best_val_loss": best_val_loss, "best_epoch": epoch},
+                device=device,
+            )
+            val_metrics = evaluate(model=model, loader=val_loader, device=device)
+
+            epoch_record = {
+                "epoch": float(epoch),
+                "train_loss": train_metrics["loss"],
+                "train_loss_v": train_metrics["loss_v"],
+                "train_loss_l": train_metrics["loss_l"],
+                "val_loss": val_metrics["loss"],
+                "val_loss_v": val_metrics["loss_v"],
+                "val_loss_l": val_metrics["loss_l"],
+            }
+            history.append(epoch_record)
+
+            log_metrics = {
+                "epoch": epoch,
+                "train/epoch_loss": train_metrics["loss"],
+                "train/epoch_loss_v": train_metrics["loss_v"],
+                "train/epoch_loss_l": train_metrics["loss_l"],
+                "val/epoch_loss": val_metrics["loss"],
+                "val/epoch_loss_v": val_metrics["loss_v"],
+                "val/epoch_loss_l": val_metrics["loss_l"],
+                "train/loss": train_metrics["loss"],
+                "train/loss_v": train_metrics["loss_v"],
+                "train/loss_l": train_metrics["loss_l"],
+                "val/loss": val_metrics["loss"],
+                "val/loss_v": val_metrics["loss_v"],
+                "val/loss_l": val_metrics["loss_l"],
+            }
+            if config["wandb_enabled"]:
+                wandb.log(log_metrics)
+
+            print(
+                f"epoch={epoch:03d}/{config['epochs']:03d} "
+                f"train_loss={train_metrics['loss']:.6f} "
+                f"(v={train_metrics['loss_v']:.4f}, l={train_metrics['loss_l']:.4f}) "
+                f"val_loss={val_metrics['loss']:.6f} "
+                f"(v={val_metrics['loss_v']:.4f}, l={val_metrics['loss_l']:.4f}) "
+                f"device={device.type}",
+                flush=True,
             )
 
-    export_final_model(
-        model=model,
-        optimizer=optimizer,
-        output_path=output_path,
-        config=config,
-    )
-    export_history(history=history, output_path=history_path)
-    artifact = wandb.Artifact("csp_final_model", type="model")
-    artifact.add_file(str(output_path))
-    if best_output_path.exists():
-        artifact.add_file(str(best_output_path))
-    if history_path.exists():
-        artifact.add_file(str(history_path))
-    run.log_artifact(artifact)
-    wandb.finish()
+            if val_metrics["loss"] < best_val_loss:
+                best_val_loss = val_metrics["loss"]
+                export_final_model(
+                    model=model,
+                    optimizer=optimizer,
+                    output_path=best_output_path,
+                    config=config | {"best_val_loss": best_val_loss, "best_epoch": epoch},
+                )
+    finally:
+        export_final_model(
+            model=model,
+            optimizer=optimizer,
+            output_path=output_path,
+            config=config,
+        )
+        export_history(history=history, output_path=history_path)
+        if config["wandb_enabled"] and run is not None:
+            artifact = wandb.Artifact("csp_final_model", type="model")
+            artifact.add_file(str(output_path))
+            if best_output_path.exists():
+                artifact.add_file(str(best_output_path))
+            if history_path.exists():
+                artifact.add_file(str(history_path))
+            run.log_artifact(artifact)
+            wandb.finish()
 
 
 if __name__ == "__main__":
