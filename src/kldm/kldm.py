@@ -178,7 +178,7 @@ class ModelKLDM(nn.Module):
 
         # Weight the velocity loss by the current normalized diffusion time.
         lambda_v_t = self.velocity_loss_weight(t_node=t_node)
-        loss_v = (lambda_v_t * self.mse_loss_per_sample(out_v, target_v)).mean()
+        loss_v = (self.mse_loss_per_sample(out_v, target_v)).mean()
 
         total_loss = lambda_v * loss_v + lambda_l * loss_l
         return total_loss, {
