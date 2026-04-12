@@ -90,7 +90,6 @@ def validation_step(
             t=t_graph,
             lambda_v=1.0,
             lambda_l=1.0,
-            lambda_t_fn=None,
         )
 
     return {
@@ -127,7 +126,6 @@ def train_epoch(
             t=t_graph,
             lambda_v=1.0,
             lambda_l=1.0,
-            lambda_t_fn=None,
         )
         loss.backward()
         optimizer.step()
