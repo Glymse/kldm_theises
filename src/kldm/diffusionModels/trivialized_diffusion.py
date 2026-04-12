@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import math
 import sys
 
 import torch
@@ -12,7 +13,7 @@ if __package__ in {None, ""}:
 
 from kldm.data import CSPTask, DNGTask, resolve_data_root
 
-from kldm.distribution import d_log_wrapped_normal
+from kldm.distribution import d_log_wrapped_normal, d_log_wrapped_normal_2pi_version
 from kldm.scoreNetwork.utils import scatter_center
 
 ################################################################
@@ -34,6 +35,7 @@ class TrivialisedDiffusion(nn.Module):
         super().__init__()
         self.eps = float(eps)
         self.time_scaling_T = 2
+        self.scale_pos = 2.0 * math.pi
         self.k_wn_score = 13
         sigma_grid = self.wrapped_gaussian_sigma_r_t(torch.linspace(0.0, self.time_scaling_T, 256))
         sigma_norm_grid = self._sigma_norm(sigma_grid)
@@ -55,6 +57,11 @@ class TrivialisedDiffusion(nn.Module):
     def wrap_displacements(x: torch.Tensor) -> torch.Tensor:
         """Wrap signed periodic displacements into [-0.5, 0.5)."""
         return torch.remainder(x + 0.5, 1.0) - 0.5
+
+    def wrap_scaled_positions(self, x: torch.Tensor) -> torch.Tensor:
+        """Wrap scaled periodic positions/displacements into [-scale_pos/2, scale_pos/2)."""
+        half_range = 0.5 * self.scale_pos
+        return torch.remainder(x + half_range, self.scale_pos) - half_range
 
     # -------------------------------------------------
     # Velocity sampling
@@ -82,12 +89,13 @@ class TrivialisedDiffusion(nn.Module):
     def _sigma_norm(self, sigma: torch.Tensor, num_samples: int = 20000) -> torch.Tensor:
         sigmas = sigma[None, :].repeat(num_samples, 1)
         x_sample = sigmas * torch.randn_like(sigmas)
-        x_sample = self.wrap_displacements(x_sample)
-        normal = d_log_wrapped_normal(
+        x_sample = self.wrap_scaled_positions(x_sample)
+        normal = d_log_wrapped_normal_2pi_version(
             r=x_sample,
             mu=torch.zeros_like(x_sample),
             sigma=sigmas,
-            K=self.k_wn_score,
+            N=self.k_wn_score,
+            T=self.scale_pos,
         )
         return normal.square().mean(dim=0)
 
@@ -132,6 +140,7 @@ class TrivialisedDiffusion(nn.Module):
         #Vi sætter v0 = 0, [Design choice] at time t = 0
         if v0 is None:
             v0 = torch.zeros_like(f0)                               #Design choice: Initial zero velocities
+        v0 = v0 * self.scale_pos
 
         #TODO: Scatter center mean free, også det de gør i KLDM
 
@@ -163,20 +172,18 @@ class TrivialisedDiffusion(nn.Module):
 
 
         #FACIT VERISON, OLD VERSION, CHAT MIGHT SAY IT IS A PROBLEM
-        r_t = self.wrap_displacements(wrapped_gaussian_mu_r_t + wrapped_gaussian_sigma_r_t * epsilon_r)
+        r_t = self.wrap_scaled_positions(wrapped_gaussian_mu_r_t + wrapped_gaussian_sigma_r_t * epsilon_r)
 
         #Now we calculate displacement, and while we stay on the manifold.
-        f_t = self.wrap_positions(f0 + r_t)
+        f0 = self.scale_pos * self.wrap_displacements(f0)
+        f_t = self.wrap_scaled_positions(f0 + r_t)
 
         #Center again
         #f_t = scatter_center(f_t, index=index) DEACTIVED WHILE FRANCOIS ANSWERS MAIL.
         #Then we wrap to ensure we stay within [0,1]
         #f_t = self.wrap_positions(f_t)
 
-
-
-
-        return f_t, v_t, epsilon_v, epsilon_r, r_t
+        return f_t / self.scale_pos, v_t / self.scale_pos, epsilon_v, epsilon_r, r_t
 
     def score_target(
         self,
@@ -194,13 +201,15 @@ class TrivialisedDiffusion(nn.Module):
 
         #Design choice, makes the target quite simple to calculate.
         v0 = torch.zeros_like(v_t) if v0 is None else v0
+        v0 = v0 * self.scale_pos
+        v_t = v_t * self.scale_pos
 
         #Now we find target of the wrapped normal fractional distribution
         wrapped_gaussian_mu_r_t = self.wrapped_gaussian_mu_r_t(t, v_t, v0)
         #NOT WRITTEN IN APPENDIX, BUT ASK FRANCOIS / MIKKEL IF IT WOULD MAKE SENSE TO DO
         #But would make sense since usually it works i [-pi, pi]
         """TODO: CHECK"""
-        wrapped_gaussian_mu_r_t = self.wrap_displacements(wrapped_gaussian_mu_r_t)
+        wrapped_gaussian_mu_r_t = self.wrap_scaled_positions(wrapped_gaussian_mu_r_t)
         """ this """
 
         wrapped_gaussian_sigma_r_t = self._match_dims(self.wrapped_gaussian_sigma_r_t(t), r_t)
@@ -214,11 +223,12 @@ class TrivialisedDiffusion(nn.Module):
         )
         """ #FULL TARGET
 
-        wrapped_gaussian_target =  d_log_wrapped_normal(
+        wrapped_gaussian_target =  d_log_wrapped_normal_2pi_version(
             r=r_t,
             mu=wrapped_gaussian_mu_r_t,
             sigma=wrapped_gaussian_sigma_r_t,
-            K=self.k_wn_score,
+            N=self.k_wn_score,
+            T=self.scale_pos,
         )
 
         sigma_norm_t = torch.sqrt(
@@ -242,6 +252,7 @@ class TrivialisedDiffusion(nn.Module):
     ) -> torch.Tensor:
         """Construct the full KLDM velocity score from the network prediction."""
         t_internal = self.time_scaling_T * t
+        v_t = v_t * self.scale_pos
         prefactor = self._match_dims(
             (1.0 - torch.exp(-t_internal)) / (1.0 + torch.exp(-t_internal)),
             pred_v,
@@ -265,6 +276,8 @@ class TrivialisedDiffusion(nn.Module):
         dt: float,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """One exponential-integrator reverse step for the TDM process."""
+        f_t = f_t * self.scale_pos
+        v_t = v_t * self.scale_pos
         dt_t = torch.as_tensor(
             self.time_scaling_T * dt,
             device=v_t.device,
@@ -281,9 +294,9 @@ class TrivialisedDiffusion(nn.Module):
         v_prev = exp_dt * v_t + 2.0 * expm1_dt * score_v + noise_scale * noise_v
 
 
-        f_prev = self.wrap_positions(f_t - dt_t * v_prev)
+        f_prev = self.wrap_scaled_positions(f_t - dt_t * v_prev)
 
-        return f_prev, v_prev
+        return f_prev / self.scale_pos, v_prev / self.scale_pos
 
 
     @staticmethod

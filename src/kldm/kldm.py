@@ -165,7 +165,7 @@ class ModelKLDM(nn.Module):
         )
 
         ########HERE WE CALCULATE SIMPLIFIED SCORE
-        out_v = scatter_center(preds["v"], index=index)
+        out_v = preds["v"]
         out_l = preds["l"]
 
         # KLDM: plain squared error for lattice targets.
@@ -234,7 +234,7 @@ class ModelKLDM(nn.Module):
         # f_T ~ U(0, 1)
         # l_T ~ N(0, I)
         v_t = scatter_center(torch.randn_like(batch.pos), index=node_index)
-        f_t = self.tdm.wrap_positions(torch.rand_like(batch.pos))
+        f_t = self.tdm.wrap_displacements(torch.rand_like(batch.pos))
         l_t = torch.randn_like(batch.l)
         a_t = batch.h  # CSP conditioning
 
@@ -297,7 +297,7 @@ class ModelKLDM(nn.Module):
                     )
 
                 # For KLDM-epsilon Algorithm 3, return the final sampled l_N directly
-                return f_t, v_t, l_t, a_t
+                return self.tdm.wrap_positions(f_t), v_t, l_t, a_t
         finally:
             if checkpoint_path is None and restore_training:
                 score_network.train()
