@@ -122,11 +122,6 @@ class ModelKLDM(nn.Module):
         loss = F.mse_loss(pred, target, reduction="none")
         return loss.reshape(loss.shape[0], -1).mean(dim=1)
 
-    @staticmethod
-    def velocity_loss_weight(t_node: torch.Tensor) -> torch.Tensor:
-        """Stable velocity-loss weighting for normalized time t in [0, 1]."""
-        return 1.0 - torch.exp(-4.0 * t_node)
-
     # ============================================================================
     # ALGORITHM 2
     # ============================================================================
@@ -170,15 +165,15 @@ class ModelKLDM(nn.Module):
         )
 
         ########HERE WE CALCULATE SIMPLIFIED SCORE
-        out_v = preds["v"]
+        out_v = scatter_center(preds["v"], index=index)
         out_l = preds["l"]
 
         # KLDM: plain squared error for lattice targets.
         loss_l = self.mse_loss_per_sample(preds["l"], target_l).mean()
 
         # Weight the velocity loss by the current normalized diffusion time.
-        lambda_v_t = self.velocity_loss_weight(t_node=t_node)
-        loss_v = (self.mse_loss_per_sample(out_v, target_v)).mean()
+        lambda_v_t = self.tdm.lambda_v(t_node)
+        loss_v = (lambda_v_t * self.mse_loss_per_sample(out_v, target_v)).mean()
 
         total_loss = lambda_v * loss_v + lambda_l * loss_l
         return total_loss, {

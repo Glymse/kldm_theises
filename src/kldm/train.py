@@ -187,6 +187,13 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Disable Weights & Biases logging for this run.",
     )
+    parser.add_argument(
+        "--lambda-precompute-batches",
+        dest="lambda_precompute_batches",
+        type=int,
+        default=None,
+        help="Number of train batches used to precompute the centered lambda(t) table.",
+    )
     return parser.parse_args()
 
 
@@ -195,6 +202,11 @@ def train() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     root = resolve_data_root()
     batch_size = args.batch_size if args.batch_size is not None else (256 if device.type == "cuda" else 16)
+    lambda_precompute_batches = (
+        args.lambda_precompute_batches
+        if args.lambda_precompute_batches is not None
+        else (64 if device.type == "cuda" else 16)
+    )
     if not (0.0 < args.train_fraction <= 1.0):
         raise ValueError("--train-fraction must be in the interval (0, 1].")
 
@@ -206,6 +218,7 @@ def train() -> None:
         "train_fraction": args.train_fraction,
         "subset_seed": args.subset_seed,
         "wandb_enabled": not args.no_wandb,
+        "lambda_precompute_batches": lambda_precompute_batches,
         "lr": 1e-3,
         "lambda_v": 1.0,
         "lambda_l": 1.0,
@@ -241,6 +254,15 @@ def train() -> None:
     )
 
     model = ModelKLDM(device=device).to(device)
+    print(
+        f"precomputing centered lambda_v table from {config['lambda_precompute_batches']} train batches",
+        flush=True,
+    )
+    model.tdm.precompute_lambda_v_table_from_loader(
+        loader=train_loader,
+        device=device,
+        num_batches=config["lambda_precompute_batches"],
+    )
     optimizer = torch.optim.Adam(model.parameters(), lr=config["lr"])
 
     run = None
