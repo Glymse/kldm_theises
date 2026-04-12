@@ -171,13 +171,6 @@ class TrivialisedDiffusion(nn.Module):
         #Design choice, makes the target quite simple to calculate.
         v0 = torch.zeros_like(v_t) if v0 is None else v0
 
-        gaussian_velocity_sigma_t = self._match_dims(self.gaussian_velocity_sigma(t), v_t)
-
-        #Simplified target of normal velocity distribution
-        gaussian_velocity_target = -v_t / gaussian_velocity_sigma_t.clamp_min(self.eps).pow(2)
-
-
-
         #Now we find target of the wrapped normal fractional distribution
         wrapped_gaussian_mu_r_t = self.wrapped_gaussian_mu_r_t(t, v_t, v0)
         #NOT WRITTEN IN APPENDIX, BUT ASK FRANCOIS / MIKKEL IF IT WOULD MAKE SENSE TO DO
@@ -219,12 +212,16 @@ class TrivialisedDiffusion(nn.Module):
     ) -> torch.Tensor:
         """Construct the full KLDM velocity score from the network prediction."""
         t_internal = self.time_scaling_T * t
-        gaussian_velocity_sigma_sq = self._match_dims(self.gaussian_velocity_sigma(t_internal) ** 2, pred_v)
-
-        return self._match_dims(
+        prefactor = self._match_dims(
             (1.0 - torch.exp(-t_internal)) / (1.0 + torch.exp(-t_internal)),
             pred_v,
-        ) * pred_v - v_t / gaussian_velocity_sigma_sq.clamp_min(self.eps)
+        )
+        gaussian_velocity_sigma_sq = self._match_dims(
+            self.gaussian_velocity_sigma(t_internal) ** 2,
+            pred_v,
+        ).clamp_min(self.eps)
+
+        return prefactor * pred_v - v_t / gaussian_velocity_sigma_sq
 
     def reverse_exp_step(
         self,

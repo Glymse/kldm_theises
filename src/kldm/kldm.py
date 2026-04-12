@@ -173,20 +173,12 @@ class ModelKLDM(nn.Module):
         out_v = preds["v"]
         out_l = preds["l"]
 
-        # Full velocity score, KLDM Eq. (19)
-        t_internal = self.tdm.time_scaling_T * t_node #Time scaling for TDM
-        exp_coef = self.tdm._match_dims((1.0 - torch.exp(-t_internal)) / (1.0 + torch.exp(-t_internal)), out_v)
-        sigma_v_sq = self.tdm._match_dims(self.tdm.gaussian_velocity_sigma(t_internal) ** 2, out_v)
-
-        #The simplified score, assuming initial velocity is 0
-        score_v = exp_coef * out_v - v_t / sigma_v_sq.clamp_min(1e-8)
-
         # KLDM: plain squared error for lattice targets.
         loss_l = self.mse_loss_per_sample(preds["l"], target_l).mean()
 
         # Weight the velocity loss by the current normalized diffusion time.
         lambda_v_t = self.velocity_loss_weight(t_node=t_node)
-        loss_v = (lambda_v_t * self.mse_loss_per_sample(score_v, target_v)).mean()
+        loss_v = (lambda_v_t * self.mse_loss_per_sample(out_v, target_v)).mean()
 
         total_loss = lambda_v * loss_v + lambda_l * loss_l
         return total_loss, {
