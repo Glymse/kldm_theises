@@ -128,6 +128,8 @@ class TrivialisedDiffusion(nn.Module):
         #Now we calculate f_t = f_0 * expm(r_t), where r_t follows a wrapped Gaussian.
 
         wrapped_gaussian_mu_r_t = self.wrapped_gaussian_mu_r_t(t, v_t, v0)
+        wrapped_gaussian_mu_r_t = self.wrap_displacements(wrapped_gaussian_mu_r_t) #To stay in [-0.5, 0.5] or [-pi, pi] equvialant.
+
         wrapped_gaussian_sigma_r_t = self._match_dims(self.wrapped_gaussian_sigma_r_t(t), f0)
 
         #Sample normal noise on epsilon
@@ -136,24 +138,17 @@ class TrivialisedDiffusion(nn.Module):
         epsilon_r = scatter_center(epsilon_r, index=index)
 
 
-        """ OLD VERSION, CHAT MIGHT SAY IT IS A PROBLEM
+        #FACIT VERISON, OLD VERSION, CHAT MIGHT SAY IT IS A PROBLEM
         r_t = self.wrap_displacements(wrapped_gaussian_mu_r_t + wrapped_gaussian_sigma_r_t * epsilon_r)
 
         #Now we calculate displacement, and while we stay on the manifold.
         f_t = self.wrap_positions(f0 + r_t)
 
         #Center again
-        f_t = scatter_center(f_t, index=index)
-        f_t = self.wrap_positions(f_t)
-        """
-        #Move to [-0.5, 0.5]
+        #f_t = scatter_center(f_t, index=index) DEACTIVED WHILE FRANCOIS ANSWERS MAIL.
+        #Then we wrap to ensure we stay within [0,1]
+        #f_t = self.wrap_positions(f_t)
 
-        #PSEUDO: rt = w(µrt(t, v0, vt) + σrt, (t, v0, vt) · ϵrt ) ▷ w indicates the wrap function. ft = w(f0 + rt) ft = center(ft) ▷ center(·) keeps the center of gravity fixed
-        r_t = self.wrap_displacements(wrapped_gaussian_mu_r_t + wrapped_gaussian_sigma_r_t * epsilon_r)
-        #Remove mean
-        r_t = scatter_center(r_t, index=index)
-        r_t = self.wrap_displacements(r_t)
-        f_t = self.wrap_positions(f0 + r_t)
 
 
 
@@ -181,9 +176,19 @@ class TrivialisedDiffusion(nn.Module):
         #Simplified target of normal velocity distribution
         gaussian_velocity_target = -v_t / gaussian_velocity_sigma_t.clamp_min(self.eps).pow(2)
 
+
+
         #Now we find target of the wrapped normal fractional distribution
         wrapped_gaussian_mu_r_t = self.wrapped_gaussian_mu_r_t(t, v_t, v0)
+        #NOT WRITTEN IN APPENDIX, BUT ASK FRANCOIS / MIKKEL IF IT WOULD MAKE SENSE TO DO
+        #But would make sense since usually it works i [-pi, pi]
+        """TODO: CHECK"""
+        wrapped_gaussian_mu_r_t = self.wrap_displacements(wrapped_gaussian_mu_r_t)
+        """ this """
+
         wrapped_gaussian_sigma_r_t = self._match_dims(self.wrapped_gaussian_sigma_r_t(t), r_t)
+
+
 
         wrapped_gaussian_target = self._match_dims((1.0 - torch.exp(-t)) / (1.0 + torch.exp(-t)), r_t) * d_log_wrapped_normal(
             r=r_t,
@@ -191,10 +196,12 @@ class TrivialisedDiffusion(nn.Module):
             sigma=wrapped_gaussian_sigma_r_t,
         )
 
+        #Center the target
         wrapped_gaussian_target = scatter_center(wrapped_gaussian_target, index=index)
 
-        target = gaussian_velocity_target + wrapped_gaussian_target
-        return target
+        #target = gaussian_velocity_target + wrapped_gaussian_target
+        return wrapped_gaussian_target #Simplified version, might explain later.
+
         #return target_s
 
     def construct_velocity_score(
@@ -230,9 +237,13 @@ class TrivialisedDiffusion(nn.Module):
 
         exp_dt = torch.exp(dt_t)
         exp_2dt_minus_1 = torch.exp(2.0 * dt_t) - 1.0
-        noise_scale = torch.sqrt(exp_2dt_minus_1.clamp_min(self.eps))
+        expm1_dt = torch.expm1(dt_t)
+        expm1_2dt = torch.expm1(2.0 * dt_t)
+        noise_scale = torch.sqrt(expm1_2dt.clamp_min(self.eps))
 
-        v_prev = exp_dt * v_t + 2.0 * exp_2dt_minus_1 * score_v + noise_scale * noise_v
+        v_prev = exp_dt * v_t + 2.0 * expm1_dt * score_v + noise_scale * noise_v
+
+
         f_prev = self.wrap_positions(f_t - dt_t * v_prev)
 
         return f_prev, v_prev
