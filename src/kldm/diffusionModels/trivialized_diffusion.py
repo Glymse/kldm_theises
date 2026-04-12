@@ -34,8 +34,12 @@ class TrivialisedDiffusion(nn.Module):
         super().__init__()
         self.eps = float(eps)
         self.time_scaling_T = 2
+        self.k_wn_score = 13
         self.n_lambdas = 256
         self.register_buffer("_lambda_v_table", torch.ones(self.n_lambdas))
+        sigma_grid = self.wrapped_gaussian_sigma_r_t(torch.linspace(0.0, self.time_scaling_T, self.n_lambdas))
+        sigma_norm_grid = self._sigma_norm(sigma_grid)
+        self.register_buffer("_sigma_norms", sigma_norm_grid)
 
     # -------------------------------------------------
     #  Wrapping function.
@@ -76,6 +80,26 @@ class TrivialisedDiffusion(nn.Module):
         return torch.sqrt(
             torch.clamp(2.0 * t + 8.0 / (1.0 + torch.exp(t)) - 4.0, min=self.eps)
         )  # Eq. (23)
+
+    def _sigma_norm(self, sigma: torch.Tensor, num_samples: int = 20000) -> torch.Tensor:
+        sigmas = sigma[None, :].repeat(num_samples, 1)
+        x_sample = sigma * torch.randn_like(sigmas)
+        x_sample = self.wrap_displacements(x_sample)
+        normal = d_log_wrapped_normal(
+            r=x_sample,
+            mu=torch.zeros_like(x_sample),
+            sigma=sigma,
+            K=self.k_wn_score,
+        )
+        return normal.square().mean(dim=0)
+
+    def _sigma_norm_t(self, t: torch.Tensor) -> torch.Tensor:
+        idx = torch.clamp(
+            torch.round(t / self.time_scaling_T * (self.n_lambdas - 1)).long(),
+            0,
+            self.n_lambdas - 1,
+        )
+        return self._sigma_norms[idx]
 
     def _fill_missing_lambda_bins(
         self,
@@ -301,7 +325,13 @@ class TrivialisedDiffusion(nn.Module):
             r=r_t,
             mu=wrapped_gaussian_mu_r_t,
             sigma=wrapped_gaussian_sigma_r_t,
+            K=self.k_wn_score,
         )
+
+        sigma_norm_t = torch.sqrt(
+            self._match_dims(self._sigma_norm_t(t), wrapped_gaussian_target)
+        ).clamp_min(self.eps)
+        wrapped_gaussian_target = wrapped_gaussian_target / sigma_norm_t
 
         #Center the target
         wrapped_gaussian_target = scatter_center(wrapped_gaussian_target, index=index)
@@ -323,12 +353,15 @@ class TrivialisedDiffusion(nn.Module):
             (1.0 - torch.exp(-t_internal)) / (1.0 + torch.exp(-t_internal)),
             pred_v,
         )
+        sigma_norm_t = torch.sqrt(
+            self._match_dims(self._sigma_norm_t(t_internal), pred_v)
+        ).clamp_min(self.eps)
         gaussian_velocity_sigma_sq = self._match_dims(
             self.gaussian_velocity_sigma(t_internal) ** 2,
             pred_v,
         ).clamp_min(self.eps)
 
-        return prefactor * pred_v - v_t / gaussian_velocity_sigma_sq
+        return prefactor * sigma_norm_t * pred_v - v_t / gaussian_velocity_sigma_sq
 
     def reverse_exp_step(
         self,
