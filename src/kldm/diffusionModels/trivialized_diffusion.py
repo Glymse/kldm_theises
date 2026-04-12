@@ -189,8 +189,15 @@ class TrivialisedDiffusion(nn.Module):
         wrapped_gaussian_sigma_r_t = self._match_dims(self.wrapped_gaussian_sigma_r_t(t), r_t)
 
 
-
+        """
         wrapped_gaussian_target = self._match_dims((1.0 - torch.exp(-t)) / (1.0 + torch.exp(-t)), r_t) * d_log_wrapped_normal(
+            r=r_t,
+            mu=wrapped_gaussian_mu_r_t,
+            sigma=wrapped_gaussian_sigma_r_t,
+        )
+        """ #FULL TARGET
+
+        wrapped_gaussian_target =  d_log_wrapped_normal(
             r=r_t,
             mu=wrapped_gaussian_mu_r_t,
             sigma=wrapped_gaussian_sigma_r_t,
