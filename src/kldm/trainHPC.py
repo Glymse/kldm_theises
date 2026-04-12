@@ -485,12 +485,6 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional safety cap on epochs. Omit to run until stopped.",
     )
-    parser.add_argument(
-        "--lambda-precompute-batches",
-        type=int,
-        default=None,
-        help="Number of train batches used to precompute the centered lambda(t) table.",
-    )
     return parser.parse_args()
 
 
@@ -498,11 +492,6 @@ def train() -> None:
     args = parse_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     root = resolve_data_root()
-    lambda_precompute_batches = (
-        args.lambda_precompute_batches
-        if args.lambda_precompute_batches is not None
-        else (128 if device.type == "cuda" else 32)
-    )
 
     config = {
         "task": "CSP",
@@ -516,7 +505,6 @@ def train() -> None:
         "sampling_steps": args.sampling_steps,
         "load_from_checkpoint": args.load_from_checkpoint,
         "max_epochs": args.max_epochs,
-        "lambda_precompute_batches": lambda_precompute_batches,
     }
 
     train_loader = CSPTask().dataloader(
@@ -553,16 +541,6 @@ def train() -> None:
         optimizer=optimizer,
         checkpoint_path=args.load_from_checkpoint,
         device=device,
-    )
-
-    print(
-        f"precomputing centered lambda_v table from {config['lambda_precompute_batches']} train batches",
-        flush=True,
-    )
-    model.tdm.precompute_lambda_v_table_from_loader(
-        loader=train_loader,
-        device=device,
-        num_batches=config["lambda_precompute_batches"],
     )
 
     run_name = (

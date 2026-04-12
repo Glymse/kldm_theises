@@ -35,9 +35,7 @@ class TrivialisedDiffusion(nn.Module):
         self.eps = float(eps)
         self.time_scaling_T = 2
         self.k_wn_score = 13
-        self.n_lambdas = 256
-        self.register_buffer("_lambda_v_table", torch.ones(self.n_lambdas))
-        sigma_grid = self.wrapped_gaussian_sigma_r_t(torch.linspace(0.0, self.time_scaling_T, self.n_lambdas))
+        sigma_grid = self.wrapped_gaussian_sigma_r_t(torch.linspace(0.0, self.time_scaling_T, 256))
         sigma_norm_grid = self._sigma_norm(sigma_grid)
         self.register_buffer("_sigma_norms", sigma_norm_grid)
 
@@ -95,116 +93,11 @@ class TrivialisedDiffusion(nn.Module):
 
     def _sigma_norm_t(self, t: torch.Tensor) -> torch.Tensor:
         idx = torch.clamp(
-            torch.round(t / self.time_scaling_T * (self.n_lambdas - 1)).long(),
+            torch.round(t / self.time_scaling_T * (len(self._sigma_norms) - 1)).long(),
             0,
-            self.n_lambdas - 1,
+            len(self._sigma_norms) - 1,
         )
         return self._sigma_norms[idx]
-
-    def _fill_missing_lambda_bins(
-        self,
-        expected_sq_norm: torch.Tensor,
-        counts: torch.Tensor,
-    ) -> torch.Tensor:
-        observed = counts > 0
-        if bool(observed.all()):
-            return expected_sq_norm
-        if not bool(observed.any()):
-            return torch.ones_like(expected_sq_norm)
-
-        filled = expected_sq_norm.clone()
-        observed_idx = torch.nonzero(observed, as_tuple=False).flatten()
-        missing_idx = torch.nonzero(~observed, as_tuple=False).flatten()
-
-        for idx in missing_idx.tolist():
-            idx_tensor = torch.tensor(idx, device=observed_idx.device)
-            right_pos = torch.searchsorted(observed_idx, idx_tensor, right=False)
-            if right_pos == 0:
-                filled[idx] = expected_sq_norm[observed_idx[0]]
-                continue
-            if right_pos == observed_idx.numel():
-                filled[idx] = expected_sq_norm[observed_idx[-1]]
-                continue
-
-            left_idx = observed_idx[right_pos - 1]
-            right_idx = observed_idx[right_pos]
-            left_val = expected_sq_norm[left_idx]
-            right_val = expected_sq_norm[right_idx]
-            mix = (idx - int(left_idx.item())) / (int(right_idx.item()) - int(left_idx.item()))
-            filled[idx] = left_val + (right_val - left_val) * mix
-
-        return filled
-
-    def precompute_lambda_v_table_from_loader(
-        self,
-        loader,
-        device: torch.device,
-        num_batches: int = 64,
-    ) -> None:
-        """
-        Paper-style lambda(t) for the simplified target, estimated from actual
-        training batches after applying the same graph-wise centering used in training.
-        """
-        was_training = self.training
-        self.eval()
-
-        lambda_sum = torch.zeros(self.n_lambdas, device=device)
-        lambda_count = torch.zeros(self.n_lambdas, device=device)
-        loader_iter = iter(loader)
-
-        with torch.no_grad():
-            for _ in range(num_batches):
-                try:
-                    batch = next(loader_iter)
-                except StopIteration:
-                    loader_iter = iter(loader)
-                    batch = next(loader_iter)
-
-                batch = batch.to(device)
-                t_graph = torch.rand(batch.num_graphs, device=device).clamp_(1e-4, 1.0)
-                t_node = t_graph[batch.batch]
-
-                f_t, v_t, epsilon_v, epsilon_r, r_t = self.forward_sample(
-                    t=t_node,
-                    f0=batch.pos,
-                    index=batch.batch,
-                )
-                target_v = self.score_target(
-                    t=t_node,
-                    r_t=r_t,
-                    v_t=v_t,
-                    index=batch.batch,
-                )
-
-                target_sq_node = target_v.reshape(target_v.shape[0], -1).pow(2).mean(dim=1)
-                target_sq_graph = scatter(target_sq_node, batch.batch, dim=0, reduce="mean")
-                bin_idx = torch.clamp(
-                    torch.round(t_graph * (self.n_lambdas - 1)).long(),
-                    0,
-                    self.n_lambdas - 1,
-                )
-
-                lambda_sum.scatter_add_(0, bin_idx, target_sq_graph)
-                lambda_count.scatter_add_(0, bin_idx, torch.ones_like(target_sq_graph))
-
-        expected_sq_norm = lambda_sum / lambda_count.clamp_min(1.0)
-        expected_sq_norm = self._fill_missing_lambda_bins(expected_sq_norm, lambda_count)
-        lambda_table = 1.0 / expected_sq_norm.clamp_min(self.eps)
-        self._lambda_v_table.copy_(lambda_table.to(self._lambda_v_table.device))
-
-        if was_training:
-            self.train()
-
-    def lambda_v(self, t01: torch.Tensor) -> torch.Tensor:
-        """
-        Lookup lambda(t) for normalized time t01 in [0,1].
-        """
-        idx = torch.clamp(
-            torch.round(t01 * (self.n_lambdas - 1)).long(),
-            0,
-            self.n_lambdas - 1,
-        )
-        return self._lambda_v_table[idx]
 
 
     #TODO: We do not center the distribution around = 0 yet. Ask francois.
