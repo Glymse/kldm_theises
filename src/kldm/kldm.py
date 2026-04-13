@@ -39,6 +39,7 @@ class ModelKLDM(nn.Module):
         eps: float = 1e-3,
     ) -> None:
         super().__init__()
+        self.device = device or torch.device("cpu")
 
         self.score_network = score_network or CSPVNet(
             hidden_dim=128,
@@ -54,9 +55,12 @@ class ModelKLDM(nn.Module):
             zero_cog=True # center-of-mass / zero mean per graph.
         )
 
-        self.tdm = diffusion_v or TDM(eps=eps)
+        self.tdm = diffusion_v or TDM(
+            eps=eps,
+            sigma_norm_num_samples=20000 if self.device.type == "cuda" else 4096,
+            sigma_norm_chunk_size=128 if self.device.type == "cuda" else 32,
+        )
         self.diffusion_l = diffusion_l or ContinuousVPDiffusion(eps=eps)
-        self.device = device or torch.device("cpu")
         self.eps = eps
         self.task_type: Optional[str] = None
         self._cached_sampling_checkpoint_path: Optional[str] = None
