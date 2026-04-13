@@ -131,7 +131,7 @@ class ExponentialMovingAverage:
 
 #####
 #####
-####
+#####
 
 
 def validation_step(
@@ -628,6 +628,15 @@ def train() -> None:
         decay=config["ema_decay"],
         start_step=config["ema_start"],
     )
+    lambda_table = getattr(model.tdm, "_lambda_v_table", None)
+    if isinstance(lambda_table, torch.Tensor):
+        print(
+            "lambda_v_table_stats "
+            f"min={float(lambda_table.min()):.6f} "
+            f"mean={float(lambda_table.mean()):.6f} "
+            f"max={float(lambda_table.max()):.6f}",
+            flush=True,
+        )
     print("constructed model and optimizer", flush=True)
 
     start_epoch, resume_config = maybe_resume(
