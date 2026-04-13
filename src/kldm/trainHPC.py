@@ -658,6 +658,11 @@ def train() -> None:
     print("constructed train/val/sample loaders", flush=True)
 
     model = ModelKLDM(device=device).to(device)
+    print("precomputing lambda_v table on real train batches", flush=True)
+    model.tdm.precompute_lambda_v_table_from_loader(
+        train_loader,
+        device=device,
+    )
     optimizer = torch.optim.AdamW(model.parameters(), lr=config["lr"])
     ema = ExponentialMovingAverage(
         model=model,

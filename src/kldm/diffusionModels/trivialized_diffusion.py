@@ -10,7 +10,10 @@ if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from kldm.distribution import d_log_wrapped_normal
-from kldm.diffusionModels.lambda_t import interpolate_lambda_table, precompute_lambda_time_grid
+from kldm.diffusionModels.lambda_t import (
+    interpolate_lambda_table,
+    precompute_lambda_time_grid_from_loader,
+)
 from kldm.scoreNetwork.utils import scatter_center
 
 ################################################################
@@ -30,26 +33,14 @@ class TrivialisedDiffusion(nn.Module):
             self,
             eps: float = 1e-5,
             n_lambdas: int = 256,
-            lambda_num_batches: int = 16,
-            lambda_graphs_per_batch: int = 16,
-            lambda_nodes_per_graph: int = 16) -> None:
+            lambda_num_batches: int = 16) -> None:
         super().__init__()
         self.eps = float(eps)
         self.time_scaling_T = 2
         self.n_lambdas = int(n_lambdas)
         self.lambda_num_batches = int(lambda_num_batches)
-        self.lambda_graphs_per_batch = int(lambda_graphs_per_batch)
-        self.lambda_nodes_per_graph = int(lambda_nodes_per_graph)
-
-        lambda_grid = torch.linspace(1e-4, 1.0, self.n_lambdas)
-        lambda_table = precompute_lambda_time_grid(
-            diffusion=self,
-            t01_grid=lambda_grid,
-            num_batches=self.lambda_num_batches,
-            graphs_per_batch=self.lambda_graphs_per_batch,
-            nodes_per_graph=self.lambda_nodes_per_graph,
-        )
-        self.register_buffer("_lambda_v_table", lambda_table)
+        self.register_buffer("_lambda_t01_grid", torch.linspace(1e-4, 1.0, self.n_lambdas))
+        self.register_buffer("_lambda_v_table", torch.ones(self.n_lambdas))
 
     # -------------------------------------------------
     #  Wrapping function.
@@ -96,6 +87,30 @@ class TrivialisedDiffusion(nn.Module):
         Interpolate λ(t) for normalized time t01 in [0,1].
         """
         return interpolate_lambda_table(self._lambda_v_table, t01)
+
+    @torch.no_grad()
+    def precompute_lambda_v_table_from_loader(
+        self,
+        loader,
+        device: torch.device | None = None,
+        num_batches: int | None = None,
+        clamp_min: float = 1e-3,
+        clamp_max: float = 10.0,
+    ) -> torch.Tensor:
+        """
+        Precompute λ(t) on real train batches with their real `batch.batch`.
+        """
+        lambda_table = precompute_lambda_time_grid_from_loader(
+            diffusion=self,
+            loader=loader,
+            t01_grid=self._lambda_t01_grid,
+            num_batches=self.lambda_num_batches if num_batches is None else int(num_batches),
+            clamp_min=clamp_min,
+            clamp_max=clamp_max,
+            device=self._lambda_v_table.device if device is None else device,
+        )
+        self._lambda_v_table.copy_(lambda_table.to(self._lambda_v_table))
+        return self._lambda_v_table
 
 
     #TODO: We do not center the distribution around = 0 yet. Ask francois.

@@ -58,8 +58,6 @@ class ModelKLDM(nn.Module):
             eps=eps,
             n_lambdas=512 if self.device.type == "cuda" else 128,
             lambda_num_batches=32 if self.device.type == "cuda" else 8,
-            lambda_graphs_per_batch=32 if self.device.type == "cuda" else 8,
-            lambda_nodes_per_graph=16,
         )
         self.diffusion_l = diffusion_l or ContinuousVPDiffusion(eps=eps)
         self.eps = eps

@@ -239,6 +239,11 @@ def train() -> None:
     )
 
     model = ModelKLDM(device=device).to(device)
+    print("precomputing lambda_v table on real train batches", flush=True)
+    model.tdm.precompute_lambda_v_table_from_loader(
+        train_loader,
+        device=device,
+    )
     optimizer = torch.optim.Adam(model.parameters(), lr=config["lr"])
 
     run = wandb.init(

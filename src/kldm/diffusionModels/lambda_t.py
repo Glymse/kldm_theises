@@ -22,14 +22,14 @@ def interpolate_lambda_table(
 
 
 @torch.no_grad()
-def precompute_lambda_time_grid(
+def precompute_lambda_time_grid_from_loader(
     diffusion,
+    loader,
     t01_grid: torch.Tensor,
     num_batches: int = 32,
-    graphs_per_batch: int = 16,
-    nodes_per_graph: int = 16,
     clamp_min: float = 1e-3,
     clamp_max: float = 10.0,
+    device: torch.device | None = None,
 ) -> torch.Tensor:
     """
     Monte Carlo estimate of
@@ -38,27 +38,36 @@ def precompute_lambda_time_grid(
 
     for the velocity states in the unit-period TDM convention.
 
-    We estimate the score norm from the same simplified target used in training:
-    sample from the forward kernel with zero initial positions / velocities, then
-    call diffusion.score_target(...). This is the stripped-down wrapped-normal
-    target without the KLDM prefactor, because the prefactor is reinserted only
-    during score reconstruction. Because the tangent space is Euclidean here,
-    the loss computation uses the usual squared norm in R^m.
+    We estimate the score norm from the same simplified target used in training
+    on real train batches with their real `batch.batch` graph structure. This is
+    the stripped-down wrapped-normal target without the KLDM prefactor, because
+    the prefactor is reinserted only during score reconstruction. Because the
+    tangent space is Euclidean here, the loss computation uses the usual squared
+    norm in R^m.
     """
-    device = t01_grid.device
-    dtype = t01_grid.dtype
+    if num_batches <= 0:
+        raise ValueError("num_batches must be positive for lambda precomputation.")
+
+    table_device = t01_grid.device if device is None else torch.device(device)
     lambda_values = []
 
     for t01 in t01_grid:
         batch_estimates = []
 
-        for _ in range(num_batches):
-            index = torch.arange(graphs_per_batch, device=device).repeat_interleave(nodes_per_graph)
-            num_nodes = int(index.shape[0])
+        for batch_idx, batch in enumerate(loader):
+            if batch_idx >= num_batches:
+                break
 
-            # Zero initial state for the Monte Carlo approximation in p_t|0(. | 0).
-            f0 = torch.zeros((num_nodes, 3), device=device, dtype=dtype)
-            t_node = torch.full((num_nodes,), float(t01.item()), device=device, dtype=dtype)
+            batch = batch.to(table_device)
+            index = batch.batch
+            f0 = batch.pos.to(device=table_device)
+            num_nodes = int(index.shape[0])
+            t_node = torch.full(
+                (num_nodes,),
+                float(t01.item()),
+                device=table_device,
+                dtype=f0.dtype,
+            )
 
             _, v_t, _, _, r_t = diffusion.forward_sample(
                 t=t_node,
@@ -74,6 +83,9 @@ def precompute_lambda_time_grid(
 
             sq_norm = target_v.reshape(num_nodes, -1).pow(2).sum(dim=1).mean()
             batch_estimates.append(sq_norm)
+
+        if not batch_estimates:
+            raise RuntimeError("Train loader is empty; cannot precompute lambda(t).")
 
         expected_sq_norm = torch.stack(batch_estimates).mean()
         lambda_values.append(1.0 / expected_sq_norm.clamp_min(diffusion.eps))
