@@ -137,6 +137,7 @@ class ModelKLDM(nn.Module):
         t: torch.Tensor,
         lambda_v: float = 1.0,
         lambda_l: float = 1.0,
+        debug: bool = False,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """
         Algorithm 2 in KLDM:
@@ -182,19 +183,36 @@ class ModelKLDM(nn.Module):
         raw_loss_v = raw_loss_v_per_sample.mean()
 
         total_loss = lambda_v * loss_v + lambda_l * loss_l
-        return total_loss, {
+        metrics = {
             "loss": total_loss.detach(),
             "loss_v": loss_v.detach(),
-            "raw_loss_v": raw_loss_v.detach(),
             "loss_l": loss_l.detach(),
-            "target_v_abs_mean": target_v.abs().mean().detach(),
-            "target_v_norm_mean": target_v.norm(dim=-1).mean().detach(),
-            "pred_v_abs_mean": out_v.abs().mean().detach(),
-            "pred_v_norm_mean": out_v.norm(dim=-1).mean().detach(),
-            "lambda_v_mean": lambda_v_t.mean().detach(),
-            "lambda_v_min": lambda_v_t.min().detach(),
-            "lambda_v_max": lambda_v_t.max().detach(),
         }
+        if debug:
+            t_node = t_graph[index].squeeze(-1)
+            score_v = self.tdm.construct_velocity_score(t=t_node, v_t=v_t, pred_v=out_v)
+            metrics.update(
+                {
+                    "raw_loss_v": raw_loss_v.detach(),
+                    "target_v_abs_mean": target_v.abs().mean().detach(),
+                    "target_v_norm_mean": target_v.norm(dim=-1).mean().detach(),
+                    "pred_v_abs_mean": out_v.abs().mean().detach(),
+                    "pred_v_norm_mean": out_v.norm(dim=-1).mean().detach(),
+                    "lambda_v_mean": lambda_v_t.mean().detach(),
+                    "lambda_v_min": lambda_v_t.min().detach(),
+                    "lambda_v_max": lambda_v_t.max().detach(),
+                    "lambda_v_effective": (
+                        loss_v.detach() / raw_loss_v.detach().clamp_min(self.eps)
+                    ),
+                    "v_t_abs_mean": v_t.abs().mean().detach(),
+                    "f_t_abs_mean": f_t.abs().mean().detach(),
+                    "r_t_abs_mean": self.tdm.wrap_displacements(f_t - self.tdm.wrap_displacements(batch.pos)).abs().mean().detach(),
+                    "score_v_abs_mean": score_v.abs().mean().detach(),
+                    "pred_l_abs_mean": out_l.abs().mean().detach(),
+                    "target_l_abs_mean": target_l.abs().mean().detach(),
+                }
+            )
+        return total_loss, metrics
 
 
 
@@ -249,7 +267,7 @@ class ModelKLDM(nn.Module):
         # v_T ~ N_v(0, I) with zero-net translation
         # f_T is kept in the centered unit chart internally again.
         # l_T ~ N(0, I)
-        v_t = scatter_center(torch.randn_like(batch.pos), index=node_index) / self.tdm.scale_pos
+        v_t = scatter_center(torch.randn_like(batch.pos), index=node_index)
         f_t = self.tdm.wrap_displacements(torch.rand_like(batch.pos))
         l_t = torch.randn_like(batch.l)
         a_t = batch.h  # CSP conditioning

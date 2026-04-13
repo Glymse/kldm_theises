@@ -28,7 +28,6 @@ def precompute_lambda_time_grid(
     num_batches: int = 32,
     graphs_per_batch: int = 16,
     nodes_per_graph: int = 16,
-    clamp_min: float = 0.1,
     clamp_max: float = 10.0,
 ) -> torch.Tensor:
     """
@@ -77,5 +76,5 @@ def precompute_lambda_time_grid(
         lambda_values.append(1.0 / expected_sq_norm.clamp_min(diffusion.eps))
 
     lambda_table = torch.stack(lambda_values)
-    lambda_table = lambda_table.clamp(min=clamp_min, max=clamp_max)
+    lambda_table = torch.clamp_max(lambda_table, clamp_max)
     return lambda_table

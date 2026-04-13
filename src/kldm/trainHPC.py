@@ -138,6 +138,7 @@ def validation_step(
     model: ModelKLDM,
     batch,
     device: torch.device,
+    debug: bool = False,
 ) -> dict[str, float]:
     model.eval()
     batch = batch.to(device)
@@ -154,6 +155,7 @@ def validation_step(
             t=t_graph,
             lambda_v=1.0,
             lambda_l=1.0,
+            debug=debug,
         )
 
     return {
@@ -168,6 +170,7 @@ def train_epoch(
     optimizer: torch.optim.Optimizer,
     ema: ExponentialMovingAverage,
     device: torch.device,
+    debug: bool = False,
 ) -> dict[str, float]:
     model.train()
     running: dict[str, float] = {}
@@ -190,8 +193,34 @@ def train_epoch(
             t=t_graph,
             lambda_v=1.0,
             lambda_l=1.0,
+            debug=debug,
         )
         loss.backward()
+        if debug:
+            total_grad_sq = 0.0
+            score_network_grad_sq = 0.0
+            out_v_grad_sq = 0.0
+            out_l_grad_sq = 0.0
+            for name, param in model.named_parameters():
+                if param.grad is None:
+                    continue
+                grad_sq = float(param.grad.detach().pow(2).sum().item())
+                total_grad_sq += grad_sq
+                if name.startswith("score_network"):
+                    score_network_grad_sq += grad_sq
+                if name.startswith("score_network.out_v"):
+                    out_v_grad_sq += grad_sq
+                if name.startswith("score_network.out_l"):
+                    out_l_grad_sq += grad_sq
+            metrics = dict(metrics)
+            metrics.update(
+                {
+                    "grad_norm": total_grad_sq ** 0.5,
+                    "score_network_grad_norm": score_network_grad_sq ** 0.5,
+                    "out_v_grad_norm": out_v_grad_sq ** 0.5,
+                    "out_l_grad_norm": out_l_grad_sq ** 0.5,
+                }
+            )
         optimizer.step()
         ema.update(model)
 
@@ -211,12 +240,13 @@ def evaluate_loss(
     model: ModelKLDM,
     loader,
     device: torch.device,
+    debug: bool = False,
 ) -> dict[str, float]:
     totals: dict[str, float] = {}
     num_batches = 0
 
     for batch in loader:
-        metrics = validation_step(model=model, batch=batch, device=device)
+        metrics = validation_step(model=model, batch=batch, device=device, debug=debug)
         for key, value in metrics.items():
             totals[key] = totals.get(key, 0.0) + value
         num_batches += 1
@@ -567,6 +597,11 @@ def parse_args() -> argparse.Namespace:
         default=500,
         help="Number of optimizer steps before EMA switches from copying to decayed updates.",
     )
+    parser.add_argument(
+        "--dev",
+        action="store_true",
+        help="Enable detailed KLDM/TDM convergence diagnostics in logs and W&B.",
+    )
     return parser.parse_args()
 
 
@@ -590,6 +625,7 @@ def train() -> None:
         "max_epochs": args.max_epochs,
         "ema_decay": args.ema_decay,
         "ema_start": args.ema_start,
+        "dev": args.dev,
     }
 
     train_loader = CSPTask().dataloader(
@@ -627,12 +663,15 @@ def train() -> None:
         start_step=config["ema_start"],
     )
     lambda_table = getattr(model.tdm, "_lambda_v_table", None)
-    if isinstance(lambda_table, torch.Tensor):
+    if args.dev and isinstance(lambda_table, torch.Tensor):
         print(
             "lambda_v_table_stats "
             f"min={float(lambda_table.min()):.6f} "
             f"mean={float(lambda_table.mean()):.6f} "
-            f"max={float(lambda_table.max()):.6f}",
+            f"max={float(lambda_table.max()):.6f} "
+            f"p25={float(torch.quantile(lambda_table, 0.25)):.6f} "
+            f"p50={float(torch.quantile(lambda_table, 0.50)):.6f} "
+            f"p75={float(torch.quantile(lambda_table, 0.75)):.6f}",
             flush=True,
         )
     print("constructed model and optimizer", flush=True)
@@ -696,16 +735,25 @@ def train() -> None:
                 optimizer=optimizer,
                 ema=ema,
                 device=device,
+                debug=args.dev,
             )
 
-            print(
-                f"epoch={epoch:04d} "
-                f"train_loss={train_metrics['loss']:.6f} "
-                f"(v={train_metrics['loss_v']:.6f}, raw_v={train_metrics['raw_loss_v']:.6f}, l={train_metrics['loss_l']:.6f}) "
-                f"target_v_abs={train_metrics['target_v_abs_mean']:.6f} "
-                f"pred_v_abs={train_metrics['pred_v_abs_mean']:.6f} "
-                f"lambda=[{train_metrics['lambda_v_min']:.3f},{train_metrics['lambda_v_mean']:.3f},{train_metrics['lambda_v_max']:.3f}]"
-            )
+            if args.dev:
+                print(
+                    f"epoch={epoch:04d} "
+                    f"train_loss={train_metrics['loss']:.6f} "
+                    f"(v={train_metrics['loss_v']:.6f}, raw_v={train_metrics['raw_loss_v']:.6f}, l={train_metrics['loss_l']:.6f}) "
+                    f"target_v_abs={train_metrics['target_v_abs_mean']:.6f} "
+                    f"pred_v_abs={train_metrics['pred_v_abs_mean']:.6f} "
+                    f"lambda=[{train_metrics['lambda_v_min']:.3f},{train_metrics['lambda_v_mean']:.3f},{train_metrics['lambda_v_max']:.3f}] "
+                    f"grad=[total={train_metrics['grad_norm']:.3f},v={train_metrics['out_v_grad_norm']:.3f},l={train_metrics['out_l_grad_norm']:.3f}]"
+                )
+            else:
+                print(
+                    f"epoch={epoch:04d} "
+                    f"train_loss={train_metrics['loss']:.6f} "
+                    f"(v={train_metrics['loss_v']:.6f}, l={train_metrics['loss_l']:.6f})"
+                )
 
             should_record_loss = (epoch % config["loss_every"] == 0)
             should_run_sampling = (epoch % config["validate_every"] == 0)
@@ -714,7 +762,7 @@ def train() -> None:
                 continue
 
             with ema.average_parameters(model):
-                val_metrics = evaluate_loss(model=model, loader=val_loader, device=device)
+                val_metrics = evaluate_loss(model=model, loader=val_loader, device=device, debug=args.dev)
 
             #Add metric here, ground truth vs predicted.  ASE libary.
             if should_record_loss:
@@ -732,42 +780,71 @@ def train() -> None:
                     }
                 )
 
-                print(
-                    f"validation_epoch={epoch:04d} "
-                    f"val_loss={val_metrics['loss']:.6f} "
-                    f"(v={val_metrics['loss_v']:.6f}, raw_v={val_metrics['raw_loss_v']:.6f}, l={val_metrics['loss_l']:.6f}) "
-                    f"target_v_abs={val_metrics['target_v_abs_mean']:.6f} "
-                    f"pred_v_abs={val_metrics['pred_v_abs_mean']:.6f} "
-                    f"lambda=[{val_metrics['lambda_v_min']:.3f},{val_metrics['lambda_v_mean']:.3f},{val_metrics['lambda_v_max']:.3f}]"
-                )
+                if args.dev:
+                    print(
+                        f"validation_epoch={epoch:04d} "
+                        f"val_loss={val_metrics['loss']:.6f} "
+                        f"(v={val_metrics['loss_v']:.6f}, raw_v={val_metrics['raw_loss_v']:.6f}, l={val_metrics['loss_l']:.6f}) "
+                        f"target_v_abs={val_metrics['target_v_abs_mean']:.6f} "
+                        f"pred_v_abs={val_metrics['pred_v_abs_mean']:.6f} "
+                        f"lambda=[{val_metrics['lambda_v_min']:.3f},{val_metrics['lambda_v_mean']:.3f},{val_metrics['lambda_v_max']:.3f}]"
+                    )
+                else:
+                    print(
+                        f"validation_epoch={epoch:04d} "
+                        f"val_loss={val_metrics['loss']:.6f} "
+                        f"(v={val_metrics['loss_v']:.6f}, l={val_metrics['loss_l']:.6f})"
+                    )
 
-                wandb.log(
-                    {
-                        "epoch": epoch,
-                        "train/epoch_loss": train_metrics["loss"],
-                        "train/epoch_loss_v": train_metrics["loss_v"],
-                        "train/epoch_raw_loss_v": train_metrics["raw_loss_v"],
-                        "train/epoch_loss_l": train_metrics["loss_l"],
-                        "train/target_v_abs_mean": train_metrics["target_v_abs_mean"],
-                        "train/target_v_norm_mean": train_metrics["target_v_norm_mean"],
-                        "train/pred_v_abs_mean": train_metrics["pred_v_abs_mean"],
-                        "train/pred_v_norm_mean": train_metrics["pred_v_norm_mean"],
-                        "train/lambda_v_mean": train_metrics["lambda_v_mean"],
-                        "train/lambda_v_min": train_metrics["lambda_v_min"],
-                        "train/lambda_v_max": train_metrics["lambda_v_max"],
-                        "val/epoch_loss": val_metrics["loss"],
-                        "val/epoch_loss_v": val_metrics["loss_v"],
-                        "val/epoch_raw_loss_v": val_metrics["raw_loss_v"],
-                        "val/epoch_loss_l": val_metrics["loss_l"],
-                        "val/target_v_abs_mean": val_metrics["target_v_abs_mean"],
-                        "val/target_v_norm_mean": val_metrics["target_v_norm_mean"],
-                        "val/pred_v_abs_mean": val_metrics["pred_v_abs_mean"],
-                        "val/pred_v_norm_mean": val_metrics["pred_v_norm_mean"],
-                        "val/lambda_v_mean": val_metrics["lambda_v_mean"],
-                        "val/lambda_v_min": val_metrics["lambda_v_min"],
-                        "val/lambda_v_max": val_metrics["lambda_v_max"],
-                    }
-                )
+                log_payload = {
+                    "epoch": epoch,
+                    "train/epoch_loss": train_metrics["loss"],
+                    "train/epoch_loss_v": train_metrics["loss_v"],
+                    "train/epoch_loss_l": train_metrics["loss_l"],
+                    "val/epoch_loss": val_metrics["loss"],
+                    "val/epoch_loss_v": val_metrics["loss_v"],
+                    "val/epoch_loss_l": val_metrics["loss_l"],
+                }
+                if args.dev:
+                    log_payload.update(
+                        {
+                            "train/epoch_raw_loss_v": train_metrics["raw_loss_v"],
+                            "train/target_v_abs_mean": train_metrics["target_v_abs_mean"],
+                            "train/target_v_norm_mean": train_metrics["target_v_norm_mean"],
+                            "train/pred_v_abs_mean": train_metrics["pred_v_abs_mean"],
+                            "train/pred_v_norm_mean": train_metrics["pred_v_norm_mean"],
+                            "train/lambda_v_mean": train_metrics["lambda_v_mean"],
+                            "train/lambda_v_min": train_metrics["lambda_v_min"],
+                            "train/lambda_v_max": train_metrics["lambda_v_max"],
+                            "train/lambda_v_effective": train_metrics["lambda_v_effective"],
+                            "train/v_t_abs_mean": train_metrics["v_t_abs_mean"],
+                            "train/f_t_abs_mean": train_metrics["f_t_abs_mean"],
+                            "train/r_t_abs_mean": train_metrics["r_t_abs_mean"],
+                            "train/score_v_abs_mean": train_metrics["score_v_abs_mean"],
+                            "train/pred_l_abs_mean": train_metrics["pred_l_abs_mean"],
+                            "train/target_l_abs_mean": train_metrics["target_l_abs_mean"],
+                            "train/grad_norm": train_metrics["grad_norm"],
+                            "train/score_network_grad_norm": train_metrics["score_network_grad_norm"],
+                            "train/out_v_grad_norm": train_metrics["out_v_grad_norm"],
+                            "train/out_l_grad_norm": train_metrics["out_l_grad_norm"],
+                            "val/epoch_raw_loss_v": val_metrics["raw_loss_v"],
+                            "val/target_v_abs_mean": val_metrics["target_v_abs_mean"],
+                            "val/target_v_norm_mean": val_metrics["target_v_norm_mean"],
+                            "val/pred_v_abs_mean": val_metrics["pred_v_abs_mean"],
+                            "val/pred_v_norm_mean": val_metrics["pred_v_norm_mean"],
+                            "val/lambda_v_mean": val_metrics["lambda_v_mean"],
+                            "val/lambda_v_min": val_metrics["lambda_v_min"],
+                            "val/lambda_v_max": val_metrics["lambda_v_max"],
+                            "val/lambda_v_effective": val_metrics["lambda_v_effective"],
+                            "val/v_t_abs_mean": val_metrics["v_t_abs_mean"],
+                            "val/f_t_abs_mean": val_metrics["f_t_abs_mean"],
+                            "val/r_t_abs_mean": val_metrics["r_t_abs_mean"],
+                            "val/score_v_abs_mean": val_metrics["score_v_abs_mean"],
+                            "val/pred_l_abs_mean": val_metrics["pred_l_abs_mean"],
+                            "val/target_l_abs_mean": val_metrics["target_l_abs_mean"],
+                        }
+                    )
+                wandb.log(log_payload)
 
                 export_csv(
                     rows=history,
