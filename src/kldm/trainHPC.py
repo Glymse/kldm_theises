@@ -264,6 +264,7 @@ def clean_model_state_dict(model: ModelKLDM) -> dict[str, torch.Tensor]:
         key: value
         for key, value in model.state_dict().items()
         if not key.startswith("_cached_sampling_score_network")
+        and not key.endswith("._lambda_v_table")
     }
 
 
@@ -519,6 +520,7 @@ def maybe_resume(
         key: value
         for key, value in checkpoint["model_state_dict"].items()
         if not key.startswith("_cached_sampling_score_network")
+        and not key.endswith("._lambda_v_table")
     }
     model.load_state_dict(cleaned_state_dict, strict=False)
     optimizer.load_state_dict(checkpoint["optimizer_state_dict"])

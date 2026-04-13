@@ -28,6 +28,7 @@ def precompute_lambda_time_grid(
     num_batches: int = 32,
     graphs_per_batch: int = 16,
     nodes_per_graph: int = 16,
+    clamp_min: float = 1e-3,
     clamp_max: float = 10.0,
 ) -> torch.Tensor:
     """
@@ -39,7 +40,9 @@ def precompute_lambda_time_grid(
 
     We estimate the score norm from the same simplified target used in training:
     sample from the forward kernel with zero initial positions / velocities, then
-    call diffusion.score_target(...). Because the tangent space is Euclidean here,
+    call diffusion.score_target(...). This is the stripped-down wrapped-normal
+    target without the KLDM prefactor, because the prefactor is reinserted only
+    during score reconstruction. Because the tangent space is Euclidean here,
     the loss computation uses the usual squared norm in R^m.
     """
     device = t01_grid.device
@@ -76,5 +79,5 @@ def precompute_lambda_time_grid(
         lambda_values.append(1.0 / expected_sq_norm.clamp_min(diffusion.eps))
 
     lambda_table = torch.stack(lambda_values)
-    lambda_table = torch.clamp_max(lambda_table, clamp_max)
+    lambda_table = lambda_table.clamp(min=clamp_min, max=clamp_max)
     return lambda_table

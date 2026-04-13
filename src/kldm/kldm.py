@@ -234,6 +234,7 @@ class ModelKLDM(nn.Module):
             key: value
             for key, value in source_state_dict.items()
             if not key.startswith("_cached_sampling_score_network")
+            and not key.endswith("._lambda_v_table")
         }
         model = ModelKLDM(device=device).to(device)
         model.load_state_dict(cleaned_state_dict, strict=False)

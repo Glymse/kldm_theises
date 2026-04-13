@@ -182,7 +182,12 @@ class TrivialisedDiffusion(nn.Module):
         index: torch.Tensor,
         v0: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Return the TDM velocity training target used by KLDM. """
+        """Return the simplified TDM target predicted by the network.
+
+        In the simplified parameterization we train on the stripped-down
+        wrapped-normal term only. The prefactor is reinserted later in
+        `construct_velocity_score(...)` when reconstructing Eq. (19).
+        """
 
         #We do time scaling.
         t = self.time_scaling_T * t
@@ -224,7 +229,7 @@ class TrivialisedDiffusion(nn.Module):
         v_t: torch.Tensor,
         pred_v: torch.Tensor,
     ) -> torch.Tensor:
-        """Construct the full KLDM velocity score from the network prediction."""
+        """Construct the full KLDM velocity score from the simplified prediction."""
         t_internal = self.time_scaling_T * t
         prefactor = self._match_dims(
             (1.0 - torch.exp(-t_internal)) / (1.0 + torch.exp(-t_internal)),
