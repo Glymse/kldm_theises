@@ -16,7 +16,6 @@ from torch_geometric.data import Data, Batch
 from kldm.data import CSPTask
 from kldm.diffusionModels.continuous import ContinuousVPDiffusion
 from kldm.diffusionModels.trivialized_diffusion import TrivialisedDiffusion as TDM
-from kldm.distribution.uniform import sample_uniform
 from kldm.scoreNetwork.scoreNetwork import CSPVNet
 from kldm.scoreNetwork.utils import scatter_center
 
@@ -150,7 +149,6 @@ class ModelKLDM(nn.Module):
             t_graph = t_graph[:, None]
 
         index = batch.batch
-        t_node = t_graph[index].squeeze(-1)
         # Algorithm 1
         noisy, targets = self.algorithm1_training_targets(batch=batch, t=t_graph)
 
@@ -174,9 +172,11 @@ class ModelKLDM(nn.Module):
         out_l = preds["l"]
 
         # KLDM: plain squared error for lattice targets.
-        loss_l = self.mse_loss_per_sample(preds["l"], target_l).mean()
+        loss_l = self.mse_loss_per_sample(out_l, target_l).mean()
 
         # Monte Carlo lambda(t) weighting on the simplified wrapped-normal target.
+        # Keep the raw network output here, since extra centering in the loss path
+        # is one of the behavioral differences from facit we wanted to remove.
         lambda_v_t = self.tdm.lambda_v(t_graph.squeeze(-1))[index]
         loss_v = (lambda_v_t * self.mse_loss_per_sample(out_v, target_v)).mean()
 

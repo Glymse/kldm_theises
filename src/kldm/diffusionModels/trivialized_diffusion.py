@@ -10,8 +10,6 @@ from torch import nn
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from kldm.data import CSPTask, DNGTask, resolve_data_root
-
 from kldm.distribution import d_log_wrapped_normal_2pi_version
 from kldm.scoreNetwork.utils import scatter_center
 
@@ -33,12 +31,13 @@ class TrivialisedDiffusion(nn.Module):
             eps: float = 1e-5,
             n_lambdas: int = 2000,
             lambda_num_samples: int = 20000,
-            lambda_chunk_size: int = 64) -> None:
+            lambda_chunk_size: int = 128,
+            k_wn_score: int = 13) -> None:
         super().__init__()
         self.eps = float(eps)
         self.time_scaling_T = 2
         self.scale_pos = 2.0 * math.pi
-        self.k_wn_score = 13
+        self.k_wn_score = int(k_wn_score)
         self.n_lambdas = int(n_lambdas)
         self.lambda_num_samples = int(lambda_num_samples)
         self.lambda_chunk_size = int(lambda_chunk_size)
@@ -95,6 +94,12 @@ class TrivialisedDiffusion(nn.Module):
         t01_grid: torch.Tensor,
         num_samples: int = 20000,
     ) -> torch.Tensor:
+        """
+        Estimate λ(t) = 1 / E || ∇_μ log WN ||^2 on a normalized time grid.
+
+        This is computed for the raw simplified wrapped-normal target in the
+        same 2π-periodic convention used by score_target().
+        """
         sigma_grid = self.wrapped_gaussian_sigma_r_t(self.time_scaling_T * t01_grid)
         chunk_size = self.lambda_chunk_size
         total = torch.zeros_like(sigma_grid)
@@ -119,6 +124,9 @@ class TrivialisedDiffusion(nn.Module):
         return 1.0 / expected_sq_norm.clamp_min(self.eps)
 
     def lambda_v(self, t01: torch.Tensor) -> torch.Tensor:
+        """
+        Interpolate λ(t) for normalized time t01 in [0,1].
+        """
         scaled = torch.clamp(t01, 0.0, 1.0) * (self.n_lambdas - 1)
         idx_lo = torch.floor(scaled).long()
         idx_hi = torch.clamp(idx_lo + 1, max=self.n_lambdas - 1)

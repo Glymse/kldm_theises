@@ -26,7 +26,8 @@ def d_log_wrapped_normal(
 
     return ((diff) / sigma2 * w).sum(dim=-1)
 
-
+#∇μ​logWN    not   ∇𝑟log⁡W.
+#HUSK DETTE I RAPPORT
 
 def d_log_wrapped_normal_2pi_version(
     r: torch.Tensor,
