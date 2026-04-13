@@ -27,8 +27,8 @@ def precompute_lambda_time_grid_from_loader(
     loader,
     t01_grid: torch.Tensor,
     num_batches: int = 32,
-    clamp_min: float = 0.05,
-    clamp_max: float = 10.0,
+    clamp_min: float = 0.1,
+    clamp_max: float = 3.0,
     device: torch.device | None = None,
 ) -> torch.Tensor:
     """
@@ -109,6 +109,7 @@ def precompute_lambda_time_grid_from_loader(
         expected_sq_norm[missing] = expected_sq_norm[nearest_valid[missing]]
 
     lambda_table = 1.0 / expected_sq_norm.clamp_min(diffusion.eps)
+    lambda_table = lambda_table.clamp_min(diffusion.eps).pow(0.5)
     lambda_table = lambda_table / lambda_table.mean().clamp_min(diffusion.eps)
     lambda_table = lambda_table.clamp(min=clamp_min, max=clamp_max)
     return lambda_table
