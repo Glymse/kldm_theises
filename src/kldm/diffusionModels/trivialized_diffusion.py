@@ -94,7 +94,7 @@ class TrivialisedDiffusion(nn.Module):
         loader,
         device: torch.device | None = None,
         num_batches: int | None = None,
-        clamp_min: float = 1e-3,
+        clamp_min: float = 0.05,
         clamp_max: float = 10.0,
     ) -> torch.Tensor:
         """

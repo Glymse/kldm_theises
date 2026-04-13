@@ -27,7 +27,7 @@ def precompute_lambda_time_grid_from_loader(
     loader,
     t01_grid: torch.Tensor,
     num_batches: int = 32,
-    clamp_min: float = 1e-3,
+    clamp_min: float = 0.05,
     clamp_max: float = 10.0,
     device: torch.device | None = None,
 ) -> torch.Tensor:
@@ -80,7 +80,8 @@ def precompute_lambda_time_grid_from_loader(
             index=index,
         )
 
-        node_sq_norm = target_v.reshape(num_nodes, -1).pow(2).sum(dim=1)
+        # Match the per-node reduction used by mse_loss_per_sample(...).
+        node_sq_norm = target_v.reshape(num_nodes, -1).pow(2).mean(dim=1)
         graph_sq_sums = torch.zeros(num_graphs, device=table_device, dtype=node_sq_norm.dtype)
         graph_counts = torch.zeros(num_graphs, device=table_device, dtype=node_sq_norm.dtype)
         graph_sq_sums.scatter_add_(0, index, node_sq_norm)
@@ -108,5 +109,6 @@ def precompute_lambda_time_grid_from_loader(
         expected_sq_norm[missing] = expected_sq_norm[nearest_valid[missing]]
 
     lambda_table = 1.0 / expected_sq_norm.clamp_min(diffusion.eps)
+    lambda_table = lambda_table / lambda_table.mean().clamp_min(diffusion.eps)
     lambda_table = lambda_table.clamp(min=clamp_min, max=clamp_max)
     return lambda_table
