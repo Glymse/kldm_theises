@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import csv
 import itertools
+from contextlib import contextmanager
 from pathlib import Path
 import signal
 import sys
@@ -55,6 +56,79 @@ def should_stop(run) -> bool:
 
     return False
 
+
+class ExponentialMovingAverage:
+    def __init__(
+        self,
+        model: ModelKLDM,
+        decay: float = 0.999,
+        start_step: int = 500,
+    ) -> None:
+        self.decay = float(decay)
+        self.start_step = int(start_step)
+        self.num_updates = 0
+        self.shadow = {
+            name: param.detach().clone()
+            for name, param in model.named_parameters()
+            if param.requires_grad
+        }
+        self.backup: dict[str, torch.Tensor] = {}
+
+    def update(self, model: ModelKLDM) -> None:
+        self.num_updates += 1
+
+        for name, param in model.named_parameters():
+            if not param.requires_grad:
+                continue
+            if self.num_updates <= self.start_step:
+                self.shadow[name].copy_(param.detach())
+            else:
+                self.shadow[name].mul_(self.decay).add_(param.detach(), alpha=1.0 - self.decay)
+
+    def state_dict(self) -> dict[str, Any]:
+        return {
+            "decay": self.decay,
+            "start_step": self.start_step,
+            "num_updates": self.num_updates,
+            "shadow": {name: tensor.clone() for name, tensor in self.shadow.items()},
+        }
+
+    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+        self.decay = float(state_dict.get("decay", self.decay))
+        self.start_step = int(state_dict.get("start_step", self.start_step))
+        self.num_updates = int(state_dict.get("num_updates", 0))
+        self.shadow = {
+            name: tensor.clone()
+            for name, tensor in state_dict.get("shadow", {}).items()
+        }
+
+    def ema_model_state_dict(self, model: ModelKLDM) -> dict[str, torch.Tensor]:
+        ema_state = clean_model_state_dict(model)
+        for name, tensor in self.shadow.items():
+            if name in ema_state:
+                ema_state[name] = tensor.clone()
+        return ema_state
+
+    @contextmanager
+    def average_parameters(self, model: ModelKLDM):
+        if not self.shadow:
+            yield
+            return
+
+        self.backup = {}
+        try:
+            for name, param in model.named_parameters():
+                if not param.requires_grad or name not in self.shadow:
+                    continue
+                self.backup[name] = param.detach().clone()
+                param.data.copy_(self.shadow[name].to(device=param.device, dtype=param.dtype))
+            yield
+        finally:
+            for name, param in model.named_parameters():
+                if name in self.backup:
+                    param.data.copy_(self.backup[name].to(device=param.device, dtype=param.dtype))
+            self.backup = {}
+
 #####
 #####
 ####
@@ -93,6 +167,7 @@ def train_epoch(
     model: ModelKLDM,
     loader,
     optimizer: torch.optim.Optimizer,
+    ema: ExponentialMovingAverage,
     device: torch.device,
 ) -> dict[str, float]:
     model.train()
@@ -119,6 +194,7 @@ def train_epoch(
         )
         loss.backward()
         optimizer.step()
+        ema.update(model)
 
         running["loss"] += float(loss)
         running["loss_v"] += float(metrics["loss_v"])
@@ -166,6 +242,7 @@ def clean_model_state_dict(model: ModelKLDM) -> dict[str, torch.Tensor]:
 def export_model_checkpoint(
     model: ModelKLDM,
     optimizer: torch.optim.Optimizer,
+    ema: ExponentialMovingAverage | None,
     output_path: Path,
     config: dict[str, Any],
     epoch: int,
@@ -175,6 +252,8 @@ def export_model_checkpoint(
         {
             "epoch": epoch,
             "model_state_dict": clean_model_state_dict(model),
+            "ema_model_state_dict": None if ema is None else ema.ema_model_state_dict(model),
+            "ema_state_dict": None if ema is None else ema.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
             "config": config,
         },
@@ -400,6 +479,7 @@ def run_sampling_evaluation(
 def maybe_resume(
     model: ModelKLDM,
     optimizer: torch.optim.Optimizer,
+    ema: ExponentialMovingAverage | None,
     checkpoint_path: str | None,
     device: torch.device,
 ) -> tuple[int, dict[str, Any]]:
@@ -414,6 +494,8 @@ def maybe_resume(
     }
     model.load_state_dict(cleaned_state_dict, strict=False)
     optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+    if ema is not None and checkpoint.get("ema_state_dict") is not None:
+        ema.load_state_dict(checkpoint["ema_state_dict"])
     start_epoch = int(checkpoint.get("epoch", 0))
     checkpoint_config = checkpoint.get("config", {})
 
@@ -475,6 +557,18 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional safety cap on epochs. Omit to run until stopped.",
     )
+    parser.add_argument(
+        "--ema-decay",
+        type=float,
+        default=0.999,
+        help="EMA decay used for the shadow model during HPC training.",
+    )
+    parser.add_argument(
+        "--ema-start",
+        type=int,
+        default=500,
+        help="Number of optimizer steps before EMA switches from copying to decayed updates.",
+    )
     return parser.parse_args()
 
 
@@ -496,6 +590,8 @@ def train() -> None:
         "sampling_steps": args.sampling_steps,
         "load_from_checkpoint": args.load_from_checkpoint,
         "max_epochs": args.max_epochs,
+        "ema_decay": args.ema_decay,
+        "ema_start": args.ema_start,
     }
 
     train_loader = CSPTask().dataloader(
@@ -526,21 +622,18 @@ def train() -> None:
     print("constructed train/val/sample loaders", flush=True)
 
     model = ModelKLDM(device=device).to(device)
-    lambda_batches = 128 if device.type == "cuda" else 32
-    used_lambda_batches = model.tdm.precompute_lambda_table_from_loader(
-        loader=train_loader,
-        max_batches=lambda_batches,
-        device=device,
-    )
     optimizer = torch.optim.AdamW(model.parameters(), lr=config["lr"])
-    print(
-        f"constructed model and optimizer lambda_batches={used_lambda_batches}",
-        flush=True,
+    ema = ExponentialMovingAverage(
+        model=model,
+        decay=config["ema_decay"],
+        start_step=config["ema_start"],
     )
+    print("constructed model and optimizer", flush=True)
 
     start_epoch, resume_config = maybe_resume(
         model=model,
         optimizer=optimizer,
+        ema=ema,
         checkpoint_path=args.load_from_checkpoint,
         device=device,
     )
@@ -594,6 +687,7 @@ def train() -> None:
                 model=model,
                 loader=train_loader,
                 optimizer=optimizer,
+                ema=ema,
                 device=device,
             )
 
@@ -609,7 +703,8 @@ def train() -> None:
             if not should_record_loss and not should_run_sampling:
                 continue
 
-            val_metrics = evaluate_loss(model=model, loader=val_loader, device=device)
+            with ema.average_parameters(model):
+                val_metrics = evaluate_loss(model=model, loader=val_loader, device=device)
 
             #Add metric here, ground truth vs predicted.  ASE libary.
             if should_record_loss:
@@ -665,18 +760,20 @@ def train() -> None:
             export_model_checkpoint(
                 model=model,
                 optimizer=optimizer,
+                ema=ema,
                 output_path=checkpoint_path,
                 config=config,
                 epoch=epoch,
             )
 
-            sampling_metrics = run_sampling_evaluation(
-                model=model,
-                loader=sample_loader,
-                device=device,
-                num_samples=config["sampling_samples"],
-                n_steps=config["sampling_steps"],
-            )
+            with ema.average_parameters(model):
+                sampling_metrics = run_sampling_evaluation(
+                    model=model,
+                    loader=sample_loader,
+                    device=device,
+                    num_samples=config["sampling_samples"],
+                    n_steps=config["sampling_steps"],
+                )
             sampling_history.append({"epoch": epoch, **sampling_metrics})
 
             print(
@@ -747,6 +844,7 @@ def train() -> None:
         export_model_checkpoint(
             model=model,
             optimizer=optimizer,
+            ema=ema,
             output_path=final_checkpoint_path,
             config=config | {"completed_epochs": epoch},
             epoch=epoch,

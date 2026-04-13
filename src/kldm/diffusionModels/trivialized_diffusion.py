@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from pathlib import Path
-import math
 import sys
 
 import torch
@@ -10,7 +9,8 @@ from torch import nn
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from kldm.distribution import d_log_wrapped_normal_2pi_version
+from kldm.distribution import d_log_wrapped_normal
+from kldm.diffusionModels.lambda_t import interpolate_lambda_table, precompute_lambda_time_grid
 from kldm.scoreNetwork.utils import scatter_center
 
 ################################################################
@@ -29,20 +29,26 @@ class TrivialisedDiffusion(nn.Module):
     def __init__(
             self,
             eps: float = 1e-5,
-            n_lambdas: int = 2000,
-            lambda_num_samples: int = 20000,
-            lambda_chunk_size: int = 128,
-            k_wn_score: int = 13) -> None:
+            n_lambdas: int = 256,
+            lambda_num_batches: int = 16,
+            lambda_graphs_per_batch: int = 16,
+            lambda_nodes_per_graph: int = 16) -> None:
         super().__init__()
         self.eps = float(eps)
         self.time_scaling_T = 2
-        self.scale_pos = 2.0 * math.pi
-        self.k_wn_score = int(k_wn_score)
         self.n_lambdas = int(n_lambdas)
-        self.lambda_num_samples = int(lambda_num_samples)
-        self.lambda_chunk_size = int(lambda_chunk_size)
+        self.lambda_num_batches = int(lambda_num_batches)
+        self.lambda_graphs_per_batch = int(lambda_graphs_per_batch)
+        self.lambda_nodes_per_graph = int(lambda_nodes_per_graph)
+
         lambda_grid = torch.linspace(1e-4, 1.0, self.n_lambdas)
-        lambda_table = self._precompute_lambda_table(lambda_grid, num_samples=self.lambda_num_samples)
+        lambda_table = precompute_lambda_time_grid(
+            diffusion=self,
+            t01_grid=lambda_grid,
+            num_batches=self.lambda_num_batches,
+            graphs_per_batch=self.lambda_graphs_per_batch,
+            nodes_per_graph=self.lambda_nodes_per_graph,
+        )
         self.register_buffer("_lambda_v_table", lambda_table)
 
     # -------------------------------------------------
@@ -61,10 +67,6 @@ class TrivialisedDiffusion(nn.Module):
     def wrap_displacements(x: torch.Tensor) -> torch.Tensor:
         """Wrap signed periodic displacements into [-0.5, 0.5)."""
         return torch.remainder(x + 0.5, 1.0) - 0.5
-
-    def wrap_angles(self, x: torch.Tensor) -> torch.Tensor:
-        """Wrap scaled periodic variables into [-pi, pi)."""
-        return torch.remainder(x + torch.pi, self.scale_pos) - torch.pi
 
     # -------------------------------------------------
     # Velocity sampling
@@ -89,147 +91,11 @@ class TrivialisedDiffusion(nn.Module):
             torch.clamp(2.0 * t + 8.0 / (1.0 + torch.exp(t)) - 4.0, min=self.eps)
         )  # Eq. (23)
 
-    def _precompute_lambda_table(
-        self,
-        t01_grid: torch.Tensor,
-        num_samples: int = 20000,
-    ) -> torch.Tensor:
-        """
-        Estimate λ(t) = 1 / E || ∇_μ log WN ||^2 on a normalized time grid.
-
-        This is computed for the raw simplified wrapped-normal target in the
-        same 2π-periodic convention used by score_target().
-        """
-        sigma_grid = self.wrapped_gaussian_sigma_r_t(self.time_scaling_T * t01_grid)
-        chunk_size = self.lambda_chunk_size
-        total = torch.zeros_like(sigma_grid)
-        count = 0
-
-        for start in range(0, num_samples, chunk_size):
-            current_chunk = min(chunk_size, num_samples - start)
-            sigmas = sigma_grid[None, :].repeat(current_chunk, 1)
-            x_sample = sigmas * torch.randn_like(sigmas)
-            x_sample = self.wrap_angles(x_sample)
-            normal = d_log_wrapped_normal_2pi_version(
-                r=x_sample,
-                mu=torch.zeros_like(x_sample),
-                sigma=sigmas,
-                N=self.k_wn_score,
-                T=self.scale_pos,
-            )
-            total = total + normal.square().sum(dim=0)
-            count += current_chunk
-
-        expected_sq_norm = total / max(count, 1)
-        return 1.0 / expected_sq_norm.clamp_min(self.eps)
-
     def lambda_v(self, t01: torch.Tensor) -> torch.Tensor:
         """
         Interpolate λ(t) for normalized time t01 in [0,1].
         """
-        scaled = torch.clamp(t01, 0.0, 1.0) * (self.n_lambdas - 1)
-        idx_lo = torch.floor(scaled).long()
-        idx_hi = torch.clamp(idx_lo + 1, max=self.n_lambdas - 1)
-        frac = (scaled - idx_lo.to(scaled.dtype)).to(self._lambda_v_table.dtype)
-        lambda_lo = self._lambda_v_table[idx_lo]
-        lambda_hi = self._lambda_v_table[idx_hi]
-        return lambda_lo + (lambda_hi - lambda_lo) * frac
-
-    def _fill_missing_lambda_bins(
-        self,
-        lambda_table: torch.Tensor,
-        valid_mask: torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        Linearly fill bins that were not visited during the centered Monte Carlo
-        precompute. This keeps λ(t) smooth even when the loader-based estimate
-        does not hit every grid point.
-        """
-        if not torch.any(valid_mask):
-            return lambda_table
-
-        filled = lambda_table.clone()
-        valid_indices = torch.nonzero(valid_mask, as_tuple=False).flatten().tolist()
-
-        first_idx = valid_indices[0]
-        last_idx = valid_indices[-1]
-        filled[:first_idx] = filled[first_idx]
-        filled[last_idx + 1 :] = filled[last_idx]
-
-        for left_idx, right_idx in zip(valid_indices[:-1], valid_indices[1:]):
-            if right_idx - left_idx <= 1:
-                continue
-
-            left_value = filled[left_idx]
-            right_value = filled[right_idx]
-            gap_steps = torch.linspace(
-                0.0,
-                1.0,
-                right_idx - left_idx + 1,
-                device=filled.device,
-                dtype=filled.dtype,
-            )
-            filled[left_idx:right_idx + 1] = left_value + (right_value - left_value) * gap_steps
-
-        return filled
-
-    def precompute_lambda_table_from_loader(
-        self,
-        loader,
-        max_batches: int = 64,
-        device: torch.device | None = None,
-    ) -> int:
-        """
-        Re-estimate λ(t) from the same centered simplified target convention used
-        during training, using real graph batches and their batch.batch centering.
-        """
-        table_device = self._lambda_v_table.device if device is None else device
-        sums = torch.zeros(self.n_lambdas, device=table_device, dtype=self._lambda_v_table.dtype)
-        counts = torch.zeros(self.n_lambdas, device=table_device, dtype=self._lambda_v_table.dtype)
-        num_batches = 0
-
-        with torch.no_grad():
-            for batch_idx, batch in enumerate(loader):
-                if batch_idx >= max_batches:
-                    break
-
-                batch = batch.to(table_device)
-                index = batch.batch
-                num_graphs = batch.num_graphs
-
-                t_graph = torch.rand(num_graphs, device=table_device).clamp_(1e-4, 1.0)
-                t_node = t_graph[index]
-
-                _, v_t, _, _, r_t = self.forward_sample(
-                    t=t_node,
-                    f0=batch.pos,
-                    index=index,
-                )
-                target = self.score_target(
-                    t=t_node,
-                    r_t=r_t,
-                    v_t=v_t,
-                    index=index,
-                )
-
-                node_sq = target.reshape(target.shape[0], -1).pow(2).mean(dim=1)
-                node_bins = torch.clamp(
-                    torch.round(t_node * (self.n_lambdas - 1)).long(),
-                    0,
-                    self.n_lambdas - 1,
-                )
-
-                sums.index_add_(0, node_bins, node_sq.to(sums.dtype))
-                counts.index_add_(0, node_bins, torch.ones_like(node_sq, dtype=sums.dtype))
-                num_batches += 1
-
-        valid_mask = counts > 0
-        centered_lambda_table = self._lambda_v_table.detach().clone().to(table_device)
-        centered_lambda_table[valid_mask] = 1.0 / (sums[valid_mask] / counts[valid_mask]).clamp_min(self.eps)
-        centered_lambda_table = self._fill_missing_lambda_bins(centered_lambda_table, valid_mask)
-
-        self._lambda_v_table.copy_(centered_lambda_table.to(self._lambda_v_table.device))
-        return num_batches
+        return interpolate_lambda_table(self._lambda_v_table, t01)
 
 
     #TODO: We do not center the distribution around = 0 yet. Ask francois.
@@ -264,7 +130,6 @@ class TrivialisedDiffusion(nn.Module):
         #Vi sætter v0 = 0, [Design choice] at time t = 0
         if v0 is None:
             v0 = torch.zeros_like(f0)                               #Design choice: Initial zero velocities
-        v0 = self.scale_pos * v0
 
         #TODO: Scatter center mean free, også det de gør i KLDM
 
@@ -283,10 +148,8 @@ class TrivialisedDiffusion(nn.Module):
         ###    Calculate displacement ft   ###
         ######################################
         #Now we calculate f_t = f_0 * expm(r_t), where r_t follows a wrapped Gaussian.
-        f0 = self.scale_pos * self.wrap_displacements(f0)
-
         wrapped_gaussian_mu_r_t = self.wrapped_gaussian_mu_r_t(t, v_t, v0)
-        wrapped_gaussian_mu_r_t = self.wrap_angles(wrapped_gaussian_mu_r_t) #To stay in [-0.5, 0.5] or [-pi, pi] equvialant.
+        wrapped_gaussian_mu_r_t = self.wrap_displacements(wrapped_gaussian_mu_r_t) #To stay in [-0.5, 0.5] or [-pi, pi] equvialant.
 
         wrapped_gaussian_sigma_r_t = self._match_dims(self.wrapped_gaussian_sigma_r_t(t), f0)
 
@@ -297,18 +160,17 @@ class TrivialisedDiffusion(nn.Module):
 
 
         #FACIT VERISON, OLD VERSION, CHAT MIGHT SAY IT IS A PROBLEM
-        r_t = self.wrap_angles(wrapped_gaussian_mu_r_t + wrapped_gaussian_sigma_r_t * epsilon_r)
+        r_t = self.wrap_displacements(wrapped_gaussian_mu_r_t + wrapped_gaussian_sigma_r_t * epsilon_r)
 
         #Now we calculate displacement, and while we stay on the manifold.
-        #We keep the internal TDM position latent in the centered unit-period chart.
-        f_t = self.wrap_angles(f0 + r_t)
+        f_t = self.wrap_positions(f0 + r_t)
 
         #Center again
         #f_t = scatter_center(f_t, index=index) DEACTIVED WHILE FRANCOIS ANSWERS MAIL.
         #Then we wrap to ensure we stay within [0,1]
         #f_t = self.wrap_positions(f_t)
 
-        return f_t / self.scale_pos, v_t / self.scale_pos, epsilon_v, epsilon_r, r_t
+        return f_t, v_t, epsilon_v, epsilon_r, r_t
 
     def score_target(
         self,
@@ -326,15 +188,13 @@ class TrivialisedDiffusion(nn.Module):
 
         #Design choice, makes the target quite simple to calculate.
         v0 = torch.zeros_like(v_t) if v0 is None else v0
-        v0 = self.scale_pos * v0
-        v_t = self.scale_pos * v_t
 
         #Now we find target of the wrapped normal fractional distribution
         wrapped_gaussian_mu_r_t = self.wrapped_gaussian_mu_r_t(t, v_t, v0)
         #NOT WRITTEN IN APPENDIX, BUT ASK FRANCOIS / MIKKEL IF IT WOULD MAKE SENSE TO DO
         #But would make sense since usually it works i [-pi, pi]
         """TODO: CHECK"""
-        wrapped_gaussian_mu_r_t = self.wrap_angles(wrapped_gaussian_mu_r_t)
+        wrapped_gaussian_mu_r_t = self.wrap_displacements(wrapped_gaussian_mu_r_t)
         """ this """
 
         wrapped_gaussian_sigma_r_t = self._match_dims(self.wrapped_gaussian_sigma_r_t(t), r_t)
@@ -348,12 +208,10 @@ class TrivialisedDiffusion(nn.Module):
         )
         """ #FULL TARGET
 
-        wrapped_gaussian_target = d_log_wrapped_normal_2pi_version(
+        wrapped_gaussian_target = d_log_wrapped_normal(
             r=r_t,
             mu=wrapped_gaussian_mu_r_t,
             sigma=wrapped_gaussian_sigma_r_t,
-            N=self.k_wn_score,
-            T=self.scale_pos,
         )
 
         #Center the target
@@ -372,7 +230,6 @@ class TrivialisedDiffusion(nn.Module):
     ) -> torch.Tensor:
         """Construct the full KLDM velocity score from the network prediction."""
         t_internal = self.time_scaling_T * t
-        v_t = self.scale_pos * v_t
         prefactor = self._match_dims(
             (1.0 - torch.exp(-t_internal)) / (1.0 + torch.exp(-t_internal)),
             pred_v,
@@ -393,8 +250,6 @@ class TrivialisedDiffusion(nn.Module):
         dt: float,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """One exponential-integrator reverse step for the TDM process."""
-        f_t = self.scale_pos * f_t
-        v_t = self.scale_pos * v_t
         dt_t = torch.as_tensor(
             self.time_scaling_T * dt,
             device=v_t.device,
@@ -411,10 +266,9 @@ class TrivialisedDiffusion(nn.Module):
         v_prev = exp_dt * v_t + 2.0 * expm1_dt * score_v + noise_scale * noise_v
 
 
-        #Keep the internal reverse-time position latent in the centered unit-period chart.
-        f_prev = self.wrap_angles(f_t - dt_t * v_prev)
+        f_prev = self.wrap_positions(f_t - dt_t * v_prev)
 
-        return f_prev / self.scale_pos, v_prev / self.scale_pos
+        return f_prev, v_prev
 
 
     @staticmethod

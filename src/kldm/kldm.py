@@ -56,9 +56,10 @@ class ModelKLDM(nn.Module):
 
         self.tdm = diffusion_v or TDM(
             eps=eps,
-            n_lambdas=2000 if self.device.type == "cuda" else 512,
-            lambda_num_samples=20000 if self.device.type == "cuda" else 4096,
-            lambda_chunk_size=128 if self.device.type == "cuda" else 32,
+            n_lambdas=512 if self.device.type == "cuda" else 128,
+            lambda_num_batches=32 if self.device.type == "cuda" else 8,
+            lambda_graphs_per_batch=32 if self.device.type == "cuda" else 8,
+            lambda_nodes_per_graph=16,
         )
         self.diffusion_l = diffusion_l or ContinuousVPDiffusion(eps=eps)
         self.eps = eps
@@ -174,9 +175,7 @@ class ModelKLDM(nn.Module):
         # KLDM: plain squared error for lattice targets.
         loss_l = self.mse_loss_per_sample(out_l, target_l).mean()
 
-        # Monte Carlo lambda(t) weighting on the simplified wrapped-normal target.
-        # Keep the raw network output here, since extra centering in the loss path
-        # is one of the behavioral differences from facit we wanted to remove.
+        # Precomputed λ(t) weighting on the simplified velocity target.
         lambda_v_t = self.tdm.lambda_v(t_graph.squeeze(-1))[index]
         loss_v = (lambda_v_t * self.mse_loss_per_sample(out_v, target_v)).mean()
 
@@ -202,9 +201,10 @@ class ModelKLDM(nn.Module):
             return cached_score_network
 
         checkpoint = torch.load(checkpoint_path, map_location=device)
+        source_state_dict = checkpoint.get("ema_model_state_dict") or checkpoint["model_state_dict"]
         cleaned_state_dict = {
             key: value
-            for key, value in checkpoint["model_state_dict"].items()
+            for key, value in source_state_dict.items()
             if not key.startswith("_cached_sampling_score_network")
         }
         model = ModelKLDM(device=device).to(device)
@@ -237,10 +237,10 @@ class ModelKLDM(nn.Module):
 
         # Algorithm 3 priors:
         # v_T ~ N_v(0, I) with zero-net translation
-        # f_T is kept in the centered unit-period chart internally.
+        # f_T is kept in [0,1] internally again.
         # l_T ~ N(0, I)
-        v_t = scatter_center(torch.randn_like(batch.pos), index=node_index) / self.tdm.scale_pos
-        f_t = self.tdm.wrap_displacements(torch.rand_like(batch.pos))
+        v_t = scatter_center(torch.randn_like(batch.pos), index=node_index)
+        f_t = self.tdm.wrap_positions(torch.rand_like(batch.pos))
         l_t = torch.randn_like(batch.l)
         a_t = batch.h  # CSP conditioning
 
