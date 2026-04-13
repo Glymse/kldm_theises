@@ -29,12 +29,13 @@ class TrivialisedDiffusion(nn.Module):
     """
     def __init__(
             self,
-            eps: float = 1e-5) -> None:
+            eps: float = 1e-5,
+            n_sigmas: int = 2000) -> None:
         super().__init__()
         self.eps = float(eps)
         self.time_scaling_T = 2
         self.k_wn_score = 13
-        sigma_grid = self.wrapped_gaussian_sigma_r_t(torch.linspace(0.0, self.time_scaling_T, 256))
+        sigma_grid = self.wrapped_gaussian_sigma_r_t(torch.linspace(0.0, self.time_scaling_T, n_sigmas))
         sigma_norm_grid = self._sigma_norm(sigma_grid)
         self.register_buffer("_sigma_norms", sigma_norm_grid)
 
@@ -165,7 +166,8 @@ class TrivialisedDiffusion(nn.Module):
         r_t = self.wrap_displacements(wrapped_gaussian_mu_r_t + wrapped_gaussian_sigma_r_t * epsilon_r)
 
         #Now we calculate displacement, and while we stay on the manifold.
-        f_t = self.wrap_positions(f0 + r_t)
+        #We keep the internal TDM position latent in the centered unit-period chart.
+        f_t = self.wrap_displacements(f0 + r_t)
 
         #Center again
         #f_t = scatter_center(f_t, index=index) DEACTIVED WHILE FRANCOIS ANSWERS MAIL.
@@ -277,7 +279,8 @@ class TrivialisedDiffusion(nn.Module):
         v_prev = exp_dt * v_t + 2.0 * expm1_dt * score_v + noise_scale * noise_v
 
 
-        f_prev = self.wrap_positions(f_t - dt_t * v_prev)
+        #Keep the internal reverse-time position latent in the centered unit-period chart.
+        f_prev = self.wrap_displacements(f_t - dt_t * v_prev)
 
         return f_prev, v_prev
 
