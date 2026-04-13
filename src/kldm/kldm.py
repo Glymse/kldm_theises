@@ -177,13 +177,23 @@ class ModelKLDM(nn.Module):
 
         # Precomputed λ(t) weighting on the simplified velocity target.
         lambda_v_t = self.tdm.lambda_v(t_graph.squeeze(-1))[index]
-        loss_v = (lambda_v_t * self.mse_loss_per_sample(out_v, target_v)).mean()
+        raw_loss_v_per_sample = self.mse_loss_per_sample(out_v, target_v)
+        loss_v = (lambda_v_t * raw_loss_v_per_sample).mean()
+        raw_loss_v = raw_loss_v_per_sample.mean()
 
         total_loss = lambda_v * loss_v + lambda_l * loss_l
         return total_loss, {
             "loss": total_loss.detach(),
             "loss_v": loss_v.detach(),
+            "raw_loss_v": raw_loss_v.detach(),
             "loss_l": loss_l.detach(),
+            "target_v_abs_mean": target_v.abs().mean().detach(),
+            "target_v_norm_mean": target_v.norm(dim=-1).mean().detach(),
+            "pred_v_abs_mean": out_v.abs().mean().detach(),
+            "pred_v_norm_mean": out_v.norm(dim=-1).mean().detach(),
+            "lambda_v_mean": lambda_v_t.mean().detach(),
+            "lambda_v_min": lambda_v_t.min().detach(),
+            "lambda_v_max": lambda_v_t.max().detach(),
         }
 
 

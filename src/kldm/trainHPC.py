@@ -157,9 +157,8 @@ def validation_step(
         )
 
     return {
-        "loss": float(loss),
-        "loss_v": float(metrics["loss_v"]),
-        "loss_l": float(metrics["loss_l"]),
+        key: float(value)
+        for key, value in metrics.items()
     }
 
 
@@ -171,7 +170,7 @@ def train_epoch(
     device: torch.device,
 ) -> dict[str, float]:
     model.train()
-    running = {"loss": 0.0, "loss_v": 0.0, "loss_l": 0.0}
+    running: dict[str, float] = {}
     num_batches = 0
 
     for batch in loader:
@@ -196,9 +195,8 @@ def train_epoch(
         optimizer.step()
         ema.update(model)
 
-        running["loss"] += float(loss)
-        running["loss_v"] += float(metrics["loss_v"])
-        running["loss_l"] += float(metrics["loss_l"])
+        for key, value in metrics.items():
+            running[key] = running.get(key, 0.0) + float(value)
         num_batches += 1
 
     if num_batches == 0:
@@ -214,13 +212,13 @@ def evaluate_loss(
     loader,
     device: torch.device,
 ) -> dict[str, float]:
-    totals = {"loss": 0.0, "loss_v": 0.0, "loss_l": 0.0}
+    totals: dict[str, float] = {}
     num_batches = 0
 
     for batch in loader:
         metrics = validation_step(model=model, batch=batch, device=device)
-        for key in totals:
-            totals[key] += metrics[key]
+        for key, value in metrics.items():
+            totals[key] = totals.get(key, 0.0) + value
         num_batches += 1
 
     if num_batches == 0:
@@ -703,7 +701,10 @@ def train() -> None:
             print(
                 f"epoch={epoch:04d} "
                 f"train_loss={train_metrics['loss']:.6f} "
-                f"(v={train_metrics['loss_v']:.6f}, l={train_metrics['loss_l']:.6f})"
+                f"(v={train_metrics['loss_v']:.6f}, raw_v={train_metrics['raw_loss_v']:.6f}, l={train_metrics['loss_l']:.6f}) "
+                f"target_v_abs={train_metrics['target_v_abs_mean']:.6f} "
+                f"pred_v_abs={train_metrics['pred_v_abs_mean']:.6f} "
+                f"lambda=[{train_metrics['lambda_v_min']:.3f},{train_metrics['lambda_v_mean']:.3f},{train_metrics['lambda_v_max']:.3f}]"
             )
 
             should_record_loss = (epoch % config["loss_every"] == 0)
@@ -722,9 +723,11 @@ def train() -> None:
                         "epoch": epoch,
                         "train_loss": train_metrics["loss"],
                         "train_loss_v": train_metrics["loss_v"],
+                        "train_raw_loss_v": train_metrics["raw_loss_v"],
                         "train_loss_l": train_metrics["loss_l"],
                         "val_loss": val_metrics["loss"],
                         "val_loss_v": val_metrics["loss_v"],
+                        "val_raw_loss_v": val_metrics["raw_loss_v"],
                         "val_loss_l": val_metrics["loss_l"],
                     }
                 )
@@ -732,7 +735,10 @@ def train() -> None:
                 print(
                     f"validation_epoch={epoch:04d} "
                     f"val_loss={val_metrics['loss']:.6f} "
-                    f"(v={val_metrics['loss_v']:.6f}, l={val_metrics['loss_l']:.6f})"
+                    f"(v={val_metrics['loss_v']:.6f}, raw_v={val_metrics['raw_loss_v']:.6f}, l={val_metrics['loss_l']:.6f}) "
+                    f"target_v_abs={val_metrics['target_v_abs_mean']:.6f} "
+                    f"pred_v_abs={val_metrics['pred_v_abs_mean']:.6f} "
+                    f"lambda=[{val_metrics['lambda_v_min']:.3f},{val_metrics['lambda_v_mean']:.3f},{val_metrics['lambda_v_max']:.3f}]"
                 )
 
                 wandb.log(
@@ -740,10 +746,26 @@ def train() -> None:
                         "epoch": epoch,
                         "train/epoch_loss": train_metrics["loss"],
                         "train/epoch_loss_v": train_metrics["loss_v"],
+                        "train/epoch_raw_loss_v": train_metrics["raw_loss_v"],
                         "train/epoch_loss_l": train_metrics["loss_l"],
+                        "train/target_v_abs_mean": train_metrics["target_v_abs_mean"],
+                        "train/target_v_norm_mean": train_metrics["target_v_norm_mean"],
+                        "train/pred_v_abs_mean": train_metrics["pred_v_abs_mean"],
+                        "train/pred_v_norm_mean": train_metrics["pred_v_norm_mean"],
+                        "train/lambda_v_mean": train_metrics["lambda_v_mean"],
+                        "train/lambda_v_min": train_metrics["lambda_v_min"],
+                        "train/lambda_v_max": train_metrics["lambda_v_max"],
                         "val/epoch_loss": val_metrics["loss"],
                         "val/epoch_loss_v": val_metrics["loss_v"],
+                        "val/epoch_raw_loss_v": val_metrics["raw_loss_v"],
                         "val/epoch_loss_l": val_metrics["loss_l"],
+                        "val/target_v_abs_mean": val_metrics["target_v_abs_mean"],
+                        "val/target_v_norm_mean": val_metrics["target_v_norm_mean"],
+                        "val/pred_v_abs_mean": val_metrics["pred_v_abs_mean"],
+                        "val/pred_v_norm_mean": val_metrics["pred_v_norm_mean"],
+                        "val/lambda_v_mean": val_metrics["lambda_v_mean"],
+                        "val/lambda_v_min": val_metrics["lambda_v_min"],
+                        "val/lambda_v_max": val_metrics["lambda_v_max"],
                     }
                 )
 
@@ -754,9 +776,11 @@ def train() -> None:
                         "epoch",
                         "train_loss",
                         "train_loss_v",
+                        "train_raw_loss_v",
                         "train_loss_l",
                         "val_loss",
                         "val_loss_v",
+                        "val_raw_loss_v",
                         "val_loss_l",
                     ],
                 )
