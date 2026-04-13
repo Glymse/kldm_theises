@@ -41,9 +41,9 @@ class ModelKLDM(nn.Module):
         self.device = device or torch.device("cpu")
 
         self.score_network = score_network or CSPVNet(
-            hidden_dim=128,
-            time_dim=128,
-            num_layers=4,
+            hidden_dim=512,
+            time_dim=256,
+            num_layers=6,
             num_freqs=128,
             ln=True,
             h_dim=118,
