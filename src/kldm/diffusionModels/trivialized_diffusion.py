@@ -135,6 +135,102 @@ class TrivialisedDiffusion(nn.Module):
         lambda_hi = self._lambda_v_table[idx_hi]
         return lambda_lo + (lambda_hi - lambda_lo) * frac
 
+    def _fill_missing_lambda_bins(
+        self,
+        lambda_table: torch.Tensor,
+        valid_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Linearly fill bins that were not visited during the centered Monte Carlo
+        precompute. This keeps λ(t) smooth even when the loader-based estimate
+        does not hit every grid point.
+        """
+        if not torch.any(valid_mask):
+            return lambda_table
+
+        filled = lambda_table.clone()
+        valid_indices = torch.nonzero(valid_mask, as_tuple=False).flatten().tolist()
+
+        first_idx = valid_indices[0]
+        last_idx = valid_indices[-1]
+        filled[:first_idx] = filled[first_idx]
+        filled[last_idx + 1 :] = filled[last_idx]
+
+        for left_idx, right_idx in zip(valid_indices[:-1], valid_indices[1:]):
+            if right_idx - left_idx <= 1:
+                continue
+
+            left_value = filled[left_idx]
+            right_value = filled[right_idx]
+            gap_steps = torch.linspace(
+                0.0,
+                1.0,
+                right_idx - left_idx + 1,
+                device=filled.device,
+                dtype=filled.dtype,
+            )
+            filled[left_idx:right_idx + 1] = left_value + (right_value - left_value) * gap_steps
+
+        return filled
+
+    def precompute_lambda_table_from_loader(
+        self,
+        loader,
+        max_batches: int = 64,
+        device: torch.device | None = None,
+    ) -> int:
+        """
+        Re-estimate λ(t) from the same centered simplified target convention used
+        during training, using real graph batches and their batch.batch centering.
+        """
+        table_device = self._lambda_v_table.device if device is None else device
+        sums = torch.zeros(self.n_lambdas, device=table_device, dtype=self._lambda_v_table.dtype)
+        counts = torch.zeros(self.n_lambdas, device=table_device, dtype=self._lambda_v_table.dtype)
+        num_batches = 0
+
+        with torch.no_grad():
+            for batch_idx, batch in enumerate(loader):
+                if batch_idx >= max_batches:
+                    break
+
+                batch = batch.to(table_device)
+                index = batch.batch
+                num_graphs = batch.num_graphs
+
+                t_graph = torch.rand(num_graphs, device=table_device).clamp_(1e-4, 1.0)
+                t_node = t_graph[index]
+
+                _, v_t, _, _, r_t = self.forward_sample(
+                    t=t_node,
+                    f0=batch.pos,
+                    index=index,
+                )
+                target = self.score_target(
+                    t=t_node,
+                    r_t=r_t,
+                    v_t=v_t,
+                    index=index,
+                )
+
+                node_sq = target.reshape(target.shape[0], -1).pow(2).mean(dim=1)
+                node_bins = torch.clamp(
+                    torch.round(t_node * (self.n_lambdas - 1)).long(),
+                    0,
+                    self.n_lambdas - 1,
+                )
+
+                sums.index_add_(0, node_bins, node_sq.to(sums.dtype))
+                counts.index_add_(0, node_bins, torch.ones_like(node_sq, dtype=sums.dtype))
+                num_batches += 1
+
+        valid_mask = counts > 0
+        centered_lambda_table = self._lambda_v_table.detach().clone().to(table_device)
+        centered_lambda_table[valid_mask] = 1.0 / (sums[valid_mask] / counts[valid_mask]).clamp_min(self.eps)
+        centered_lambda_table = self._fill_missing_lambda_bins(centered_lambda_table, valid_mask)
+
+        self._lambda_v_table.copy_(centered_lambda_table.to(self._lambda_v_table.device))
+        return num_batches
+
 
     #TODO: We do not center the distribution around = 0 yet. Ask francois.
 

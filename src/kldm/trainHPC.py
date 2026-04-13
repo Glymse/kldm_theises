@@ -526,8 +526,17 @@ def train() -> None:
     print("constructed train/val/sample loaders", flush=True)
 
     model = ModelKLDM(device=device).to(device)
+    lambda_batches = 128 if device.type == "cuda" else 32
+    used_lambda_batches = model.tdm.precompute_lambda_table_from_loader(
+        loader=train_loader,
+        max_batches=lambda_batches,
+        device=device,
+    )
     optimizer = torch.optim.AdamW(model.parameters(), lr=config["lr"])
-    print("constructed model and optimizer", flush=True)
+    print(
+        f"constructed model and optimizer lambda_batches={used_lambda_batches}",
+        flush=True,
+    )
 
     start_epoch, resume_config = maybe_resume(
         model=model,

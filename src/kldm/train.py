@@ -239,6 +239,12 @@ def train() -> None:
     )
 
     model = ModelKLDM(device=device).to(device)
+    lambda_batches = 64 if device.type == "cuda" else 16
+    used_lambda_batches = model.tdm.precompute_lambda_table_from_loader(
+        loader=train_loader,
+        max_batches=lambda_batches,
+        device=device,
+    )
     optimizer = torch.optim.Adam(model.parameters(), lr=config["lr"])
 
     run = wandb.init(
@@ -258,7 +264,8 @@ def train() -> None:
 
     print(
         f"starting training epochs={config['epochs']} batch_size={config['batch_size']} "
-        f"lr={config['lr']} device={device.type} train_fraction={config['train_fraction']}",
+        f"lr={config['lr']} device={device.type} train_fraction={config['train_fraction']} "
+        f"lambda_batches={used_lambda_batches}",
         flush=True,
     )
 
