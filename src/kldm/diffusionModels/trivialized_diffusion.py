@@ -30,13 +30,17 @@ class TrivialisedDiffusion(nn.Module):
     def __init__(
             self,
             eps: float = 1e-5,
-            n_sigmas: int = 2000) -> None:
+            n_sigmas: int = 2000,
+            sigma_norm_num_samples: int = 20000,
+            sigma_norm_chunk_size: int = 64) -> None:
         super().__init__()
         self.eps = float(eps)
         self.time_scaling_T = 2
         self.k_wn_score = 13
+        self.sigma_norm_num_samples = int(sigma_norm_num_samples)
+        self.sigma_norm_chunk_size = int(sigma_norm_chunk_size)
         sigma_grid = self.wrapped_gaussian_sigma_r_t(torch.linspace(0.0, self.time_scaling_T, n_sigmas))
-        sigma_norm_grid = self._sigma_norm(sigma_grid)
+        sigma_norm_grid = self._sigma_norm(sigma_grid, num_samples=self.sigma_norm_num_samples)
         self.register_buffer("_sigma_norms", sigma_norm_grid)
 
     # -------------------------------------------------
@@ -80,7 +84,7 @@ class TrivialisedDiffusion(nn.Module):
         )  # Eq. (23)
 
     def _sigma_norm(self, sigma: torch.Tensor, num_samples: int = 20000) -> torch.Tensor:
-        chunk_size = 512
+        chunk_size = self.sigma_norm_chunk_size
         total = torch.zeros_like(sigma)
         count = 0
 
