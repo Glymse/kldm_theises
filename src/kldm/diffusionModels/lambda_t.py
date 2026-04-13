@@ -77,6 +77,5 @@ def precompute_lambda_time_grid(
         lambda_values.append(1.0 / expected_sq_norm.clamp_min(diffusion.eps))
 
     lambda_table = torch.stack(lambda_values)
-    lambda_table = lambda_table / lambda_table.mean().clamp_min(diffusion.eps)
     lambda_table = lambda_table.clamp(min=clamp_min, max=clamp_max)
     return lambda_table
