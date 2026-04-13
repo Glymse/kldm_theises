@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import math
 import sys
 
 import torch
@@ -11,7 +12,7 @@ if __package__ in {None, ""}:
 
 from kldm.data import CSPTask, DNGTask, resolve_data_root
 
-from kldm.distribution import d_log_wrapped_normal
+from kldm.distribution import d_log_wrapped_normal_2pi_version
 from kldm.scoreNetwork.utils import scatter_center
 
 ################################################################
@@ -30,18 +31,20 @@ class TrivialisedDiffusion(nn.Module):
     def __init__(
             self,
             eps: float = 1e-5,
-            n_sigmas: int = 2000,
-            sigma_norm_num_samples: int = 20000,
-            sigma_norm_chunk_size: int = 64) -> None:
+            n_lambdas: int = 2000,
+            lambda_num_samples: int = 20000,
+            lambda_chunk_size: int = 64) -> None:
         super().__init__()
         self.eps = float(eps)
         self.time_scaling_T = 2
+        self.scale_pos = 2.0 * math.pi
         self.k_wn_score = 13
-        self.sigma_norm_num_samples = int(sigma_norm_num_samples)
-        self.sigma_norm_chunk_size = int(sigma_norm_chunk_size)
-        sigma_grid = self.wrapped_gaussian_sigma_r_t(torch.linspace(0.0, self.time_scaling_T, n_sigmas))
-        sigma_norm_grid = self._sigma_norm(sigma_grid, num_samples=self.sigma_norm_num_samples)
-        self.register_buffer("_sigma_norms", sigma_norm_grid)
+        self.n_lambdas = int(n_lambdas)
+        self.lambda_num_samples = int(lambda_num_samples)
+        self.lambda_chunk_size = int(lambda_chunk_size)
+        lambda_grid = torch.linspace(1e-4, 1.0, self.n_lambdas)
+        lambda_table = self._precompute_lambda_table(lambda_grid, num_samples=self.lambda_num_samples)
+        self.register_buffer("_lambda_v_table", lambda_table)
 
     # -------------------------------------------------
     #  Wrapping function.
@@ -59,6 +62,10 @@ class TrivialisedDiffusion(nn.Module):
     def wrap_displacements(x: torch.Tensor) -> torch.Tensor:
         """Wrap signed periodic displacements into [-0.5, 0.5)."""
         return torch.remainder(x + 0.5, 1.0) - 0.5
+
+    def wrap_angles(self, x: torch.Tensor) -> torch.Tensor:
+        """Wrap scaled periodic variables into [-pi, pi)."""
+        return torch.remainder(x + torch.pi, self.scale_pos) - torch.pi
 
     # -------------------------------------------------
     # Velocity sampling
@@ -83,34 +90,42 @@ class TrivialisedDiffusion(nn.Module):
             torch.clamp(2.0 * t + 8.0 / (1.0 + torch.exp(t)) - 4.0, min=self.eps)
         )  # Eq. (23)
 
-    def _sigma_norm(self, sigma: torch.Tensor, num_samples: int = 20000) -> torch.Tensor:
-        chunk_size = self.sigma_norm_chunk_size
-        total = torch.zeros_like(sigma)
+    def _precompute_lambda_table(
+        self,
+        t01_grid: torch.Tensor,
+        num_samples: int = 20000,
+    ) -> torch.Tensor:
+        sigma_grid = self.wrapped_gaussian_sigma_r_t(self.time_scaling_T * t01_grid)
+        chunk_size = self.lambda_chunk_size
+        total = torch.zeros_like(sigma_grid)
         count = 0
 
         for start in range(0, num_samples, chunk_size):
             current_chunk = min(chunk_size, num_samples - start)
-            sigmas = sigma[None, :].repeat(current_chunk, 1)
+            sigmas = sigma_grid[None, :].repeat(current_chunk, 1)
             x_sample = sigmas * torch.randn_like(sigmas)
-            x_sample = self.wrap_displacements(x_sample)
-            normal = d_log_wrapped_normal(
+            x_sample = self.wrap_angles(x_sample)
+            normal = d_log_wrapped_normal_2pi_version(
                 r=x_sample,
                 mu=torch.zeros_like(x_sample),
                 sigma=sigmas,
-                K=self.k_wn_score,
+                N=self.k_wn_score,
+                T=self.scale_pos,
             )
             total = total + normal.square().sum(dim=0)
             count += current_chunk
 
-        return total / max(count, 1)
+        expected_sq_norm = total / max(count, 1)
+        return 1.0 / expected_sq_norm.clamp_min(self.eps)
 
-    def _sigma_norm_t(self, t: torch.Tensor) -> torch.Tensor:
-        idx = torch.clamp(
-            torch.round(t / self.time_scaling_T * (len(self._sigma_norms) - 1)).long(),
-            0,
-            len(self._sigma_norms) - 1,
-        )
-        return self._sigma_norms[idx]
+    def lambda_v(self, t01: torch.Tensor) -> torch.Tensor:
+        scaled = torch.clamp(t01, 0.0, 1.0) * (self.n_lambdas - 1)
+        idx_lo = torch.floor(scaled).long()
+        idx_hi = torch.clamp(idx_lo + 1, max=self.n_lambdas - 1)
+        frac = (scaled - idx_lo.to(scaled.dtype)).to(self._lambda_v_table.dtype)
+        lambda_lo = self._lambda_v_table[idx_lo]
+        lambda_hi = self._lambda_v_table[idx_hi]
+        return lambda_lo + (lambda_hi - lambda_lo) * frac
 
 
     #TODO: We do not center the distribution around = 0 yet. Ask francois.
@@ -145,6 +160,7 @@ class TrivialisedDiffusion(nn.Module):
         #Vi sætter v0 = 0, [Design choice] at time t = 0
         if v0 is None:
             v0 = torch.zeros_like(f0)                               #Design choice: Initial zero velocities
+        v0 = self.scale_pos * v0
 
         #TODO: Scatter center mean free, også det de gør i KLDM
 
@@ -163,9 +179,10 @@ class TrivialisedDiffusion(nn.Module):
         ###    Calculate displacement ft   ###
         ######################################
         #Now we calculate f_t = f_0 * expm(r_t), where r_t follows a wrapped Gaussian.
+        f0 = self.scale_pos * self.wrap_displacements(f0)
 
         wrapped_gaussian_mu_r_t = self.wrapped_gaussian_mu_r_t(t, v_t, v0)
-        wrapped_gaussian_mu_r_t = self.wrap_displacements(wrapped_gaussian_mu_r_t) #To stay in [-0.5, 0.5] or [-pi, pi] equvialant.
+        wrapped_gaussian_mu_r_t = self.wrap_angles(wrapped_gaussian_mu_r_t) #To stay in [-0.5, 0.5] or [-pi, pi] equvialant.
 
         wrapped_gaussian_sigma_r_t = self._match_dims(self.wrapped_gaussian_sigma_r_t(t), f0)
 
@@ -176,18 +193,18 @@ class TrivialisedDiffusion(nn.Module):
 
 
         #FACIT VERISON, OLD VERSION, CHAT MIGHT SAY IT IS A PROBLEM
-        r_t = self.wrap_displacements(wrapped_gaussian_mu_r_t + wrapped_gaussian_sigma_r_t * epsilon_r)
+        r_t = self.wrap_angles(wrapped_gaussian_mu_r_t + wrapped_gaussian_sigma_r_t * epsilon_r)
 
         #Now we calculate displacement, and while we stay on the manifold.
         #We keep the internal TDM position latent in the centered unit-period chart.
-        f_t = self.wrap_displacements(f0 + r_t)
+        f_t = self.wrap_angles(f0 + r_t)
 
         #Center again
         #f_t = scatter_center(f_t, index=index) DEACTIVED WHILE FRANCOIS ANSWERS MAIL.
         #Then we wrap to ensure we stay within [0,1]
         #f_t = self.wrap_positions(f_t)
 
-        return f_t, v_t, epsilon_v, epsilon_r, r_t
+        return f_t / self.scale_pos, v_t / self.scale_pos, epsilon_v, epsilon_r, r_t
 
     def score_target(
         self,
@@ -205,13 +222,15 @@ class TrivialisedDiffusion(nn.Module):
 
         #Design choice, makes the target quite simple to calculate.
         v0 = torch.zeros_like(v_t) if v0 is None else v0
+        v0 = self.scale_pos * v0
+        v_t = self.scale_pos * v_t
 
         #Now we find target of the wrapped normal fractional distribution
         wrapped_gaussian_mu_r_t = self.wrapped_gaussian_mu_r_t(t, v_t, v0)
         #NOT WRITTEN IN APPENDIX, BUT ASK FRANCOIS / MIKKEL IF IT WOULD MAKE SENSE TO DO
         #But would make sense since usually it works i [-pi, pi]
         """TODO: CHECK"""
-        wrapped_gaussian_mu_r_t = self.wrap_displacements(wrapped_gaussian_mu_r_t)
+        wrapped_gaussian_mu_r_t = self.wrap_angles(wrapped_gaussian_mu_r_t)
         """ this """
 
         wrapped_gaussian_sigma_r_t = self._match_dims(self.wrapped_gaussian_sigma_r_t(t), r_t)
@@ -225,17 +244,13 @@ class TrivialisedDiffusion(nn.Module):
         )
         """ #FULL TARGET
 
-        wrapped_gaussian_target =  d_log_wrapped_normal(
+        wrapped_gaussian_target = d_log_wrapped_normal_2pi_version(
             r=r_t,
             mu=wrapped_gaussian_mu_r_t,
             sigma=wrapped_gaussian_sigma_r_t,
-            K=self.k_wn_score,
+            N=self.k_wn_score,
+            T=self.scale_pos,
         )
-
-        sigma_norm_t = torch.sqrt(
-            self._match_dims(self._sigma_norm_t(t), wrapped_gaussian_target)
-        ).clamp_min(self.eps)
-        wrapped_gaussian_target = wrapped_gaussian_target / sigma_norm_t
 
         #Center the target
         wrapped_gaussian_target = scatter_center(wrapped_gaussian_target, index=index)
@@ -253,19 +268,17 @@ class TrivialisedDiffusion(nn.Module):
     ) -> torch.Tensor:
         """Construct the full KLDM velocity score from the network prediction."""
         t_internal = self.time_scaling_T * t
+        v_t = self.scale_pos * v_t
         prefactor = self._match_dims(
             (1.0 - torch.exp(-t_internal)) / (1.0 + torch.exp(-t_internal)),
             pred_v,
         )
-        sigma_norm_t = torch.sqrt(
-            self._match_dims(self._sigma_norm_t(t_internal), pred_v)
-        ).clamp_min(self.eps)
         gaussian_velocity_sigma_sq = self._match_dims(
             self.gaussian_velocity_sigma(t_internal) ** 2,
             pred_v,
         ).clamp_min(self.eps)
 
-        return prefactor * sigma_norm_t * pred_v - v_t / gaussian_velocity_sigma_sq
+        return prefactor * pred_v - v_t / gaussian_velocity_sigma_sq
 
     def reverse_exp_step(
         self,
@@ -276,6 +289,8 @@ class TrivialisedDiffusion(nn.Module):
         dt: float,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """One exponential-integrator reverse step for the TDM process."""
+        f_t = self.scale_pos * f_t
+        v_t = self.scale_pos * v_t
         dt_t = torch.as_tensor(
             self.time_scaling_T * dt,
             device=v_t.device,
@@ -293,9 +308,9 @@ class TrivialisedDiffusion(nn.Module):
 
 
         #Keep the internal reverse-time position latent in the centered unit-period chart.
-        f_prev = self.wrap_displacements(f_t - dt_t * v_prev)
+        f_prev = self.wrap_angles(f_t - dt_t * v_prev)
 
-        return f_prev, v_prev
+        return f_prev / self.scale_pos, v_prev / self.scale_pos
 
 
     @staticmethod

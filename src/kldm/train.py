@@ -20,6 +20,11 @@ try:
     import wandb
 except ImportError as exc:  # pragma: no cover
     raise ImportError("wandb is required for src/kldm/train.py") from exc
+"""
+
+COMMAND FOR UNNING: uv run src/kldm/train.py --train-fraction 0.2 --subset-seed 42 --no-wandb
+"""
+
 
 def validation_step(
     model: ModelKLDM,
@@ -181,12 +186,6 @@ def parse_args() -> argparse.Namespace:
         default=7,
         help="Random seed used when selecting a training subset.",
     )
-    parser.add_argument(
-        "--no-wandb",
-        dest="no_wandb",
-        action="store_true",
-        help="Disable Weights & Biases logging for this run.",
-    )
     return parser.parse_args()
 
 
@@ -205,7 +204,6 @@ def train() -> None:
         "num_workers": args.num_workers,
         "train_fraction": args.train_fraction,
         "subset_seed": args.subset_seed,
-        "wandb_enabled": not args.no_wandb,
         "lr": 1e-3,
         "lambda_v": 1.0,
         "lambda_l": 1.0,
@@ -243,16 +241,14 @@ def train() -> None:
     model = ModelKLDM(device=device).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=config["lr"])
 
-    run = None
-    if config["wandb_enabled"]:
-        run = wandb.init(
-            project="kldm-csp",
-            config=config,
-            name=f"csp_{config['epochs']}_epochs",
-        )
-        wandb.define_metric("epoch")
-        wandb.define_metric("train/*", step_metric="epoch")
-        wandb.define_metric("val/*", step_metric="epoch")
+    run = wandb.init(
+        project="kldm-csp",
+        config=config,
+        name=f"csp_{config['epochs']}_epochs",
+    )
+    wandb.define_metric("epoch")
+    wandb.define_metric("train/*", step_metric="epoch")
+    wandb.define_metric("val/*", step_metric="epoch")
 
     output_path = Path("artifacts") / "csp_final_model.pt"
     history_path = Path("artifacts") / "csp_training_history.csv"
@@ -305,8 +301,7 @@ def train() -> None:
                 "val/loss_v": val_metrics["loss_v"],
                 "val/loss_l": val_metrics["loss_l"],
             }
-            if config["wandb_enabled"]:
-                wandb.log(log_metrics)
+            wandb.log(log_metrics)
 
             print(
                 f"epoch={epoch:03d}/{config['epochs']:03d} "
@@ -334,15 +329,14 @@ def train() -> None:
             config=config,
         )
         export_history(history=history, output_path=history_path)
-        if config["wandb_enabled"] and run is not None:
-            artifact = wandb.Artifact("csp_final_model", type="model")
-            artifact.add_file(str(output_path))
-            if best_output_path.exists():
-                artifact.add_file(str(best_output_path))
-            if history_path.exists():
-                artifact.add_file(str(history_path))
-            run.log_artifact(artifact)
-            wandb.finish()
+        artifact = wandb.Artifact("csp_final_model", type="model")
+        artifact.add_file(str(output_path))
+        if best_output_path.exists():
+            artifact.add_file(str(best_output_path))
+        if history_path.exists():
+            artifact.add_file(str(history_path))
+        run.log_artifact(artifact)
+        wandb.finish()
 
 
 if __name__ == "__main__":

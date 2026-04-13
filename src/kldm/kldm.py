@@ -57,8 +57,9 @@ class ModelKLDM(nn.Module):
 
         self.tdm = diffusion_v or TDM(
             eps=eps,
-            sigma_norm_num_samples=20000 if self.device.type == "cuda" else 4096,
-            sigma_norm_chunk_size=128 if self.device.type == "cuda" else 32,
+            n_lambdas=2000 if self.device.type == "cuda" else 512,
+            lambda_num_samples=20000 if self.device.type == "cuda" else 4096,
+            lambda_chunk_size=128 if self.device.type == "cuda" else 32,
         )
         self.diffusion_l = diffusion_l or ContinuousVPDiffusion(eps=eps)
         self.eps = eps
@@ -175,8 +176,9 @@ class ModelKLDM(nn.Module):
         # KLDM: plain squared error for lattice targets.
         loss_l = self.mse_loss_per_sample(preds["l"], target_l).mean()
 
-        # Facit-style simplified target training uses plain MSE after target normalization.
-        loss_v = self.mse_loss_per_sample(out_v, target_v).mean()
+        # Monte Carlo lambda(t) weighting on the simplified wrapped-normal target.
+        lambda_v_t = self.tdm.lambda_v(t_graph.squeeze(-1))[index]
+        loss_v = (lambda_v_t * self.mse_loss_per_sample(out_v, target_v)).mean()
 
         total_loss = lambda_v * loss_v + lambda_l * loss_l
         return total_loss, {
