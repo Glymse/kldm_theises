@@ -80,16 +80,25 @@ class TrivialisedDiffusion(nn.Module):
         )  # Eq. (23)
 
     def _sigma_norm(self, sigma: torch.Tensor, num_samples: int = 20000) -> torch.Tensor:
-        sigmas = sigma[None, :].repeat(num_samples, 1)
-        x_sample = sigmas * torch.randn_like(sigmas)
-        x_sample = self.wrap_displacements(x_sample)
-        normal = d_log_wrapped_normal(
-            r=x_sample,
-            mu=torch.zeros_like(x_sample),
-            sigma=sigmas,
-            K=self.k_wn_score,
-        )
-        return normal.square().mean(dim=0)
+        chunk_size = 512
+        total = torch.zeros_like(sigma)
+        count = 0
+
+        for start in range(0, num_samples, chunk_size):
+            current_chunk = min(chunk_size, num_samples - start)
+            sigmas = sigma[None, :].repeat(current_chunk, 1)
+            x_sample = sigmas * torch.randn_like(sigmas)
+            x_sample = self.wrap_displacements(x_sample)
+            normal = d_log_wrapped_normal(
+                r=x_sample,
+                mu=torch.zeros_like(x_sample),
+                sigma=sigmas,
+                K=self.k_wn_score,
+            )
+            total = total + normal.square().sum(dim=0)
+            count += current_chunk
+
+        return total / max(count, 1)
 
     def _sigma_norm_t(self, t: torch.Tensor) -> torch.Tensor:
         idx = torch.clamp(

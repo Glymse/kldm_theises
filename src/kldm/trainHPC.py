@@ -53,16 +53,6 @@ def should_stop(run) -> bool:
         if isinstance(value, bool) and value:
             return True
 
-    state = getattr(run, "state", None)
-    if isinstance(state, str) and state.lower() in {
-        "stopped",
-        "stopping",
-        "killed",
-        "finished",
-        "failed",
-    }:
-        return True
-
     return False
 
 #####
@@ -492,6 +482,7 @@ def train() -> None:
     args = parse_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     root = resolve_data_root()
+    print(f"starting trainHPC root={root} device={device.type}", flush=True)
 
     config = {
         "task": "CSP",
@@ -532,9 +523,11 @@ def train() -> None:
         shuffle=False,
         download=True,
     )
+    print("constructed train/val/sample loaders", flush=True)
 
     model = ModelKLDM(device=device).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=config["lr"])
+    print("constructed model and optimizer", flush=True)
 
     start_epoch, resume_config = maybe_resume(
         model=model,
@@ -553,6 +546,11 @@ def train() -> None:
         project="kldm-csp-hpc",
         config=config | {"resume_config": resume_config, "start_epoch": start_epoch},
         name=run_name,
+    )
+    print(
+        f"wandb initialized run_name={run_name} stopped={getattr(run, 'stopped', None)} "
+        f"_stopped={getattr(run, '_stopped', None)} state={getattr(run, 'state', None)}",
+        flush=True,
     )
     wandb.define_metric("epoch")
     wandb.define_metric("train/*", step_metric="epoch")
