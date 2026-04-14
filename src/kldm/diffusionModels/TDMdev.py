@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from pathlib import Path
+import os
 import sys
+import time
 
 import torch
 from torch import nn
@@ -45,11 +47,22 @@ class TrivialisedDiffusionDev(nn.Module):
 
         sigma_grid_t = torch.linspace(0.0, self.time_scaling_T, int(n_sigmas))
         sigma_values = self.wrapped_gaussian_sigma_r_t(sigma_grid_t)
+        sigma_precompute_start = time.perf_counter()
+        print(
+            "TDMdev sigma_norm precompute start "
+            f"n_sigmas={n_sigmas} k_wn_score={self.k_wn_score}",
+            flush=True,
+        )
         sigma_norm_values = sigma_norm(
             sigma=sigma_values,
             T=self.scale_pos,
             K=self.k_wn_score,
             eps=self.eps,
+        )
+        print(
+            "TDMdev sigma_norm precompute done "
+            f"seconds={time.perf_counter() - sigma_precompute_start:.1f}",
+            flush=True,
         )
         self.register_buffer("_sigma_norms", sigma_norm_values)
 

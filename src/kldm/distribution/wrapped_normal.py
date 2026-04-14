@@ -1,3 +1,5 @@
+import os
+
 import torch
 
 
@@ -38,11 +40,21 @@ def sigma_norm(
     sample_chunk_size: int = 2048,
     eps: float = 1e-8,
 ) -> torch.Tensor:
+    debug = os.environ.get("KLDM_SIGMA_NORM_DEBUG", "").lower() in {"1", "true", "yes", "on"}
     sigma = sigma.reshape(-1)
     if sigma_chunk_size <= 0 or sample_chunk_size <= 0:
         raise ValueError("sigma_chunk_size and sample_chunk_size must be positive.")
 
     result = torch.empty_like(sigma)
+
+    if debug:
+        print(
+            "sigma_norm_debug "
+            f"sigmas={sigma.numel()} sn={sn} K={K} "
+            f"sigma_chunk_size={sigma_chunk_size} sample_chunk_size={sample_chunk_size} "
+            f"dtype={sigma.dtype} device={sigma.device}",
+            flush=True,
+        )
 
     with torch.no_grad():
         for sigma_start in range(0, sigma.numel(), sigma_chunk_size):
@@ -50,6 +62,17 @@ def sigma_norm(
             sigma_chunk = sigma[sigma_start:sigma_end].clamp_min(eps)
             accum = torch.zeros_like(sigma_chunk)
             seen = 0
+
+            if debug:
+                diff_elements = sample_chunk_size * sigma_chunk.numel() * (2 * K + 1)
+                diff_mb = diff_elements * sigma.element_size() / (1024 ** 2)
+                print(
+                    "sigma_norm_debug "
+                    f"chunk={sigma_start}:{sigma_end} "
+                    f"chunk_sigmas={sigma_chunk.numel()} "
+                    f"estimated_diff_tensor_mb={diff_mb:.1f}",
+                    flush=True,
+                )
 
             while seen < sn:
                 current_samples = min(sample_chunk_size, sn - seen)
@@ -67,7 +90,25 @@ def sigma_norm(
                 accum += (normal_ ** 2).sum(dim=0)
                 seen += current_samples
 
+                if debug and (seen == current_samples or seen == sn or seen % max(sample_chunk_size * 4, 1) == 0):
+                    print(
+                        "sigma_norm_debug "
+                        f"chunk={sigma_start}:{sigma_end} "
+                        f"progress={seen}/{sn}",
+                        flush=True,
+                    )
+
             result[sigma_start:sigma_end] = accum / float(sn)
+
+            if debug:
+                print(
+                    "sigma_norm_debug "
+                    f"chunk={sigma_start}:{sigma_end} done",
+                    flush=True,
+                )
+
+    if debug:
+        print("sigma_norm_debug complete", flush=True)
 
     return result
 

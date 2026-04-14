@@ -15,6 +15,7 @@ if __package__ in {None, ""}:
 import torch
 
 from kldm.data import CSPTask, resolve_data_root
+from kldm.diffusionModels.TDMdev import TrivialisedDiffusionDev
 from kldm.distribution.uniform import sample_uniform
 from kldm.kldm import ModelKLDM
 from kldm.sample_evaluation.sample_evaluation import (
@@ -657,7 +658,12 @@ def train() -> None:
     )
     print("constructed train/val/sample loaders", flush=True)
 
-    model = ModelKLDM(device=device).to(device)
+    tdm = TrivialisedDiffusionDev(
+        eps=1e-3,
+        n_lambdas=512 if device.type == "cuda" else 128,
+        lambda_num_batches=32 if device.type == "cuda" else 8,
+    )
+    model = ModelKLDM(device=device, diffusion_v=tdm).to(device)
     print("precomputing lambda_v table on real train batches", flush=True)
     model.tdm.precompute_lambda_v_table_from_loader(
         train_loader,
@@ -681,7 +687,7 @@ def train() -> None:
             f"p75={float(torch.quantile(lambda_table, 0.75)):.6f}",
             flush=True,
         )
-    print("constructed model and optimizer", flush=True)
+    print(f"constructed model and optimizer tdm={type(model.tdm).__name__}", flush=True)
 
     start_epoch, resume_config = maybe_resume(
         model=model,
