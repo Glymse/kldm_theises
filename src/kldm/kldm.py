@@ -15,7 +15,8 @@ from torch_geometric.data import Data, Batch
 
 from kldm.data import CSPTask
 from kldm.diffusionModels.continuous import ContinuousVPDiffusion
-from kldm.diffusionModels.trivialized_diffusion import TrivialisedDiffusion as TDM
+# from kldm.diffusionModels.trivialized_diffusion import TrivialisedDiffusion as TDM
+from kldm.diffusionModels.TDMdev import TrivialisedDiffusionDev as TDM
 from kldm.scoreNetwork.scoreNetwork import CSPVNet
 from kldm.scoreNetwork.utils import scatter_center
 
@@ -175,9 +176,13 @@ class ModelKLDM(nn.Module):
         loss_l = self.mse_loss_per_sample(out_l, target_l).mean()
 
         # Precomputed λ(t) weighting on the simplified velocity target.
-        lambda_v_t = self.tdm.lambda_v(t_graph.squeeze(-1))[index]
         raw_loss_v_per_sample = self.mse_loss_per_sample(out_v, target_v)
-        loss_v = (lambda_v_t * raw_loss_v_per_sample).mean()
+        if getattr(self.tdm, "use_lambda_weighting", True):
+            lambda_v_t = self.tdm.lambda_v(t_graph.squeeze(-1))[index]
+            loss_v = (lambda_v_t * raw_loss_v_per_sample).mean()
+        else:
+            lambda_v_t = torch.ones_like(raw_loss_v_per_sample)
+            loss_v = raw_loss_v_per_sample.mean()
         raw_loss_v = raw_loss_v_per_sample.mean()
 
         total_loss = lambda_v * loss_v + lambda_l * loss_l
