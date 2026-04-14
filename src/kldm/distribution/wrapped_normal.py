@@ -34,21 +34,42 @@ def sigma_norm(
     T: float = 1.0,
     K: int = 9,
     sn: int = 20000,
+    sigma_chunk_size: int = 128,
+    sample_chunk_size: int = 2048,
     eps: float = 1e-8,
 ) -> torch.Tensor:
     sigma = sigma.reshape(-1)
-    sigmas = sigma[None, :].repeat(sn, 1)
-    x_sample = sigmas * torch.randn_like(sigmas)
-    x_sample = torch.remainder(x_sample + 0.5 * T, T) - 0.5 * T
-    normal_ = d_log_wrapped_normal(
-        r=x_sample,
-        mu=torch.zeros_like(x_sample),
-        sigma=sigmas.clamp_min(eps),
-        K=K,
-        T=T,
-        eps=eps,
-    )
-    return (normal_ ** 2).mean(dim=0)
+    if sigma_chunk_size <= 0 or sample_chunk_size <= 0:
+        raise ValueError("sigma_chunk_size and sample_chunk_size must be positive.")
+
+    result = torch.empty_like(sigma)
+
+    with torch.no_grad():
+        for sigma_start in range(0, sigma.numel(), sigma_chunk_size):
+            sigma_end = min(sigma_start + sigma_chunk_size, sigma.numel())
+            sigma_chunk = sigma[sigma_start:sigma_end].clamp_min(eps)
+            accum = torch.zeros_like(sigma_chunk)
+            seen = 0
+
+            while seen < sn:
+                current_samples = min(sample_chunk_size, sn - seen)
+                sigmas = sigma_chunk.unsqueeze(0).expand(current_samples, -1)
+                x_sample = sigmas * torch.randn_like(sigmas)
+                x_sample = torch.remainder(x_sample + 0.5 * T, T) - 0.5 * T
+                normal_ = d_log_wrapped_normal(
+                    r=x_sample,
+                    mu=torch.zeros_like(x_sample),
+                    sigma=sigmas,
+                    K=K,
+                    T=T,
+                    eps=eps,
+                )
+                accum += (normal_ ** 2).sum(dim=0)
+                seen += current_samples
+
+            result[sigma_start:sigma_end] = accum / float(sn)
+
+    return result
 
 #∇μ​logWN    not   ∇𝑟log⁡W.
 #HUSK DETTE I RAPPORT
