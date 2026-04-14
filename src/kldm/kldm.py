@@ -266,7 +266,7 @@ class ModelKLDM(nn.Module):
         # v_T ~ N_v(0, I) with zero-net translation
         # f_T is kept in the centered unit chart internally again.
         # l_T ~ N(0, I)
-        v_t = scatter_center(torch.randn_like(batch.pos), index=node_index)
+        v_t = scatter_center(torch.randn_like(batch.pos), index=node_index) / self.tdm.scale_pos
         f_t = self.tdm.wrap_displacements(torch.rand_like(batch.pos))
         l_t = torch.randn_like(batch.l)
         a_t = batch.h  # CSP conditioning
