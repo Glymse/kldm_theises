@@ -154,7 +154,7 @@ def validation_step(
             batch=batch,
             t=t_graph,
             lambda_v=1.0,
-            lambda_l=1.0,
+            lambda_l=0.5,
             debug=debug,
         )
 
@@ -192,7 +192,7 @@ def train_epoch(
             batch=batch,
             t=t_graph,
             lambda_v=1.0,
-            lambda_l=1.0,
+            lambda_l=0.5,
             debug=debug,
         )
         loss.backward()
@@ -618,7 +618,7 @@ def train() -> None:
         "batch_size": args.batch_size,
         "lr": args.lr,
         "lambda_v": 1.0,
-        "lambda_l": 1.0,
+        "lambda_l": 0.5,
         "validate_every": args.validate_every,
         "loss_every": args.loss_every,
         "sampling_samples": args.sampling_samples,

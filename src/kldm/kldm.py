@@ -134,7 +134,7 @@ class ModelKLDM(nn.Module):
         batch: Data | Batch,
         t: torch.Tensor,
         lambda_v: float = 1.0,
-        lambda_l: float = 1.0,
+        lambda_l: float = 0.5,
         debug: bool = False,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """
@@ -266,7 +266,9 @@ class ModelKLDM(nn.Module):
         # v_T ~ N_v(0, I) with zero-net translation
         # f_T is kept in the centered unit chart internally again.
         # l_T ~ N(0, I)
-        v_t = scatter_center(torch.randn_like(batch.pos), index=node_index) / self.tdm.scale_pos
+        # Keep the Algorithm 3 prior in the same native unit-period velocity scaling
+        # as forward_sample(...) and reverse_exp_step(...).
+        v_t = scatter_center(torch.randn_like(batch.pos), index=node_index)
         f_t = self.tdm.wrap_displacements(torch.rand_like(batch.pos))
         l_t = torch.randn_like(batch.l)
         a_t = batch.h  # CSP conditioning
