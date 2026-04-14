@@ -15,8 +15,8 @@ from torch_geometric.data import Data, Batch
 
 from kldm.data import CSPTask
 from kldm.diffusionModels.continuous import ContinuousVPDiffusion
-# from kldm.diffusionModels.trivialized_diffusion import TrivialisedDiffusion as TDM
-from kldm.diffusionModels.TDMdev import TrivialisedDiffusionDev as TDM
+from kldm.diffusionModels.trivialized_diffusion import TrivialisedDiffusion as TDM
+# from kldm.diffusionModels.TDMdev import TrivialisedDiffusionDev as TDM
 from kldm.scoreNetwork.scoreNetwork import CSPVNet
 from kldm.scoreNetwork.utils import scatter_center
 

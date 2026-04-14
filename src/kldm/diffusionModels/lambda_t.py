@@ -30,82 +30,101 @@ def precompute_lambda_time_grid_from_loader(
     loader,
     t01_grid: torch.Tensor,
     num_batches: int = 32,
+    samples_per_batch: int = 2048,
+    coord_dim: int = 3,
     clamp_min: float | None = None,
     clamp_max: float | None = None,
     smooth: bool = False,
+    mean_normalize: bool = False,
+    target_mean_weight: float = 1.0,
     device: torch.device | None = None,
 ) -> torch.Tensor:
     """
-    Monte Carlo estimate of the Torsional Diffusion Eq. (4) weight:
+    Monte Carlo estimate of the paper Eq. (4)-style lambda for the wrapped
+    coordinate diffusion used by vanilla KLDM.
 
         λ(t) = 1 / E_{τ ~ p_{t|0}(·|0)} [ ||∇_τ log p_{t|0}(τ | 0)||_2^2 ]
 
-    Implementation details:
-    - sample directly from the zero-centered wrapped-normal perturbation kernel
-    - evaluate the raw wrapped-normal score directly
-    - use squared Euclidean norm over the full 3D fractional coordinate vector
+    This follows the torsional-diffusion implementation closely:
+    - precompute a score norm for each noise level / time bin directly from the
+      forward kernel score itself
+    - use the zero-clean-state wrapped kernel p_{t|0}(·|0)
+    - estimate the second moment using the same coordinate reduction as the live
+      KLDM loss: mean over coordinates per sample
+    - return the inverse second moment as the loss weight
 
-    The loader argument is kept only for API compatibility with the training code.
-    No graph structure, centering, or real-batch statistics are used here.
+    The default behavior is the raw paper-style estimator: no smoothing, no
+    mean normalization, and no clipping. Those can still be enabled explicitly
+    when you want an optimizer-calibrated variant for experiments.
+
+    The loader argument is kept only for API compatibility with the training
+    code. No graph structure, centering, or real-batch statistics are used.
     """
     if num_batches <= 0:
         raise ValueError("num_batches must be positive for lambda precomputation.")
+    if samples_per_batch <= 0:
+        raise ValueError("samples_per_batch must be positive for lambda precomputation.")
+    if coord_dim <= 0:
+        raise ValueError("coord_dim must be positive for lambda precomputation.")
 
-    del loader
+    del loader  # kept only for API compatibility
 
     table_device = t01_grid.device if device is None else torch.device(device)
     t01_grid = t01_grid.to(table_device)
     num_bins = int(t01_grid.shape[0])
-    spatial_dim = 3
-    samples_per_batch = 2048
 
-    sq_norm_sums = torch.zeros(num_bins, device=table_device, dtype=t01_grid.dtype)
-    counts = torch.zeros(num_bins, device=table_device, dtype=t01_grid.dtype)
+    acc_dtype = (
+        torch.float32
+        if t01_grid.dtype in (torch.float16, torch.bfloat16)
+        else t01_grid.dtype
+    )
 
-    for _ in range(num_batches):
-        bin_idx = torch.randint(0, num_bins, (samples_per_batch,), device=table_device)
-        t_node = t01_grid[bin_idx]
-        t_internal = diffusion.time_scaling_T * t_node
-        sigma_scalar = diffusion.wrapped_gaussian_sigma_r_t(t_internal).to(dtype=t01_grid.dtype)
-        sigma = sigma_scalar[:, None].expand(-1, spatial_dim)
-        eps = torch.randn((samples_per_batch, spatial_dim), device=table_device, dtype=t01_grid.dtype)
-        r_t = diffusion.wrap_displacements(sigma * eps)
-        mu = torch.zeros_like(r_t)
+    lambda_table = torch.empty(num_bins, device=table_device, dtype=acc_dtype)
 
-        raw_score = d_log_wrapped_normal(
-            r=r_t,
-            mu=mu,
-            sigma=sigma,
-            K=int(getattr(diffusion, "k_wn_score", 9)),
-            T=float(getattr(diffusion, "scale_pos", 1.0)),
-            eps=diffusion.eps,
-        )
+    for bin_idx in range(num_bins):
+        t01_value = t01_grid[bin_idx]
+        t_internal = diffusion.time_scaling_T * t01_value
+        sigma_scalar = diffusion.wrapped_gaussian_sigma_r_t(t_internal).to(dtype=acc_dtype)
 
-        node_sq = raw_score.pow(2).sum(dim=1)
-        sq_norm_sums.scatter_add_(0, bin_idx, node_sq)
-        counts.scatter_add_(0, bin_idx, torch.ones_like(node_sq))
+        sq_norm_sum = torch.zeros((), device=table_device, dtype=acc_dtype)
+        count = 0
 
-    expected_sq = sq_norm_sums / counts.clamp_min(1.0)
+        for _ in range(num_batches):
+            sigma = sigma_scalar.expand(samples_per_batch, coord_dim)
+            eps = torch.randn((samples_per_batch, coord_dim), device=table_device, dtype=acc_dtype)
 
-    missing = counts <= 0
-    if torch.any(missing):
-        valid_idx = torch.nonzero(counts > 0, as_tuple=False).squeeze(-1)
-        all_idx = torch.arange(num_bins, device=table_device)
-        nearest_valid = valid_idx[
-            torch.argmin(torch.abs(all_idx[:, None] - valid_idx[None, :]), dim=1)
-        ]
-        expected_sq = expected_sq.clone()
-        expected_sq[missing] = expected_sq[nearest_valid[missing]]
+            # Sample from p_{t|0}(·|0) in wrapped coordinates.
+            r_t = diffusion.wrap_displacements(sigma * eps)
+            mu = torch.zeros_like(r_t)
 
-    lambda_table = 1.0 / expected_sq.clamp_min(diffusion.eps)
+            raw_score = d_log_wrapped_normal(
+                r=r_t,
+                mu=mu,
+                sigma=sigma,
+                K=int(getattr(diffusion, "k_wn_score", 9)),
+                T=float(getattr(diffusion, "scale_pos", 1.0)),
+                eps=float(diffusion.eps),
+            ).to(acc_dtype)
+
+            # Match the live KLDM loss reduction: mean over coordinates per node.
+            sq_norm = raw_score.pow(2).mean(dim=1)
+            sq_norm_sum = sq_norm_sum + sq_norm.sum()
+            count += sq_norm.numel()
+
+        expected_sq_norm = sq_norm_sum / max(count, 1)
+        lambda_table[bin_idx] = 1.0 / expected_sq_norm.clamp_min(float(diffusion.eps))
 
     if smooth and num_bins >= 5:
-        log_lambda = torch.log(lambda_table.clamp_min(diffusion.eps))
+        log_lambda = torch.log(lambda_table.clamp_min(float(diffusion.eps)))
         kernel = torch.tensor([1.0, 2.0, 3.0, 2.0, 1.0], device=table_device, dtype=log_lambda.dtype)
         kernel = kernel / kernel.sum()
         x = F.pad(log_lambda[None, None, :], (2, 2), mode="replicate")
         log_lambda = F.conv1d(x, kernel[None, None, :]).squeeze(0).squeeze(0)
         lambda_table = torch.exp(log_lambda)
+
+    if mean_normalize:
+        lambda_table = lambda_table / lambda_table.mean().clamp_min(float(diffusion.eps))
+        lambda_table = lambda_table * float(target_mean_weight)
 
     if clamp_min is not None and clamp_max is not None:
         lambda_table = lambda_table.clamp(min=clamp_min, max=clamp_max)
@@ -114,4 +133,4 @@ def precompute_lambda_time_grid_from_loader(
     elif clamp_max is not None:
         lambda_table = lambda_table.clamp_max(clamp_max)
 
-    return lambda_table
+    return lambda_table.to(dtype=t01_grid.dtype)
