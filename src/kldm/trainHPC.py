@@ -15,7 +15,7 @@ if __package__ in {None, ""}:
 import torch
 
 from kldm.data import CSPTask, resolve_data_root
-from kldm.diffusionModels.TDMdev import TrivialisedDiffusionDev
+from kldm.diffusionModels.trivialized_diffusion import TrivialisedDiffusion
 from kldm.distribution.uniform import sample_uniform
 from kldm.kldm import ModelKLDM
 from kldm.sample_evaluation.sample_evaluation import (
@@ -155,7 +155,7 @@ def validation_step(
             batch=batch,
             t=t_graph,
             lambda_v=1.0,
-            lambda_l=0.5,
+            lambda_l=0.75,
             debug=debug,
         )
 
@@ -193,7 +193,7 @@ def train_epoch(
             batch=batch,
             t=t_graph,
             lambda_v=1.0,
-            lambda_l=0.5,
+            lambda_l=0.75,
             debug=debug,
         )
         loss.backward()
@@ -619,7 +619,7 @@ def train() -> None:
         "batch_size": args.batch_size,
         "lr": args.lr,
         "lambda_v": 1.0,
-        "lambda_l": 0.5,
+        "lambda_l": 0.75,
         "validate_every": args.validate_every,
         "loss_every": args.loss_every,
         "sampling_samples": args.sampling_samples,
@@ -658,7 +658,7 @@ def train() -> None:
     )
     print("constructed train/val/sample loaders", flush=True)
 
-    tdm = TrivialisedDiffusionDev(
+    tdm = TrivialisedDiffusion(
         eps=1e-3,
         n_lambdas=512 if device.type == "cuda" else 128,
         lambda_num_batches=32 if device.type == "cuda" else 8,

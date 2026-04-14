@@ -100,15 +100,14 @@ class TrivialisedDiffusion(nn.Module):
         loader,
         device: torch.device | None = None,
         num_batches: int | None = None,
-        clamp_min: float = 0.2,
-        clamp_max: float = 5.0,
-        smooth: bool = True,
+        clamp_min: float | None = None,
+        clamp_max: float | None = None,
+        smooth: bool = False,
     ) -> torch.Tensor:
         """
-        Precompute λ(t) from the exact wrapped-normal target used in training.
+        Precompute λ(t) using the Torsional Diffusion Eq. (4) kernel-score norm.
 
-        This matches the actual training loss:
-            target = score_target(...)
+        By default this is the raw paper-style estimate with no smoothing or clipping.
         """
         lambda_table = precompute_lambda_time_grid_from_loader(
             diffusion=self,
