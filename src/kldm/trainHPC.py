@@ -15,7 +15,8 @@ if __package__ in {None, ""}:
 import torch
 
 from kldm.data import CSPTask, resolve_data_root
-from kldm.diffusionModels.trivialized_diffusion import TrivialisedDiffusion
+# from kldm.diffusionModels.trivialized_diffusion import TrivialisedDiffusion
+from kldm.diffusionModels.TDMdev import TrivialisedDiffusionDev
 from kldm.distribution.uniform import sample_uniform
 from kldm.kldm import ModelKLDM
 from kldm.sample_evaluation.sample_evaluation import (
@@ -658,10 +659,11 @@ def train() -> None:
     )
     print("constructed train/val/sample loaders", flush=True)
 
-    tdm = TrivialisedDiffusion(
+    tdm = TrivialisedDiffusionDev(
         eps=1e-3,
         n_lambdas=512 if device.type == "cuda" else 128,
         lambda_num_batches=32 if device.type == "cuda" else 8,
+        n_sigmas=2000 if device.type == "cuda" else 512,
     )
     model = ModelKLDM(device=device, diffusion_v=tdm).to(device)
     print("precomputing lambda_v table on real train batches", flush=True)
@@ -774,8 +776,28 @@ def train() -> None:
             if not should_record_loss and not should_run_sampling:
                 continue
 
+            phase_bits = []
+            if should_record_loss:
+                phase_bits.append("loss-validation")
+            if should_run_sampling:
+                phase_bits.append("sampling")
+            print(
+                f"epoch={epoch:04d} entering {' + '.join(phase_bits)}",
+                flush=True,
+            )
+
             with ema.average_parameters(model):
+                if should_record_loss:
+                    print(
+                        f"epoch={epoch:04d} starting validation loss pass",
+                        flush=True,
+                    )
                 val_metrics = evaluate_loss(model=model, loader=val_loader, device=device, debug=args.dev)
+                if should_record_loss:
+                    print(
+                        f"epoch={epoch:04d} finished validation loss pass",
+                        flush=True,
+                    )
 
             #Add metric here, ground truth vs predicted.  ASE libary.
             if should_record_loss:
@@ -874,12 +896,24 @@ def train() -> None:
                         "val_loss_l",
                     ],
                 )
+                print(
+                    f"epoch={epoch:04d} writing training metrics plot",
+                    flush=True,
+                )
                 maybe_plot_training_metrics(history, training_plot_path)
+                print(
+                    f"epoch={epoch:04d} finished training metrics plot",
+                    flush=True,
+                )
 
             if not should_run_sampling:
                 continue
 
             checkpoint_path = checkpoints_dir / f"checkpoint_epoch_{epoch}.pt"
+            print(
+                f"epoch={epoch:04d} exporting checkpoint",
+                flush=True,
+            )
             export_model_checkpoint(
                 model=model,
                 optimizer=optimizer,
@@ -890,12 +924,20 @@ def train() -> None:
             )
 
             with ema.average_parameters(model):
+                print(
+                    f"epoch={epoch:04d} starting sampling evaluation",
+                    flush=True,
+                )
                 sampling_metrics = run_sampling_evaluation(
                     model=model,
                     loader=sample_loader,
                     device=device,
                     num_samples=config["sampling_samples"],
                     n_steps=config["sampling_steps"],
+                )
+                print(
+                    f"epoch={epoch:04d} finished sampling evaluation",
+                    flush=True,
                 )
             sampling_history.append({"epoch": epoch, **sampling_metrics})
 

@@ -33,9 +33,9 @@ def precompute_lambda_time_grid_from_loader(
     samples_per_batch: int = 2048,
     coord_dim: int = 3,
     clamp_min: float | None = None,
-    clamp_max: float | None = None,
-    smooth: bool = False,
-    mean_normalize: bool = False,
+    clamp_max: float = 3,
+    smooth: bool = True,
+    mean_normalize: bool = True,
     target_mean_weight: float = 1.0,
     device: torch.device | None = None,
 ) -> torch.Tensor:

@@ -23,7 +23,15 @@ from kldm.scoreNetwork.utils import scatter_center
 #######       t = tf * t01.        [Appendix T = 2]         ####
 ################################################################
 
-
+############################################################
+##### Prøv at sample tid fra en log distrubution,
+##### Then recompute dt on the fly, since its different on the time grid, since its not uniform
+#####
+##### Start med 2pi scaling
+##### Herefter prøv at scale epsilon, W(0, sigmaI) hvor sigma = sqrt(2pi).
+##### Add to metrics, compute error metric on lattice.
+##### Use EMA version to validation metrics.
+#############################################################
 
 class TrivialisedDiffusion(nn.Module):
     """
