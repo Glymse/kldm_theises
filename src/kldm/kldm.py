@@ -268,13 +268,12 @@ class ModelKLDM(nn.Module):
         num_graphs = batch.num_graphs
 
         # Algorithm 3 priors:
-        # v_T ~ N_v(0, I) with zero-net translation
-        # f_T is kept in the centered unit chart internally again.
-        # l_T ~ N(0, I)
-        # Keep the Algorithm 3 prior in the same native unit-period velocity scaling
-        # as forward_sample(...) and reverse_exp_step(...).
-        v_t = scatter_center(torch.randn_like(batch.pos), index=node_index)
-        f_t = self.tdm.wrap_displacements(torch.rand_like(batch.pos))
+        # let the active TDM own the position/velocity prior if it exposes one.
+        if hasattr(self.tdm, "sample_prior"):
+            f_t, v_t = self.tdm.sample_prior(node_index)
+        else:
+            v_t = scatter_center(torch.randn_like(batch.pos), index=node_index)
+            f_t = self.tdm.wrap_displacements(torch.rand_like(batch.pos))
         l_t = torch.randn_like(batch.l)
         a_t = batch.h  # CSP conditioning
 

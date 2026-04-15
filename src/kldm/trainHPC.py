@@ -806,11 +806,11 @@ def train() -> None:
                         "epoch": epoch,
                         "train_loss": train_metrics["loss"],
                         "train_loss_v": train_metrics["loss_v"],
-                        "train_raw_loss_v": train_metrics["raw_loss_v"],
+                        "train_raw_loss_v": train_metrics.get("raw_loss_v", float("nan")),
                         "train_loss_l": train_metrics["loss_l"],
                         "val_loss": val_metrics["loss"],
                         "val_loss_v": val_metrics["loss_v"],
-                        "val_raw_loss_v": val_metrics["raw_loss_v"],
+                        "val_raw_loss_v": val_metrics.get("raw_loss_v", float("nan")),
                         "val_loss_l": val_metrics["loss_l"],
                     }
                 )
