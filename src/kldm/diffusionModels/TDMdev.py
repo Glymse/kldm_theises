@@ -38,9 +38,10 @@ class TrivialisedDiffusionDev(nn.Module):
         self.eps = float(eps)
         self.time_scaling_T = 2.0
         self.scale_pos = 1.0
-        # Native [0,1] variant with a reduced velocity-noise scale chosen to
-        # mimic a less noisy fractional chart without reintroducing 2π states.
-        self.velocity_epsilon_std = 1.0 / (2.0 * math.pi)
+        # Native [0,1] variant with a reduced unit-chart noise scale.
+        # Keep a shared scale for both velocity and wrapped displacement noise.
+        self.vel_scale = 1.0 / (2.0 * math.pi)
+        self.velocity_epsilon_std = self.vel_scale
         self.k_wn_score = int(k_wn_score)
         self.n_lambdas = int(n_lambdas)
         self.lambda_num_batches = int(lambda_num_batches)
@@ -56,7 +57,7 @@ class TrivialisedDiffusionDev(nn.Module):
         print(
             "TDMdev sigma_norm precompute start "
             f"n_sigmas={n_sigmas} k_wn_score={self.k_wn_score} "
-            f"scale_pos={self.scale_pos:.6f} velocity_epsilon_std={self.velocity_epsilon_std:.6f}",
+            f"scale_pos={self.scale_pos:.6f} vel_scale={self.vel_scale:.6f}",
             flush=True,
         )
         sigma_norm_values = sigma_norm(
@@ -90,7 +91,7 @@ class TrivialisedDiffusionDev(nn.Module):
         return torch.sqrt(torch.clamp(1.0 - torch.exp(-2.0 * t), min=self.eps))
 
     def gaussian_velocity_sigma(self, t: torch.Tensor) -> torch.Tensor:
-        return self.velocity_epsilon_std * self.gaussian_velocity_sigma_base(t)
+        return self.vel_scale * self.gaussian_velocity_sigma_base(t)
 
     def _prefactor_t(self, t: torch.Tensor) -> torch.Tensor:
         return (1.0 - torch.exp(-t)) / (1.0 + torch.exp(-t))
@@ -106,9 +107,8 @@ class TrivialisedDiffusionDev(nn.Module):
         return coeff * (v_t + v0)
 
     def wrapped_gaussian_sigma_r_t(self, t: torch.Tensor) -> torch.Tensor:
-        return torch.sqrt(
-            torch.clamp(2.0 * t + 8.0 / (1.0 + torch.exp(t)) - 4.0, min=self.eps)
-        )
+        base_var = 2.0 * t + 8.0 / (1.0 + torch.exp(t)) - 4.0
+        return self.vel_scale * torch.sqrt(torch.clamp(base_var, min=self.eps))
 
     def lambda_v(self, t01: torch.Tensor) -> torch.Tensor:
         return torch.ones_like(t01, dtype=self._lambda_v_table.dtype, device=t01.device)
@@ -137,7 +137,7 @@ class TrivialisedDiffusionDev(nn.Module):
     def sample_velocity_epsilon(self, ref: torch.Tensor, index: torch.Tensor) -> torch.Tensor:
         eps = torch.randn_like(ref)
         eps = scatter_center(eps, index=index)
-        return self.velocity_epsilon_std * eps
+        return self.vel_scale * eps
 
     @torch.no_grad()
     def sample_prior(self, index: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -164,7 +164,7 @@ class TrivialisedDiffusionDev(nn.Module):
         if epsilon_v is None:
             epsilon_v = self.sample_velocity_epsilon(v0, index=index)
         else:
-            epsilon_v = self.velocity_epsilon_std * scatter_center(epsilon_v, index=index)
+            epsilon_v = self.vel_scale * scatter_center(epsilon_v, index=index)
 
         mean_coeff_t = self._match_dims(self.gaussian_velocity_mean_coeff(t), v0)
         sigma_v_base_t = self._match_dims(self.gaussian_velocity_sigma_base(t), v0)
