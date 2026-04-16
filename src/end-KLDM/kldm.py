@@ -6,19 +6,18 @@ import sys
 from typing import Optional
 
 if __package__ in {None, ""}:
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 from torch_geometric.data import Data, Batch
 
-from kldm.data import CSPTask
-from kldm.diffusionModels.continuous import ContinuousVPDiffusion
-# from kldm.diffusionModels.trivialized_diffusion import TrivialisedDiffusion as TDM
-from kldm.diffusionModels.TDMdev import TrivialisedDiffusionDev as TDM
-from kldm.scoreNetwork.scoreNetwork import CSPVNet
-from kldm.scoreNetwork.utils import scatter_center
+from data import CSPTask
+from diffusionModels.continuous import ContinuousVPDiffusion
+from diffusionModels.trivialized_diffusion import TrivialisedDiffusion as TDM
+from scoreNetwork.scoreNetwork import CSPVNet
+from scoreNetwork.utils import scatter_center
 
 
 logger = logging.getLogger(__name__)
@@ -61,10 +60,61 @@ class ModelKLDM(nn.Module):
             lambda_num_batches=32 if self.device.type == "cuda" else 8,
         )
         self.diffusion_l = diffusion_l or ContinuousVPDiffusion(eps=eps)
+        self.pos_gain = nn.Parameter(torch.tensor(1.0))
+        self.vel_gain = nn.Parameter(torch.tensor(1.0))
+        self.lat_gain = nn.Parameter(torch.tensor(1.0))
         self.eps = eps
         self.task_type: Optional[str] = None
         self._cached_sampling_checkpoint_path: Optional[str] = None
-        self.__dict__["_cached_sampling_score_network_obj"] = None
+        self.__dict__["_cached_sampling_model_obj"] = None
+
+    def sample_graph_times(
+        self,
+        num_graphs: int,
+        device: torch.device | None = None,
+    ) -> torch.Tensor:
+        active_device = device or next(self.parameters()).device
+        lower_bound = max(float(self.diffusion_l.eps), float(self.eps))
+        return self.tdm.sample_t01(
+            size=(num_graphs, 1),
+            device=active_device,
+            lb=lower_bound,
+        )
+
+    def sampling_t01_schedule(
+        self,
+        n_steps: int,
+        device: torch.device | None = None,
+    ) -> torch.Tensor:
+        active_device = device or next(self.parameters()).device
+        lower_bound = max(float(self.diffusion_l.eps), float(self.eps))
+        return self.tdm.sampling_t01_schedule(
+            n_steps=n_steps,
+            device=active_device,
+            lb=lower_bound,
+        )
+
+    def _network_forward(
+        self,
+        score_network: CSPVNet,
+        *,
+        t: torch.Tensor,
+        pos: torch.Tensor,
+        v: torch.Tensor,
+        h: torch.Tensor,
+        l: torch.Tensor,
+        node_index: torch.Tensor,
+        edge_node_index: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        return score_network(
+            t=t,
+            pos=self.pos_gain.to(device=pos.device, dtype=pos.dtype) * pos,
+            v=self.vel_gain.to(device=v.device, dtype=v.dtype) * v,
+            h=h,
+            l=self.lat_gain.to(device=l.device, dtype=l.dtype) * l,
+            node_index=node_index,
+            edge_node_index=edge_node_index,
+        )
 
     # ============================================================================
     # ALGORITHM 1
@@ -158,7 +208,8 @@ class ModelKLDM(nn.Module):
         a_t = batch.h
 
         # Network prediction, KLDM Alg. 2
-        preds = self.score_network(
+        preds = self._network_forward(
+            self.score_network,
             t=t_graph,
             pos=f_t,
             v=v_t,
@@ -222,31 +273,30 @@ class ModelKLDM(nn.Module):
     # ============================================================================
     # ALGORITHM 3 - Sampling algorithm
     # ============================================================================
-    def _load_csp_score_network(self, checkpoint_path: str = "artifacts/csp_final_model.pt") -> CSPVNet:
+    def _load_sampling_model(self, checkpoint_path: str = "artifacts/csp_final_model.pt") -> "ModelKLDM":
         device = next(self.parameters()).device
-        cached_score_network = self.__dict__.get("_cached_sampling_score_network_obj")
+        cached_model = self.__dict__.get("_cached_sampling_model_obj")
         if (
-            cached_score_network is not None
+            cached_model is not None
             and self._cached_sampling_checkpoint_path == checkpoint_path
         ):
-            return cached_score_network
+            return cached_model
 
         checkpoint = torch.load(checkpoint_path, map_location=device)
         source_state_dict = checkpoint.get("ema_model_state_dict") or checkpoint["model_state_dict"]
         cleaned_state_dict = {
             key: value
             for key, value in source_state_dict.items()
-            if not key.startswith("_cached_sampling_score_network")
+            if not key.startswith("_cached_sampling_model")
             and not key.endswith("._lambda_v_table")
         }
         model = ModelKLDM(device=device).to(device)
         model.load_state_dict(cleaned_state_dict, strict=False)
-        score_network = model.score_network.to(device)
-        score_network.eval()
+        model.eval()
 
         self._cached_sampling_checkpoint_path = checkpoint_path
-        self.__dict__["_cached_sampling_score_network_obj"] = score_network
-        return score_network
+        self.__dict__["_cached_sampling_model_obj"] = model
+        return model
 
     def sample_CSP_algorithm3(
         self,
@@ -267,34 +317,40 @@ class ModelKLDM(nn.Module):
         edge_node_index = batch.edge_node_index
         num_graphs = batch.num_graphs
 
+        sampling_model = self if checkpoint_path is None else self._load_sampling_model(checkpoint_path)
+        sampling_tdm = sampling_model.tdm
+        sampling_diffusion_l = sampling_model.diffusion_l
+
         # Algorithm 3 priors:
         # let the active TDM own the position/velocity prior if it exposes one.
-        if hasattr(self.tdm, "sample_prior"):
-            f_t, v_t = self.tdm.sample_prior(node_index)
+        if hasattr(sampling_tdm, "sample_prior"):
+            f_t, v_t = sampling_tdm.sample_prior(node_index)
         else:
             v_t = scatter_center(torch.randn_like(batch.pos), index=node_index)
-            f_t = self.tdm.wrap_displacements(torch.rand_like(batch.pos))
+            f_t = sampling_tdm.wrap_displacements(torch.rand_like(batch.pos))
         l_t = torch.randn_like(batch.l)
         a_t = batch.h  # CSP conditioning
 
         if checkpoint_path is None:
-            score_network = self.score_network
+            score_network = sampling_model.score_network
             restore_training = score_network.training
             score_network.eval()
         else:
-            score_network = self._load_csp_score_network(checkpoint_path)
+            score_network = sampling_model.score_network
             restore_training = False
 
-        dt = 1.0 / n_steps
+        t_schedule = sampling_model.sampling_t01_schedule(n_steps=n_steps, device=device)
 
         try:
             with torch.no_grad():
-                for n in range(1, n_steps + 1):
-                    t_scalar = 1.0 - (n - 1) * dt
-                    t_graph = torch.full((num_graphs, 1), t_scalar, device=device)
+                for n in range(n_steps):
+                    t_scalar = float(t_schedule[n].item())
+                    dt = float((t_schedule[n] - t_schedule[n + 1]).item())
+                    t_graph = torch.full((num_graphs, 1), t_scalar, device=device, dtype=batch.pos.dtype)
                     t_node = t_graph[node_index].squeeze(-1)
 
-                    preds = score_network(
+                    preds = sampling_model._network_forward(
+                        score_network,
                         t=t_graph,
                         pos=f_t,
                         v=v_t,
@@ -311,24 +367,24 @@ class ModelKLDM(nn.Module):
                     # Full velocity score:
                     # s_v(x_t, t) = ((1 - exp(-t)) / (1 + exp(-t))) * s_f_theta(x_t, t) - v_t / sigma_v(t)^2
 
-                    score_v = self.tdm.construct_velocity_score(
+                    score_v = sampling_tdm.construct_velocity_score(
                         t=t_node,
                         v_t=v_t,
                         pred_v=pred_v,
                     )
 
                     # Update v and f with exponential integrator
-                    f_t, v_t = self.tdm.reverse_exp_step(
+                    f_t, v_t = sampling_tdm.reverse_exp_step(
                         f_t=f_t,
                         v_t=v_t,
                         score_v=score_v,
                         index=node_index,
-                        dt=dt, #This is scaled internally.
+                        dt=dt,
                     )
 
                     # KLDM-epsilon lattice branch:
                     # Algorithm 3 does EM on l using the score corresponding to out_l
-                    l_t = self.diffusion_l.reverse_em_step_from_eps(
+                    l_t = sampling_diffusion_l.reverse_em_step_from_eps(
                         t=t_graph.squeeze(-1),
                         x_t=l_t,
                         pred_eps=pred_l,
@@ -336,7 +392,7 @@ class ModelKLDM(nn.Module):
                     )
 
                 # For KLDM-epsilon Algorithm 3, return the final sampled l_N directly
-                return self.tdm.wrap_positions(f_t), v_t, l_t, a_t
+                return sampling_tdm.wrap_positions(f_t), v_t, l_t, a_t
         finally:
             if checkpoint_path is None and restore_training:
                 score_network.train()
@@ -345,7 +401,7 @@ class ModelKLDM(nn.Module):
 def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    from kldm.data import resolve_data_root
+    from data import resolve_data_root
     root = resolve_data_root()
 
     loader = CSPTask().dataloader(
