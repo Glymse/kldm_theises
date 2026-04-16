@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import argparse
 import csv
-import itertools
 from contextlib import contextmanager
 from pathlib import Path
+import re
 import signal
 import sys
 from typing import Any
@@ -140,6 +140,7 @@ def validation_step(
     model: ModelKLDM,
     batch,
     device: torch.device,
+    lambda_l: float,
     debug: bool = False,
 ) -> dict[str, float]:
     model.eval()
@@ -156,7 +157,7 @@ def validation_step(
             batch=batch,
             t=t_graph,
             lambda_v=1.0,
-            lambda_l=0.75,
+            lambda_l=lambda_l,
             debug=debug,
         )
 
@@ -172,17 +173,19 @@ def train_epoch(
     optimizer: torch.optim.Optimizer,
     ema: ExponentialMovingAverage,
     device: torch.device,
+    lambda_l: float,
     debug: bool = False,
 ) -> dict[str, float]:
     model.train()
     running: dict[str, float] = {}
-    num_batches = 0
+    num_graphs_total = 0.0
 
     for batch in loader:
         if STOP_REQUESTED:
             break
 
         batch = batch.to(device)
+        batch_weight = float(batch.num_graphs)
         t_graph = sample_uniform(
             lb=model.diffusion_l.eps,
             size=(batch.num_graphs, 1),
@@ -194,7 +197,7 @@ def train_epoch(
             batch=batch,
             t=t_graph,
             lambda_v=1.0,
-            lambda_l=0.75,
+            lambda_l=lambda_l,
             debug=debug,
         )
         loss.backward()
@@ -227,14 +230,14 @@ def train_epoch(
         ema.update(model)
 
         for key, value in metrics.items():
-            running[key] = running.get(key, 0.0) + float(value)
-        num_batches += 1
+            running[key] = running.get(key, 0.0) + float(value) * batch_weight
+        num_graphs_total += batch_weight
 
-    if num_batches == 0:
+    if num_graphs_total <= 0.0:
         raise RuntimeError("Training loader is empty or interrupted before any batch was processed.")
 
     for key in running:
-        running[key] /= num_batches
+        running[key] /= num_graphs_total
     return running
 
 
@@ -242,22 +245,35 @@ def evaluate_loss(
     model: ModelKLDM,
     loader,
     device: torch.device,
+    lambda_l: float,
+    max_graphs: int | None = None,
     debug: bool = False,
 ) -> dict[str, float]:
     totals: dict[str, float] = {}
-    num_batches = 0
+    num_graphs_total = 0.0
+    num_graphs_seen = 0.0
 
     for batch in loader:
-        metrics = validation_step(model=model, batch=batch, device=device, debug=debug)
+        metrics = validation_step(
+            model=model,
+            batch=batch,
+            device=device,
+            lambda_l=lambda_l,
+            debug=debug,
+        )
+        batch_weight = float(batch.num_graphs)
         for key, value in metrics.items():
-            totals[key] = totals.get(key, 0.0) + value
-        num_batches += 1
+            totals[key] = totals.get(key, 0.0) + value * batch_weight
+        num_graphs_total += batch_weight
+        num_graphs_seen += batch_weight
+        if max_graphs is not None and num_graphs_seen >= max_graphs:
+            break
 
-    if num_batches == 0:
+    if num_graphs_total <= 0.0:
         raise RuntimeError("Validation loader is empty; cannot compute epoch metrics.")
 
     for key in totals:
-        totals[key] /= num_batches
+        totals[key] /= num_graphs_total
     return totals
 
 
@@ -309,10 +325,10 @@ def maybe_plot_training_metrics(rows: list[dict[str, Any]], output_path: Path) -
 
     fig, axes = plt.subplots(3, 1, figsize=(11, 13), sharex=True)
 
-    axes[0].plot(epochs, [row["train_loss"] for row in rows], marker="o", label="Train total loss")
-    axes[0].plot(epochs, [row["val_loss"] for row in rows], marker="o", label="Val total loss")
+    axes[0].plot(epochs, [row["train_loss_weighted"] for row in rows], marker="o", label="Train loss_weighted")
+    axes[0].plot(epochs, [row["val_loss_weighted"] for row in rows], marker="o", label="Val loss_weighted")
     axes[0].set_ylabel("Loss")
-    axes[0].set_title("Algorithm 2 total loss")
+    axes[0].set_title("Weighted loss")
     axes[0].grid(True, alpha=0.3)
     axes[0].legend()
 
@@ -341,70 +357,35 @@ def maybe_plot_sampling_metrics(rows: list[dict[str, Any]], output_path: Path) -
     if plt is None or not rows:
         return None
 
+    rows = [row for row in rows if row.get("valid") == row.get("valid")]
+    if not rows:
+        return None
+
     output_path.parent.mkdir(parents=True, exist_ok=True)
     epochs = [int(row["epoch"]) for row in rows]
 
-    fig, axes = plt.subplots(4, 1, figsize=(11, 16), sharex=True)
+    fig, axes = plt.subplots(3, 1, figsize=(11, 13), sharex=True)
 
-    axes[0].plot(epochs, [row["valid_percentage"] for row in rows], marker="o", label="Valid %")
-    axes[0].plot(epochs, [row["match_rate_percentage"] for row in rows], marker="o", label="Match rate %")
-    axes[0].set_ylabel("Percent")
-    axes[0].set_title("Sample validity and match rate")
+    axes[0].plot(epochs, [row["valid"] for row in rows], marker="o", label="valid")
+    axes[0].plot(epochs, [row["match_rate"] for row in rows], marker="o", label="match_rate")
+    axes[0].set_ylabel("Fraction")
+    axes[0].set_title("Validation sampling metrics")
     axes[0].grid(True, alpha=0.3)
     axes[0].legend()
 
-    axes[1].plot(epochs, [row["mean_rmse"] for row in rows], marker="o", label="Mean RMSE")
+    axes[1].plot(epochs, [row["rmse"] for row in rows], marker="o", label="rmse")
     axes[1].set_ylabel("RMSE")
-    axes[1].set_title("Sample reconstruction mean RMSE")
+    axes[1].set_title("Validation RMSE")
     axes[1].grid(True, alpha=0.3)
     axes[1].legend()
 
-    axes[2].plot(
-        epochs,
-        [row["oracle_lattice_valid_percentage"] for row in rows],
-        marker="o",
-        label="Oracle lattice valid %",
-    )
-    axes[2].plot(
-        epochs,
-        [row["oracle_lattice_match_rate_percentage"] for row in rows],
-        marker="o",
-        label="Oracle lattice match rate %",
-    )
-    axes[2].plot(
-        epochs,
-        [row["oracle_coordinate_valid_percentage"] for row in rows],
-        marker="o",
-        label="Oracle coordinate valid %",
-    )
-    axes[2].plot(
-        epochs,
-        [row["oracle_coordinate_match_rate_percentage"] for row in rows],
-        marker="o",
-        label="Oracle coordinate match rate %",
-    )
-    axes[2].set_ylabel("Percent")
-    axes[2].set_title("Oracle validity and match rate")
+    axes[2].plot(epochs, [row["val_loss_weighted"] for row in rows], marker="o", label="val/loss_weighted")
+    axes[2].plot(epochs, [row["val_loss_v"] for row in rows], marker="o", label="val/loss_v")
+    axes[2].plot(epochs, [row["val_loss_l"] for row in rows], marker="o", label="val/loss_l")
+    axes[2].set_ylabel("Loss")
+    axes[2].set_title("Validation losses at checkpoint epochs")
     axes[2].grid(True, alpha=0.3)
     axes[2].legend()
-
-    axes[3].plot(
-        epochs,
-        [row["oracle_lattice_mean_rmse"] for row in rows],
-        marker="o",
-        label="Oracle lattice mean RMSE",
-    )
-    axes[3].plot(
-        epochs,
-        [row["oracle_coordinate_mean_rmse"] for row in rows],
-        marker="o",
-        label="Oracle coordinate mean RMSE",
-    )
-    axes[3].set_xlabel("Epoch")
-    axes[3].set_ylabel("RMSE")
-    axes[3].set_title("Oracle mean RMSE")
-    axes[3].grid(True, alpha=0.3)
-    axes[3].legend()
 
     fig.tight_layout()
     fig.savefig(output_path, dpi=200)
@@ -416,18 +397,16 @@ def run_sampling_evaluation(
     model: ModelKLDM,
     loader,
     device: torch.device,
-    num_samples: int,
     n_steps: int,
+    max_graphs: int | None = None,
 ) -> dict[str, float | int]:
     reconstruction_results = []
-    oracle_lattice_results = []
-    oracle_coordinate_results = []
-    template_iter = itertools.cycle(loader)
+    num_graphs_seen = 0
 
     model.eval()
 
-    for _ in range(num_samples):
-        batch = next(template_iter).to(device)
+    for batch in loader:
+        batch = batch.to(device)
 
         with torch.no_grad():
             pos_t, v_t, l_t, h_t = model.sample_CSP_algorithm3(
@@ -435,76 +414,52 @@ def run_sampling_evaluation(
                 batch=batch,
             )
 
-        result = evaluate_csp_reconstruction(
-            pred_f=pos_t,
-            pred_l=l_t[0],
-            pred_a=h_t,
-            target_f=batch.pos,
-            target_l=batch.l[0],
-            target_a=batch.h,
-        )
-        oracle_lattice_result = evaluate_csp_reconstruction(
-            pred_f=pos_t,
-            pred_l=batch.l[0],
-            pred_a=h_t,
-            target_f=batch.pos,
-            target_l=batch.l[0],
-            target_a=batch.h,
-        )
-        oracle_coordinate_result = evaluate_csp_reconstruction(
-            pred_f=batch.pos,
-            pred_l=l_t[0],
-            pred_a=h_t,
-            target_f=batch.pos,
-            target_l=batch.l[0],
-            target_a=batch.h,
-        )
+        ptr = batch.ptr.tolist()
+        for graph_idx, (start, end) in enumerate(zip(ptr[:-1], ptr[1:])):
+            reconstruction_results.append(
+                evaluate_csp_reconstruction(
+                    pred_f=pos_t[start:end],
+                    pred_l=l_t[graph_idx],
+                    pred_a=h_t[start:end],
+                    target_f=batch.pos[start:end],
+                    target_l=batch.l[graph_idx],
+                    target_a=batch.h[start:end],
+                )
+            )
+            num_graphs_seen += 1
+            if max_graphs is not None and num_graphs_seen >= max_graphs:
+                break
+        if max_graphs is not None and num_graphs_seen >= max_graphs:
+            break
 
-        reconstruction_results.append(result)
-        oracle_lattice_results.append(oracle_lattice_result)
-        oracle_coordinate_results.append(oracle_coordinate_result)
+    if not reconstruction_results:
+        raise RuntimeError("Validation sampling produced no reconstruction results.")
 
     summary = aggregate_csp_reconstruction_metrics(reconstruction_results)
-    oracle_lattice_summary = aggregate_csp_reconstruction_metrics(oracle_lattice_results)
-    oracle_coordinate_summary = aggregate_csp_reconstruction_metrics(oracle_coordinate_results)
-
-    def count_valid(results) -> int:
-        return sum(1 for r in results if r.valid)
-
-    def count_match(results) -> int:
-        return sum(1 for r in results if r.match)
-
-    def percentage(count: int) -> float:
-        return 100.0 * float(count) / float(num_samples)
 
     def nan_if_none(x: float | None) -> float:
         return float("nan") if x is None else float(x)
 
-    valid_true_count = count_valid(reconstruction_results)
-    match_true_count = count_match(reconstruction_results)
-    oracle_lattice_valid_true_count = count_valid(oracle_lattice_results)
-    oracle_lattice_match_true_count = count_match(oracle_lattice_results)
-    oracle_coordinate_valid_true_count = count_valid(oracle_coordinate_results)
-    oracle_coordinate_match_true_count = count_match(oracle_coordinate_results)
-
     return {
-        "num_samples": num_samples,
-        "valid_true_count": valid_true_count,
-        "valid_percentage": percentage(valid_true_count),
-        "match_true_count": match_true_count,
-        "match_rate_percentage": percentage(match_true_count),
-        "mean_rmse": nan_if_none(summary["rmse"]),
-        "oracle_lattice_valid_true_count": oracle_lattice_valid_true_count,
-        "oracle_lattice_valid_percentage": percentage(oracle_lattice_valid_true_count),
-        "oracle_lattice_match_true_count": oracle_lattice_match_true_count,
-        "oracle_lattice_match_rate_percentage": percentage(oracle_lattice_match_true_count),
-        "oracle_lattice_mean_rmse": nan_if_none(oracle_lattice_summary["rmse"]),
-        "oracle_coordinate_valid_true_count": oracle_coordinate_valid_true_count,
-        "oracle_coordinate_valid_percentage": percentage(oracle_coordinate_valid_true_count),
-        "oracle_coordinate_match_true_count": oracle_coordinate_match_true_count,
-        "oracle_coordinate_match_rate_percentage": percentage(oracle_coordinate_match_true_count),
-        "oracle_coordinate_mean_rmse": nan_if_none(oracle_coordinate_summary["rmse"]),
+        "num_samples": int(summary["num_samples"]),
+        "valid": nan_if_none(summary["valid"]),
+        "match_rate": nan_if_none(summary["match_rate"]),
+        "rmse": nan_if_none(summary["rmse"]),
     }
+
+
+def prune_old_checkpoints(checkpoints_dir: Path, keep_last: int = 2) -> None:
+    epoch_pattern = re.compile(r"^checkpoint_epoch_(\d+)$")
+    checkpoint_paths = []
+    for path in checkpoints_dir.glob("checkpoint_epoch_*.pt"):
+        match = epoch_pattern.match(path.stem)
+        if match is None:
+            continue
+        checkpoint_paths.append((int(match.group(1)), path))
+    checkpoint_paths.sort(key=lambda item: item[0])
+    while len(checkpoint_paths) > keep_last:
+        checkpoint_paths[0][1].unlink(missing_ok=True)
+        checkpoint_paths.pop(0)
 
 
 def maybe_resume(
@@ -556,14 +511,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--loss-every",
         type=int,
-        default=50,
-        help="Record and plot train/val losses every N epochs.",
+        default=1,
+        help="Deprecated. Train losses are recorded every epoch.",
     )
     parser.add_argument(
         "--sampling-samples",
         type=int,
         default=25,
-        help="Number of CSP samples to generate at each validation epoch.",
+        help="Deprecated. Facit-style validation sampling now uses the validation subset instead.",
     )
     parser.add_argument(
         "--sampling-steps",
@@ -620,11 +575,12 @@ def train() -> None:
         "batch_size": args.batch_size,
         "lr": args.lr,
         "lambda_v": 1.0,
-        "lambda_l": 0.75,
+        "lambda_l": 1.0,
         "validate_every": args.validate_every,
         "loss_every": args.loss_every,
         "sampling_samples": args.sampling_samples,
         "sampling_steps": args.sampling_steps,
+        "val_subset_graphs": 1024,
         "load_from_checkpoint": args.load_from_checkpoint,
         "max_epochs": args.max_epochs,
         "ema_decay": args.ema_decay,
@@ -650,14 +606,7 @@ def train() -> None:
         download=True,
     )
 
-    sample_loader = CSPTask().dataloader(
-        root=root,
-        split="val",
-        batch_size=1,
-        shuffle=False,
-        download=True,
-    )
-    print("constructed train/val/sample loaders", flush=True)
+    print("constructed train/val loaders", flush=True)
 
     tdm = TrivialisedDiffusionDev(
         eps=1e-3,
@@ -666,7 +615,7 @@ def train() -> None:
         n_sigmas=2000 if device.type == "cuda" else 512,
     )
     model = ModelKLDM(device=device, diffusion_v=tdm).to(device)
-    print("precomputing lambda_v table on real train batches", flush=True)
+    print("precomputing TDM tables on real train batches", flush=True)
     model.tdm.precompute_lambda_v_table_from_loader(
         train_loader,
         device=device,
@@ -718,9 +667,6 @@ def train() -> None:
     wandb.define_metric("epoch")
     wandb.define_metric("train/*", step_metric="epoch")
     wandb.define_metric("val/*", step_metric="epoch")
-    wandb.define_metric("sampling/*", step_metric="epoch")
-    wandb.define_metric("oracle_lattice/*", step_metric="epoch")
-    wandb.define_metric("oracle_coordinate/*", step_metric="epoch")
 
     artifacts_dir = Path("artifacts") / "HPC"
     checkpoints_dir = artifacts_dir / "checkpoints"
@@ -730,7 +676,6 @@ def train() -> None:
     sampling_plot_path = artifacts_dir / "sampling_metrics.png"
 
     history: list[dict[str, Any]] = []
-    sampling_history: list[dict[str, Any]] = []
     epoch = start_epoch
 
     try:
@@ -750,13 +695,28 @@ def train() -> None:
                 optimizer=optimizer,
                 ema=ema,
                 device=device,
+                lambda_l=config["lambda_l"],
                 debug=args.dev,
             )
+
+            row = {
+                "epoch": epoch,
+                "train_loss_weighted": train_metrics["loss"],
+                "train_loss_v": train_metrics["loss_v"],
+                "train_loss_l": train_metrics["loss_l"],
+                "val_loss_weighted": float("nan"),
+                "val_loss_v": float("nan"),
+                "val_loss_l": float("nan"),
+                "valid": float("nan"),
+                "match_rate": float("nan"),
+                "rmse": float("nan"),
+            }
+            history.append(row)
 
             if args.dev:
                 print(
                     f"epoch={epoch:04d} "
-                    f"train_loss={train_metrics['loss']:.6f} "
+                    f"train_loss_weighted={train_metrics['loss']:.6f} "
                     f"(v={train_metrics['loss_v']:.6f}, raw_v={train_metrics['raw_loss_v']:.6f}, l={train_metrics['loss_l']:.6f}) "
                     f"target_v_abs={train_metrics['target_v_abs_mean']:.6f} "
                     f"pred_v_abs={train_metrics['pred_v_abs_mean']:.6f} "
@@ -766,148 +726,88 @@ def train() -> None:
             else:
                 print(
                     f"epoch={epoch:04d} "
-                    f"train_loss={train_metrics['loss']:.6f} "
-                    f"(v={train_metrics['loss_v']:.6f}, l={train_metrics['loss_l']:.6f})"
+                    f"train_loss_weighted={train_metrics['loss']:.6f} "
+                    f"(loss_v={train_metrics['loss_v']:.6f}, loss_l={train_metrics['loss_l']:.6f})"
                 )
 
-            should_record_loss = (epoch % config["loss_every"] == 0)
             should_run_sampling = (epoch % config["validate_every"] == 0)
 
-            if not should_record_loss and not should_run_sampling:
+            train_log_payload = {
+                "epoch": epoch,
+                "train/loss_weighted": train_metrics["loss"],
+                "train/loss_v": train_metrics["loss_v"],
+                "train/loss_l": train_metrics["loss_l"],
+            }
+            if args.dev:
+                train_log_payload.update(
+                    {
+                        "train/raw_loss_v": train_metrics["raw_loss_v"],
+                        "train/target_v_abs_mean": train_metrics["target_v_abs_mean"],
+                        "train/target_v_norm_mean": train_metrics["target_v_norm_mean"],
+                        "train/pred_v_abs_mean": train_metrics["pred_v_abs_mean"],
+                        "train/pred_v_norm_mean": train_metrics["pred_v_norm_mean"],
+                        "train/lambda_v_mean": train_metrics["lambda_v_mean"],
+                        "train/lambda_v_min": train_metrics["lambda_v_min"],
+                        "train/lambda_v_max": train_metrics["lambda_v_max"],
+                        "train/lambda_v_effective": train_metrics["lambda_v_effective"],
+                        "train/v_t_abs_mean": train_metrics["v_t_abs_mean"],
+                        "train/f_t_abs_mean": train_metrics["f_t_abs_mean"],
+                        "train/r_t_abs_mean": train_metrics["r_t_abs_mean"],
+                        "train/score_v_abs_mean": train_metrics["score_v_abs_mean"],
+                        "train/pred_l_abs_mean": train_metrics["pred_l_abs_mean"],
+                        "train/target_l_abs_mean": train_metrics["target_l_abs_mean"],
+                        "train/grad_norm": train_metrics["grad_norm"],
+                        "train/score_network_grad_norm": train_metrics["score_network_grad_norm"],
+                        "train/out_v_grad_norm": train_metrics["out_v_grad_norm"],
+                        "train/out_l_grad_norm": train_metrics["out_l_grad_norm"],
+                    }
+                )
+            wandb.log(train_log_payload)
+            export_csv(
+                rows=history,
+                output_path=history_path,
+                fieldnames=[
+                    "epoch",
+                    "train_loss_weighted",
+                    "train_loss_v",
+                    "train_loss_l",
+                    "val_loss_weighted",
+                    "val_loss_v",
+                    "val_loss_l",
+                    "valid",
+                    "match_rate",
+                    "rmse",
+                ],
+            )
+
+            if not should_run_sampling:
                 continue
 
             phase_bits = []
-            if should_record_loss:
-                phase_bits.append("loss-validation")
-            if should_run_sampling:
-                phase_bits.append("sampling")
+            phase_bits.append("validation")
+            phase_bits.append("sampling")
             print(
                 f"epoch={epoch:04d} entering {' + '.join(phase_bits)}",
                 flush=True,
             )
 
             with ema.average_parameters(model):
-                if should_record_loss:
-                    print(
-                        f"epoch={epoch:04d} starting validation loss pass",
-                        flush=True,
-                    )
-                val_metrics = evaluate_loss(model=model, loader=val_loader, device=device, debug=args.dev)
-                if should_record_loss:
-                    print(
-                        f"epoch={epoch:04d} finished validation loss pass",
-                        flush=True,
-                    )
-
-            #Add metric here, ground truth vs predicted.  ASE libary.
-            if should_record_loss:
-                history.append(
-                    {
-                        "epoch": epoch,
-                        "train_loss": train_metrics["loss"],
-                        "train_loss_v": train_metrics["loss_v"],
-                        "train_raw_loss_v": train_metrics.get("raw_loss_v", float("nan")),
-                        "train_loss_l": train_metrics["loss_l"],
-                        "val_loss": val_metrics["loss"],
-                        "val_loss_v": val_metrics["loss_v"],
-                        "val_raw_loss_v": val_metrics.get("raw_loss_v", float("nan")),
-                        "val_loss_l": val_metrics["loss_l"],
-                    }
-                )
-
-                if args.dev:
-                    print(
-                        f"validation_epoch={epoch:04d} "
-                        f"val_loss={val_metrics['loss']:.6f} "
-                        f"(v={val_metrics['loss_v']:.6f}, raw_v={val_metrics['raw_loss_v']:.6f}, l={val_metrics['loss_l']:.6f}) "
-                        f"target_v_abs={val_metrics['target_v_abs_mean']:.6f} "
-                        f"pred_v_abs={val_metrics['pred_v_abs_mean']:.6f} "
-                        f"lambda=[{val_metrics['lambda_v_min']:.3f},{val_metrics['lambda_v_mean']:.3f},{val_metrics['lambda_v_max']:.3f}]"
-                    )
-                else:
-                    print(
-                        f"validation_epoch={epoch:04d} "
-                        f"val_loss={val_metrics['loss']:.6f} "
-                        f"(v={val_metrics['loss_v']:.6f}, l={val_metrics['loss_l']:.6f})"
-                    )
-
-                log_payload = {
-                    "epoch": epoch,
-                    "train/epoch_loss": train_metrics["loss"],
-                    "train/epoch_loss_v": train_metrics["loss_v"],
-                    "train/epoch_loss_l": train_metrics["loss_l"],
-                    "val/epoch_loss": val_metrics["loss"],
-                    "val/epoch_loss_v": val_metrics["loss_v"],
-                    "val/epoch_loss_l": val_metrics["loss_l"],
-                }
-                if args.dev:
-                    log_payload.update(
-                        {
-                            "train/epoch_raw_loss_v": train_metrics["raw_loss_v"],
-                            "train/target_v_abs_mean": train_metrics["target_v_abs_mean"],
-                            "train/target_v_norm_mean": train_metrics["target_v_norm_mean"],
-                            "train/pred_v_abs_mean": train_metrics["pred_v_abs_mean"],
-                            "train/pred_v_norm_mean": train_metrics["pred_v_norm_mean"],
-                            "train/lambda_v_mean": train_metrics["lambda_v_mean"],
-                            "train/lambda_v_min": train_metrics["lambda_v_min"],
-                            "train/lambda_v_max": train_metrics["lambda_v_max"],
-                            "train/lambda_v_effective": train_metrics["lambda_v_effective"],
-                            "train/v_t_abs_mean": train_metrics["v_t_abs_mean"],
-                            "train/f_t_abs_mean": train_metrics["f_t_abs_mean"],
-                            "train/r_t_abs_mean": train_metrics["r_t_abs_mean"],
-                            "train/score_v_abs_mean": train_metrics["score_v_abs_mean"],
-                            "train/pred_l_abs_mean": train_metrics["pred_l_abs_mean"],
-                            "train/target_l_abs_mean": train_metrics["target_l_abs_mean"],
-                            "train/grad_norm": train_metrics["grad_norm"],
-                            "train/score_network_grad_norm": train_metrics["score_network_grad_norm"],
-                            "train/out_v_grad_norm": train_metrics["out_v_grad_norm"],
-                            "train/out_l_grad_norm": train_metrics["out_l_grad_norm"],
-                            "val/epoch_raw_loss_v": val_metrics["raw_loss_v"],
-                            "val/target_v_abs_mean": val_metrics["target_v_abs_mean"],
-                            "val/target_v_norm_mean": val_metrics["target_v_norm_mean"],
-                            "val/pred_v_abs_mean": val_metrics["pred_v_abs_mean"],
-                            "val/pred_v_norm_mean": val_metrics["pred_v_norm_mean"],
-                            "val/lambda_v_mean": val_metrics["lambda_v_mean"],
-                            "val/lambda_v_min": val_metrics["lambda_v_min"],
-                            "val/lambda_v_max": val_metrics["lambda_v_max"],
-                            "val/lambda_v_effective": val_metrics["lambda_v_effective"],
-                            "val/v_t_abs_mean": val_metrics["v_t_abs_mean"],
-                            "val/f_t_abs_mean": val_metrics["f_t_abs_mean"],
-                            "val/r_t_abs_mean": val_metrics["r_t_abs_mean"],
-                            "val/score_v_abs_mean": val_metrics["score_v_abs_mean"],
-                            "val/pred_l_abs_mean": val_metrics["pred_l_abs_mean"],
-                            "val/target_l_abs_mean": val_metrics["target_l_abs_mean"],
-                        }
-                    )
-                wandb.log(log_payload)
-
-                export_csv(
-                    rows=history,
-                    output_path=history_path,
-                    fieldnames=[
-                        "epoch",
-                        "train_loss",
-                        "train_loss_v",
-                        "train_raw_loss_v",
-                        "train_loss_l",
-                        "val_loss",
-                        "val_loss_v",
-                        "val_raw_loss_v",
-                        "val_loss_l",
-                    ],
-                )
                 print(
-                    f"epoch={epoch:04d} writing training metrics plot",
+                    f"epoch={epoch:04d} starting validation loss pass",
                     flush=True,
                 )
-                maybe_plot_training_metrics(history, training_plot_path)
+                val_metrics = evaluate_loss(
+                    model=model,
+                    loader=val_loader,
+                    device=device,
+                    lambda_l=config["lambda_l"],
+                    max_graphs=config["val_subset_graphs"],
+                    debug=args.dev,
+                )
                 print(
-                    f"epoch={epoch:04d} finished training metrics plot",
+                    f"epoch={epoch:04d} finished validation loss pass",
                     flush=True,
                 )
-
-            if not should_run_sampling:
-                continue
 
             checkpoint_path = checkpoints_dir / f"checkpoint_epoch_{epoch}.pt"
             print(
@@ -922,6 +822,7 @@ def train() -> None:
                 config=config,
                 epoch=epoch,
             )
+            prune_old_checkpoints(checkpoints_dir=checkpoints_dir, keep_last=2)
 
             with ema.average_parameters(model):
                 print(
@@ -930,79 +831,141 @@ def train() -> None:
                 )
                 sampling_metrics = run_sampling_evaluation(
                     model=model,
-                    loader=sample_loader,
+                    loader=val_loader,
                     device=device,
-                    num_samples=config["sampling_samples"],
                     n_steps=config["sampling_steps"],
+                    max_graphs=config["val_subset_graphs"],
                 )
                 print(
                     f"epoch={epoch:04d} finished sampling evaluation",
                     flush=True,
                 )
-            sampling_history.append({"epoch": epoch, **sampling_metrics})
+
+            row["val_loss_weighted"] = val_metrics["loss"]
+            row["val_loss_v"] = val_metrics["loss_v"]
+            row["val_loss_l"] = val_metrics["loss_l"]
+            row["valid"] = sampling_metrics["valid"]
+            row["match_rate"] = sampling_metrics["match_rate"]
+            row["rmse"] = sampling_metrics["rmse"]
+
+            if args.dev:
+                print(
+                    f"validation_epoch={epoch:04d} "
+                    f"val_loss_weighted={val_metrics['loss']:.6f} "
+                    f"(loss_v={val_metrics['loss_v']:.6f}, raw_v={val_metrics['raw_loss_v']:.6f}, loss_l={val_metrics['loss_l']:.6f}) "
+                    f"valid={sampling_metrics['valid']:.4f} "
+                    f"match_rate={sampling_metrics['match_rate']:.4f} "
+                    f"rmse={sampling_metrics['rmse']:.6f}"
+                )
+            else:
+                print(
+                    f"validation_epoch={epoch:04d} "
+                    f"val_loss_weighted={val_metrics['loss']:.6f} "
+                    f"(loss_v={val_metrics['loss_v']:.6f}, loss_l={val_metrics['loss_l']:.6f}) "
+                    f"valid={sampling_metrics['valid']:.4f} "
+                    f"match_rate={sampling_metrics['match_rate']:.4f} "
+                    f"rmse={sampling_metrics['rmse']:.6f}"
+                )
 
             print(
                 f"checkpoint_epoch={epoch:04d} "
-                f"valid={sampling_metrics['valid_percentage']:.2f}% "
-                f"match_rate={sampling_metrics['match_rate_percentage']:.2f}% "
-                f"mean_rmse={sampling_metrics['mean_rmse']:.6f}"
+                f"valid={100.0 * sampling_metrics['valid']:.2f}% "
+                f"match_rate={100.0 * sampling_metrics['match_rate']:.2f}% "
+                f"mean_rmse={sampling_metrics['rmse']:.6f}"
             )
 
-            wandb.log(
-                {
-                    "epoch": epoch,
-                    "sampling/valid_true_count": sampling_metrics["valid_true_count"],
-                    "sampling/valid_percentage": sampling_metrics["valid_percentage"],
-                    "sampling/match_true_count": sampling_metrics["match_true_count"],
-                    "sampling/match_rate_percentage": sampling_metrics["match_rate_percentage"],
-                    "sampling/mean_rmse": sampling_metrics["mean_rmse"],
-                    "oracle_lattice/valid_true_count": sampling_metrics["oracle_lattice_valid_true_count"],
-                    "oracle_lattice/valid_percentage": sampling_metrics["oracle_lattice_valid_percentage"],
-                    "oracle_lattice/match_true_count": sampling_metrics["oracle_lattice_match_true_count"],
-                    "oracle_lattice/match_rate_percentage": sampling_metrics["oracle_lattice_match_rate_percentage"],
-                    "oracle_lattice/mean_rmse": sampling_metrics["oracle_lattice_mean_rmse"],
-                    "oracle_coordinate/valid_true_count": sampling_metrics["oracle_coordinate_valid_true_count"],
-                    "oracle_coordinate/valid_percentage": sampling_metrics["oracle_coordinate_valid_percentage"],
-                    "oracle_coordinate/match_true_count": sampling_metrics["oracle_coordinate_match_true_count"],
-                    "oracle_coordinate/match_rate_percentage": sampling_metrics["oracle_coordinate_match_rate_percentage"],
-                    "oracle_coordinate/mean_rmse": sampling_metrics["oracle_coordinate_mean_rmse"],
-                }
-            )
+            val_log_payload = {
+                "epoch": epoch,
+                "val/loss_weighted": val_metrics["loss"],
+                "val/loss_v": val_metrics["loss_v"],
+                "val/loss_l": val_metrics["loss_l"],
+                "val/valid": sampling_metrics["valid"],
+                "val/match_rate": sampling_metrics["match_rate"],
+                "val/rmse": sampling_metrics["rmse"],
+            }
+            if args.dev:
+                val_log_payload.update(
+                    {
+                        "val/raw_loss_v": val_metrics["raw_loss_v"],
+                        "val/target_v_abs_mean": val_metrics["target_v_abs_mean"],
+                        "val/target_v_norm_mean": val_metrics["target_v_norm_mean"],
+                        "val/pred_v_abs_mean": val_metrics["pred_v_abs_mean"],
+                        "val/pred_v_norm_mean": val_metrics["pred_v_norm_mean"],
+                        "val/lambda_v_mean": val_metrics["lambda_v_mean"],
+                        "val/lambda_v_min": val_metrics["lambda_v_min"],
+                        "val/lambda_v_max": val_metrics["lambda_v_max"],
+                        "val/lambda_v_effective": val_metrics["lambda_v_effective"],
+                        "val/v_t_abs_mean": val_metrics["v_t_abs_mean"],
+                        "val/f_t_abs_mean": val_metrics["f_t_abs_mean"],
+                        "val/r_t_abs_mean": val_metrics["r_t_abs_mean"],
+                        "val/score_v_abs_mean": val_metrics["score_v_abs_mean"],
+                        "val/pred_l_abs_mean": val_metrics["pred_l_abs_mean"],
+                        "val/target_l_abs_mean": val_metrics["target_l_abs_mean"],
+                    }
+                )
+            wandb.log(val_log_payload)
 
             export_csv(
-                rows=sampling_history,
+                rows=history,
+                output_path=history_path,
+                fieldnames=[
+                    "epoch",
+                    "train_loss_weighted",
+                    "train_loss_v",
+                    "train_loss_l",
+                    "val_loss_weighted",
+                    "val_loss_v",
+                    "val_loss_l",
+                    "valid",
+                    "match_rate",
+                    "rmse",
+                ],
+            )
+            export_csv(
+                rows=[
+                    {
+                        "epoch": row["epoch"],
+                        "val_loss_weighted": row["val_loss_weighted"],
+                        "val_loss_v": row["val_loss_v"],
+                        "val_loss_l": row["val_loss_l"],
+                        "valid": row["valid"],
+                        "match_rate": row["match_rate"],
+                        "rmse": row["rmse"],
+                    }
+                    for row in history
+                    if row["valid"] == row["valid"]
+                ],
                 output_path=sampling_history_path,
                 fieldnames=[
                     "epoch",
-                    "num_samples",
-                    "valid_true_count",
-                    "valid_percentage",
-                    "match_true_count",
-                    "match_rate_percentage",
-                    "mean_rmse",
-                    "oracle_lattice_valid_true_count",
-                    "oracle_lattice_valid_percentage",
-                    "oracle_lattice_match_true_count",
-                    "oracle_lattice_match_rate_percentage",
-                    "oracle_lattice_mean_rmse",
-                    "oracle_coordinate_valid_true_count",
-                    "oracle_coordinate_valid_percentage",
-                    "oracle_coordinate_match_true_count",
-                    "oracle_coordinate_match_rate_percentage",
-                    "oracle_coordinate_mean_rmse",
+                    "val_loss_weighted",
+                    "val_loss_v",
+                    "val_loss_l",
+                    "valid",
+                    "match_rate",
+                    "rmse",
                 ],
             )
+            print(
+                f"epoch={epoch:04d} writing training metrics plot",
+                flush=True,
+            )
+            maybe_plot_training_metrics(history, training_plot_path)
+            print(
+                f"epoch={epoch:04d} finished training metrics plot",
+                flush=True,
+            )
+            maybe_plot_sampling_metrics(history, sampling_plot_path)
 
-            maybe_plot_sampling_metrics(sampling_history, sampling_plot_path)
+            if run is not None:
+                checkpoint_artifact = wandb.Artifact(f"checkpoint_epoch_{epoch}", type="model")
+                checkpoint_artifact.add_file(str(checkpoint_path))
+                run.log_artifact(checkpoint_artifact)
 
-            checkpoint_artifact = wandb.Artifact(f"checkpoint_epoch_{epoch}", type="model")
-            checkpoint_artifact.add_file(str(checkpoint_path))
-            run.log_artifact(checkpoint_artifact)
-
-            if sampling_history_path.exists():
-                wandb.save(str(sampling_history_path))
-            if sampling_plot_path.exists():
-                wandb.save(str(sampling_plot_path))
+                if sampling_history_path.exists():
+                    wandb.save(str(sampling_history_path))
+                if sampling_plot_path.exists():
+                    wandb.save(str(sampling_plot_path))
 
     finally:
         final_checkpoint_path = checkpoints_dir / f"checkpoint_epoch_{epoch}_final.pt"
@@ -1026,8 +989,9 @@ def train() -> None:
             final_artifact.add_file(str(training_plot_path))
         if sampling_plot_path.exists():
             final_artifact.add_file(str(sampling_plot_path))
-        run.log_artifact(final_artifact)
-        wandb.finish()
+        if run is not None:
+            run.log_artifact(final_artifact)
+            wandb.finish()
 
 
 if __name__ == "__main__":
