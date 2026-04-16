@@ -281,7 +281,7 @@ def clean_model_state_dict(model: ModelKLDM) -> dict[str, torch.Tensor]:
     return {
         key: value
         for key, value in model.state_dict().items()
-        if not key.startswith("_cached_sampling_score_network")
+        if not key.startswith("_cached_sampling_model")
         and not key.endswith("._lambda_v_table")
     }
 
@@ -483,7 +483,7 @@ def maybe_resume(
     cleaned_state_dict = {
         key: value
         for key, value in checkpoint["model_state_dict"].items()
-        if not key.startswith("_cached_sampling_score_network")
+        if not key.startswith("_cached_sampling_model")
         and not key.endswith("._lambda_v_table")
     }
     model.load_state_dict(cleaned_state_dict, strict=False)

@@ -136,7 +136,7 @@ def export_final_model(
     clean_state_dict = {
         key: value
         for key, value in model.state_dict().items()
-        if not key.startswith("_cached_sampling_score_network")
+        if not key.startswith("_cached_sampling_model")
     }
     torch.save(
         {

@@ -64,7 +64,7 @@ class ModelKLDM(nn.Module):
         self.eps = eps
         self.task_type: Optional[str] = None
         self._cached_sampling_checkpoint_path: Optional[str] = None
-        self.__dict__["_cached_sampling_score_network_obj"] = None
+        self.__dict__["_cached_sampling_model_obj"] = None
 
     # ============================================================================
     # ALGORITHM 1
@@ -222,31 +222,30 @@ class ModelKLDM(nn.Module):
     # ============================================================================
     # ALGORITHM 3 - Sampling algorithm
     # ============================================================================
-    def _load_csp_score_network(self, checkpoint_path: str = "artifacts/csp_final_model.pt") -> CSPVNet:
+    def _load_sampling_model(self, checkpoint_path: str = "artifacts/csp_final_model.pt") -> "ModelKLDM":
         device = next(self.parameters()).device
-        cached_score_network = self.__dict__.get("_cached_sampling_score_network_obj")
+        cached_model = self.__dict__.get("_cached_sampling_model_obj")
         if (
-            cached_score_network is not None
+            cached_model is not None
             and self._cached_sampling_checkpoint_path == checkpoint_path
         ):
-            return cached_score_network
+            return cached_model
 
         checkpoint = torch.load(checkpoint_path, map_location=device)
         source_state_dict = checkpoint.get("ema_model_state_dict") or checkpoint["model_state_dict"]
         cleaned_state_dict = {
             key: value
             for key, value in source_state_dict.items()
-            if not key.startswith("_cached_sampling_score_network")
+            if not key.startswith("_cached_sampling_model")
             and not key.endswith("._lambda_v_table")
         }
         model = ModelKLDM(device=device).to(device)
         model.load_state_dict(cleaned_state_dict, strict=False)
-        score_network = model.score_network.to(device)
-        score_network.eval()
+        model.eval()
 
         self._cached_sampling_checkpoint_path = checkpoint_path
-        self.__dict__["_cached_sampling_score_network_obj"] = score_network
-        return score_network
+        self.__dict__["_cached_sampling_model_obj"] = model
+        return model
 
     def sample_CSP_algorithm3(
         self,
@@ -277,12 +276,16 @@ class ModelKLDM(nn.Module):
         l_t = torch.randn_like(batch.l)
         a_t = batch.h  # CSP conditioning
 
+        sampling_model = self if checkpoint_path is None else self._load_sampling_model(checkpoint_path)
+        sampling_tdm = sampling_model.tdm
+        sampling_diffusion_l = sampling_model.diffusion_l
+
         if checkpoint_path is None:
-            score_network = self.score_network
+            score_network = sampling_model.score_network
             restore_training = score_network.training
             score_network.eval()
         else:
-            score_network = self._load_csp_score_network(checkpoint_path)
+            score_network = sampling_model.score_network
             restore_training = False
 
         dt = 1.0 / n_steps
@@ -311,14 +314,14 @@ class ModelKLDM(nn.Module):
                     # Full velocity score:
                     # s_v(x_t, t) = ((1 - exp(-t)) / (1 + exp(-t))) * s_f_theta(x_t, t) - v_t / sigma_v(t)^2
 
-                    score_v = self.tdm.construct_velocity_score(
+                    score_v = sampling_tdm.construct_velocity_score(
                         t=t_node,
                         v_t=v_t,
                         pred_v=pred_v,
                     )
 
                     # Update v and f with exponential integrator
-                    f_t, v_t = self.tdm.reverse_exp_step(
+                    f_t, v_t = sampling_tdm.reverse_exp_step(
                         f_t=f_t,
                         v_t=v_t,
                         score_v=score_v,
@@ -328,7 +331,7 @@ class ModelKLDM(nn.Module):
 
                     # KLDM-epsilon lattice branch:
                     # Algorithm 3 does EM on l using the score corresponding to out_l
-                    l_t = self.diffusion_l.reverse_em_step_from_eps(
+                    l_t = sampling_diffusion_l.reverse_em_step_from_eps(
                         t=t_graph.squeeze(-1),
                         x_t=l_t,
                         pred_eps=pred_l,
@@ -336,7 +339,7 @@ class ModelKLDM(nn.Module):
                     )
 
                 # For KLDM-epsilon Algorithm 3, return the final sampled l_N directly
-                return self.tdm.wrap_positions(f_t), v_t, l_t, a_t
+                return sampling_tdm.wrap_positions(f_t), v_t, l_t, a_t
         finally:
             if checkpoint_path is None and restore_training:
                 score_network.train()
