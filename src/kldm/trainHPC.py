@@ -448,14 +448,21 @@ def run_sampling_evaluation(
     }
 
 
-def prune_old_checkpoints(checkpoints_dir: Path, keep_last: int = 2) -> None:
+def prune_old_checkpoints(
+    checkpoints_dir: Path,
+    keep_last: int = 2,
+    current_epoch: int | None = None,
+) -> None:
     epoch_pattern = re.compile(r"^checkpoint_epoch_(\d+)$")
     checkpoint_paths = []
     for path in checkpoints_dir.glob("checkpoint_epoch_*.pt"):
         match = epoch_pattern.match(path.stem)
         if match is None:
             continue
-        checkpoint_paths.append((int(match.group(1)), path))
+        epoch = int(match.group(1))
+        if current_epoch is not None and epoch > current_epoch:
+            continue
+        checkpoint_paths.append((epoch, path))
     checkpoint_paths.sort(key=lambda item: item[0])
     while len(checkpoint_paths) > keep_last:
         checkpoint_paths[0][1].unlink(missing_ok=True)
@@ -822,7 +829,6 @@ def train() -> None:
                 config=config,
                 epoch=epoch,
             )
-            prune_old_checkpoints(checkpoints_dir=checkpoints_dir, keep_last=2)
 
             with ema.average_parameters(model):
                 print(
@@ -955,17 +961,70 @@ def train() -> None:
                 f"epoch={epoch:04d} finished training metrics plot",
                 flush=True,
             )
+            print(
+                f"epoch={epoch:04d} writing sampling metrics plot",
+                flush=True,
+            )
             maybe_plot_sampling_metrics(history, sampling_plot_path)
+            print(
+                f"epoch={epoch:04d} finished sampling metrics plot",
+                flush=True,
+            )
 
             if run is not None:
-                checkpoint_artifact = wandb.Artifact(f"checkpoint_epoch_{epoch}", type="model")
-                checkpoint_artifact.add_file(str(checkpoint_path))
-                run.log_artifact(checkpoint_artifact)
+                try:
+                    print(
+                        f"epoch={epoch:04d} logging checkpoint artifact",
+                        flush=True,
+                    )
+                    checkpoint_artifact = wandb.Artifact(f"checkpoint_epoch_{epoch}", type="model")
+                    checkpoint_artifact.add_file(str(checkpoint_path))
+                    run.log_artifact(checkpoint_artifact)
+                    print(
+                        f"epoch={epoch:04d} finished checkpoint artifact",
+                        flush=True,
+                    )
 
-                if sampling_history_path.exists():
-                    wandb.save(str(sampling_history_path))
-                if sampling_plot_path.exists():
-                    wandb.save(str(sampling_plot_path))
+                    if sampling_history_path.exists():
+                        print(
+                            f"epoch={epoch:04d} saving sampling history to wandb",
+                            flush=True,
+                        )
+                        wandb.save(str(sampling_history_path))
+                    if sampling_plot_path.exists():
+                        print(
+                            f"epoch={epoch:04d} saving sampling plot to wandb",
+                            flush=True,
+                        )
+                        wandb.save(str(sampling_plot_path))
+                    print(
+                        f"epoch={epoch:04d} finished wandb sync for validation",
+                        flush=True,
+                    )
+                except Exception as exc:
+                    print(
+                        f"epoch={epoch:04d} warning: wandb artifact/save failed: {exc}",
+                        flush=True,
+                    )
+
+            print(
+                f"epoch={epoch:04d} pruning old checkpoints",
+                flush=True,
+            )
+            prune_old_checkpoints(
+                checkpoints_dir=checkpoints_dir,
+                keep_last=2,
+                current_epoch=epoch,
+            )
+            print(
+                f"epoch={epoch:04d} finished pruning old checkpoints",
+                flush=True,
+            )
+
+            print(
+                f"epoch={epoch:04d} validation block complete",
+                flush=True,
+            )
 
     finally:
         final_checkpoint_path = checkpoints_dir / f"checkpoint_epoch_{epoch}_final.pt"
