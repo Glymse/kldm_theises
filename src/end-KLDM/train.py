@@ -40,7 +40,7 @@ def validation_step(
             batch=batch,
             t=t_graph,
             lambda_v=1.0,
-            lambda_l=0.5,
+            lambda_l=1.0,
         )
 
     return {
@@ -69,7 +69,7 @@ def train_epoch(
             batch=batch,
             t=t_graph,
             lambda_v=1.0,
-            lambda_l=0.5,
+            lambda_l=1.0,
         )
         loss.backward()
         optimizer.step()
@@ -205,7 +205,7 @@ def train() -> None:
         "subset_seed": args.subset_seed,
         "lr": 1e-3,
         "lambda_v": 1.0,
-        "lambda_l": 0.5,
+        "lambda_l": 1.0,
     }
 
     csp_task = CSPTask()

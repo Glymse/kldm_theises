@@ -5,15 +5,13 @@ import sys
 
 import torch
 from torch import nn
+import time
 
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from distribution import d_log_wrapped_normal
-from diffusionModels.lambda_t import (
-    interpolate_lambda_table,
-    precompute_lambda_time_grid_from_loader,
-)
+from distribution import d_log_wrapped_normal, sigma_norm
+from diffusionModels.lambda_t import interpolate_lambda_table
 from scoreNetwork.utils import scatter_center
 
 ################################################################
@@ -41,17 +39,42 @@ class TrivialisedDiffusion(nn.Module):
             self,
             eps: float = 1e-5,
             n_lambdas: int = 256,
-            lambda_num_batches: int = 16) -> None:
+            lambda_num_batches: int = 16,
+            k_wn_score: int = 13,
+            n_sigmas: int = 2000) -> None:
         super().__init__()
         self.eps = float(eps)
         self.time_scaling_T = 2
         self.scale_pos = 1.0
-        self.k_wn_score = 9
+        self.k_wn_score = int(k_wn_score)
         self.n_lambdas = int(n_lambdas)
         self.lambda_num_batches = int(lambda_num_batches)
+        self.simplified_parameterization = True
+        self.use_lambda_weighting = False
         self.register_buffer("_lambda_t01_grid", torch.linspace(1e-4, 1.0, self.n_lambdas))
         self.register_buffer("_lambda_v_table", torch.ones(self.n_lambdas))
         self.register_buffer("_log_sigma_t01_grid", torch.linspace(1e-4, 1.0, 4096))
+        sigma_grid_t = torch.linspace(0.0, self.time_scaling_T, int(n_sigmas))
+        sigma_values = self.wrapped_gaussian_sigma_r_t(sigma_grid_t)
+        sigma_precompute_start = time.perf_counter()
+        print(
+            "END-TDM sigma_norm precompute start "
+            f"n_sigmas={n_sigmas} k_wn_score={self.k_wn_score} "
+            f"scale_pos={self.scale_pos:.6f}",
+            flush=True,
+        )
+        sigma_norm_values = sigma_norm(
+            sigma=sigma_values,
+            T=self.scale_pos,
+            K=self.k_wn_score,
+            eps=self.eps,
+        )
+        print(
+            "END-TDM sigma_norm precompute done "
+            f"seconds={time.perf_counter() - sigma_precompute_start:.1f}",
+            flush=True,
+        )
+        self.register_buffer("_sigma_norms", sigma_norm_values)
         log_sigma_r = torch.log(
             self.wrapped_gaussian_sigma_r_t(self.time_scaling_T * self._log_sigma_t01_grid).clamp_min(self.eps)
         )
@@ -107,6 +130,11 @@ class TrivialisedDiffusion(nn.Module):
         Interpolate λ(t) for normalized time t01 in [0,1].
         """
         return interpolate_lambda_table(self._lambda_v_table, t01)
+
+    def _sigma_norm_t(self, t: torch.Tensor) -> torch.Tensor:
+        idx = torch.round(t / self.time_scaling_T * len(self._sigma_norms)).long() - 1
+        idx = idx.clamp(0, len(self._sigma_norms) - 1)
+        return self._sigma_norms[idx]
 
     def _interp_t01_from_log_sigma_r(self, log_sigma_r: torch.Tensor) -> torch.Tensor:
         grid_t01 = self._log_sigma_t01_grid.to(device=log_sigma_r.device, dtype=log_sigma_r.dtype)
@@ -191,25 +219,8 @@ class TrivialisedDiffusion(nn.Module):
         mean_normalize: bool = False,
         target_mean_weight: float = 1.0,
     ) -> torch.Tensor:
-        """
-        Precompute λ(t) using a torsional-diffusion-style score norm estimate.
-
-        By default this uses the raw paper-style estimate with no smoothing,
-        mean normalization, or clipping.
-        """
-        lambda_table = precompute_lambda_time_grid_from_loader(
-            diffusion=self,
-            loader=loader,
-            t01_grid=self._lambda_t01_grid,
-            num_batches=self.lambda_num_batches if num_batches is None else int(num_batches),
-            clamp_min=clamp_min,
-            clamp_max=clamp_max,
-            smooth=smooth,
-            mean_normalize=mean_normalize,
-            target_mean_weight=target_mean_weight,
-            device=self._lambda_v_table.device if device is None else device,
-        )
-        self._lambda_v_table.copy_(lambda_table.to(self._lambda_v_table))
+        del loader, device, num_batches, clamp_min, clamp_max, smooth, mean_normalize, target_mean_weight
+        self._lambda_v_table.fill_(1.0)
         return self._lambda_v_table
 
 
@@ -324,7 +335,9 @@ class TrivialisedDiffusion(nn.Module):
 
 
 
-        wrapped_gaussian_target = d_log_wrapped_normal(
+        prefactor_t = self._match_dims((1.0 - torch.exp(-t)) / (1.0 + torch.exp(-t)), r_t)
+
+        target_pos_t = prefactor_t * d_log_wrapped_normal(
             r=r_t,
             mu=wrapped_gaussian_mu_r_t,
             sigma=wrapped_gaussian_sigma_r_t,
@@ -333,13 +346,14 @@ class TrivialisedDiffusion(nn.Module):
             eps=self.eps,
         )
 
-
-
         #Center the target
-        wrapped_gaussian_target = scatter_center(wrapped_gaussian_target, index=index)
+        target_pos_t = scatter_center(target_pos_t, index=index)
+        sigma_norm_t = self._match_dims(
+            torch.sqrt(self._sigma_norm_t(t)).clamp_min(self.eps),
+            target_pos_t,
+        )
 
-        #target = gaussian_velocity_target + wrapped_gaussian_target
-        return wrapped_gaussian_target #Simplified version, might explain later.
+        return target_pos_t / prefactor_t.clamp_min(self.eps) / sigma_norm_t
 
         #return target_s
 
@@ -355,13 +369,17 @@ class TrivialisedDiffusion(nn.Module):
             (1.0 - torch.exp(-t_internal)) / (1.0 + torch.exp(-t_internal)),
             pred_v,
         )
+        sigma_norm_t = self._match_dims(
+            torch.sqrt(self._sigma_norm_t(t_internal)).clamp_min(self.eps),
+            pred_v,
+        )
         gaussian_velocity_sigma_sq = self._match_dims(
             self.gaussian_velocity_sigma(t_internal) ** 2,
             pred_v,
         ).clamp_min(self.eps)
 
-        # Native period-1 reconstruction: no hidden chart conversion here.
-        return prefactor * pred_v - v_t / gaussian_velocity_sigma_sq
+        # Native period-1 reconstruction with sigma-normalized simplified target.
+        return prefactor * sigma_norm_t * pred_v - v_t / gaussian_velocity_sigma_sq
 
     def reverse_exp_step(
         self,

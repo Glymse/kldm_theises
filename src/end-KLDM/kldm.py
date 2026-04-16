@@ -68,6 +68,9 @@ class ModelKLDM(nn.Module):
         self._cached_sampling_checkpoint_path: Optional[str] = None
         self.__dict__["_cached_sampling_model_obj"] = None
 
+    def _positive_gain(self, gain: torch.Tensor, *, ref: torch.Tensor) -> torch.Tensor:
+        return F.softplus(gain).to(device=ref.device, dtype=ref.dtype) + ref.new_tensor(1e-4)
+
     def sample_graph_times(
         self,
         num_graphs: int,
@@ -106,12 +109,15 @@ class ModelKLDM(nn.Module):
         node_index: torch.Tensor,
         edge_node_index: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
+        pos_gain = self._positive_gain(self.pos_gain, ref=pos)
+        vel_gain = self._positive_gain(self.vel_gain, ref=v)
+        lat_gain = self._positive_gain(self.lat_gain, ref=l)
         return score_network(
             t=t,
-            pos=self.pos_gain.to(device=pos.device, dtype=pos.dtype) * pos,
-            v=self.vel_gain.to(device=v.device, dtype=v.dtype) * v,
+            pos=pos_gain * pos,
+            v=vel_gain * v,
             h=h,
-            l=self.lat_gain.to(device=l.device, dtype=l.dtype) * l,
+            l=lat_gain * l,
             node_index=node_index,
             edge_node_index=edge_node_index,
         )
@@ -264,6 +270,9 @@ class ModelKLDM(nn.Module):
                     "score_v_abs_mean": score_v.abs().mean().detach(),
                     "pred_l_abs_mean": out_l.abs().mean().detach(),
                     "target_l_abs_mean": target_l.abs().mean().detach(),
+                    "pos_gain": self._positive_gain(self.pos_gain, ref=f_t).detach(),
+                    "vel_gain": self._positive_gain(self.vel_gain, ref=v_t).detach(),
+                    "lat_gain": self._positive_gain(self.lat_gain, ref=l_t).detach(),
                 }
             )
         return total_loss, metrics

@@ -249,8 +249,17 @@ class TrivialisedDiffusionDev(nn.Module):
         expm1_dt = torch.expm1(dt_t)
         expm1_2dt = torch.expm1(2.0 * dt_t)
         noise_scale = torch.sqrt(expm1_2dt.clamp_min(self.eps))
+        score_scale = torch.as_tensor(
+            self.vel_scale ** 2,
+            device=v_t.device,
+            dtype=v_t.dtype,
+        )
 
-        v_prev = exp_dt * v_t + 2.0 * expm1_dt * score_v + noise_scale * noise_v
+        # For the epsilon-scaled unit-chart model the forward OU diffusion
+        # coefficient is reduced by `vel_scale`, so the reverse score drift must
+        # carry the matching `vel_scale**2` factor too. Without it, sampling runs
+        # far hotter than the trained forward process even when loss looks good.
+        v_prev = exp_dt * v_t + 2.0 * score_scale * expm1_dt * score_v + noise_scale * noise_v
         f_prev = self._wrap_internal(f_t - dt_t * v_prev)
 
         return f_prev, v_prev
