@@ -19,9 +19,9 @@ from kldm.scoreNetwork.utils import scatter_center
 class TrivialisedDiffusionDev(nn.Module):
     """
     Dev TDM variant:
-    - facit-style internal angular scaling with scale_pos = 2π
-    - fractional latents returned to the network in [-0.5, 0.5)
-    - facit-style sigma_norm target normalization
+    - native fractional chart with positions in [0,1) and displacements in [-0.5, 0.5)
+    - sigma_norm target normalization on the simplified wrapped-normal target
+    - reduced velocity noise via a scaled epsilon_v sample
     - simplified parameterization only
     - no lambda(t) weighting in the loss
     """
@@ -37,9 +37,10 @@ class TrivialisedDiffusionDev(nn.Module):
         super().__init__()
         self.eps = float(eps)
         self.time_scaling_T = 2.0
-        # Facit-style internal angular chart; external/public latents are still
-        # fractional and wrapped back into [-0.5, 0.5) before reaching the net.
-        self.scale_pos = 2.0 * math.pi
+        self.scale_pos = 1.0
+        # Native [0,1] variant with a reduced velocity-noise scale chosen to
+        # mimic a less noisy fractional chart without reintroducing 2π states.
+        self.velocity_epsilon_std = 1.0 / (2.0 * math.pi)
         self.k_wn_score = int(k_wn_score)
         self.n_lambdas = int(n_lambdas)
         self.lambda_num_batches = int(lambda_num_batches)
@@ -54,7 +55,8 @@ class TrivialisedDiffusionDev(nn.Module):
         sigma_precompute_start = time.perf_counter()
         print(
             "TDMdev sigma_norm precompute start "
-            f"n_sigmas={n_sigmas} k_wn_score={self.k_wn_score} scale_pos={self.scale_pos:.6f}",
+            f"n_sigmas={n_sigmas} k_wn_score={self.k_wn_score} "
+            f"scale_pos={self.scale_pos:.6f} velocity_epsilon_std={self.velocity_epsilon_std:.6f}",
             flush=True,
         )
         sigma_norm_values = sigma_norm(
@@ -79,19 +81,21 @@ class TrivialisedDiffusionDev(nn.Module):
         return torch.remainder(x + 0.5, 1.0) - 0.5
 
     def _wrap_internal(self, x: torch.Tensor) -> torch.Tensor:
-        half_period = 0.5 * self.scale_pos
-        return torch.remainder(x + half_period, self.scale_pos) - half_period
+        return self.wrap_displacements(x)
 
     def gaussian_velocity_mean_coeff(self, t: torch.Tensor) -> torch.Tensor:
         return torch.exp(-t)
 
-    def gaussian_velocity_sigma(self, t: torch.Tensor) -> torch.Tensor:
+    def gaussian_velocity_sigma_base(self, t: torch.Tensor) -> torch.Tensor:
         return torch.sqrt(torch.clamp(1.0 - torch.exp(-2.0 * t), min=self.eps))
+
+    def gaussian_velocity_sigma(self, t: torch.Tensor) -> torch.Tensor:
+        return self.velocity_epsilon_std * self.gaussian_velocity_sigma_base(t)
 
     def _prefactor_t(self, t: torch.Tensor) -> torch.Tensor:
         return (1.0 - torch.exp(-t)) / (1.0 + torch.exp(-t))
 
-    def wrapped_gaussian_mu_r_t_pre_wrap(
+    def wrapped_gaussian_mu_r_t(
         self,
         t: torch.Tensor,
         v_t: torch.Tensor,
@@ -100,9 +104,6 @@ class TrivialisedDiffusionDev(nn.Module):
         coeff = self._prefactor_t(t)
         coeff = self._match_dims(coeff, v_t)
         return coeff * (v_t + v0)
-
-    def wrapped_gaussian_mu_r_t(self, t: torch.Tensor, v_t: torch.Tensor, v0: torch.Tensor) -> torch.Tensor:
-        return self.wrapped_gaussian_mu_r_t_pre_wrap(t=t, v_t=v_t, v0=v0)
 
     def wrapped_gaussian_sigma_r_t(self, t: torch.Tensor) -> torch.Tensor:
         return torch.sqrt(
@@ -133,11 +134,16 @@ class TrivialisedDiffusionDev(nn.Module):
         idx = idx.clamp(0, len(self._sigma_norms) - 1)
         return self._sigma_norms[idx]
 
+    def sample_velocity_epsilon(self, ref: torch.Tensor, index: torch.Tensor) -> torch.Tensor:
+        eps = torch.randn_like(ref)
+        eps = scatter_center(eps, index=index)
+        return self.velocity_epsilon_std * eps
+
     @torch.no_grad()
     def sample_prior(self, index: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         num_nodes = len(index)
         pos_frac = self.wrap_displacements(torch.rand((num_nodes, 3), device=index.device))
-        v_frac = scatter_center(torch.randn((num_nodes, 3), device=index.device), index=index) / self.scale_pos
+        v_frac = self.sample_velocity_epsilon(pos_frac, index=index)
         return pos_frac, v_frac
 
     def forward_sample(
@@ -154,30 +160,25 @@ class TrivialisedDiffusionDev(nn.Module):
         if v0 is None:
             v0 = torch.zeros_like(f0)
         f0 = self.wrap_displacements(f0)
-        f0_internal = self.scale_pos * f0
-        v0_internal = self.scale_pos * v0
 
         if epsilon_v is None:
-            epsilon_v = torch.randn_like(v0_internal)
-        epsilon_v = scatter_center(epsilon_v, index=index)
+            epsilon_v = self.sample_velocity_epsilon(v0, index=index)
+        else:
+            epsilon_v = self.velocity_epsilon_std * scatter_center(epsilon_v, index=index)
 
-        mean_coeff_t = self._match_dims(self.gaussian_velocity_mean_coeff(t), v0_internal)
-        sigma_v_t = self._match_dims(self.gaussian_velocity_sigma(t), v0_internal)
-        v_t_internal = mean_coeff_t * v0_internal + sigma_v_t * epsilon_v
+        mean_coeff_t = self._match_dims(self.gaussian_velocity_mean_coeff(t), v0)
+        sigma_v_base_t = self._match_dims(self.gaussian_velocity_sigma_base(t), v0)
+        v_t = mean_coeff_t * v0 + sigma_v_base_t * epsilon_v
 
-        mu_r_t_pre_wrap = self.wrapped_gaussian_mu_r_t_pre_wrap(t, v_t_internal, v0_internal)
-        sigma_r_t = self._match_dims(self.wrapped_gaussian_sigma_r_t(t), f0_internal)
+        mu_r_t = self.wrapped_gaussian_mu_r_t(t, v_t, v0)
+        sigma_r_t = self._match_dims(self.wrapped_gaussian_sigma_r_t(t), f0)
 
         if epsilon_r is None:
-            epsilon_r = torch.randn_like(f0_internal)
+            epsilon_r = torch.randn_like(f0)
         epsilon_r = scatter_center(epsilon_r, index=index)
 
-        r_t_internal = self._wrap_internal(mu_r_t_pre_wrap + sigma_r_t * epsilon_r)
-        f_t_internal = self._wrap_internal(f0_internal + r_t_internal)
-
-        r_t = r_t_internal / self.scale_pos
-        f_t = f_t_internal / self.scale_pos
-        v_t = v_t_internal / self.scale_pos
+        r_t = self._wrap_internal(mu_r_t + sigma_r_t * epsilon_r)
+        f_t = self._wrap_internal(f0 + r_t)
 
         return f_t, v_t, epsilon_v, epsilon_r, r_t
 
@@ -191,17 +192,13 @@ class TrivialisedDiffusionDev(nn.Module):
     ) -> torch.Tensor:
         t = self.time_scaling_T * t
         v0 = torch.zeros_like(v_t) if v0 is None else v0
-        r_t_internal = self.scale_pos * r_t
-        v_t_internal = self.scale_pos * v_t
-        v0_internal = self.scale_pos * v0
 
-        mu_r_t_pre_wrap = self.wrapped_gaussian_mu_r_t_pre_wrap(t, v_t_internal, v0_internal)
-        mu_r_t = self._wrap_internal(mu_r_t_pre_wrap)
-        sigma_r_t = self._match_dims(self.wrapped_gaussian_sigma_r_t(t), r_t_internal)
+        mu_r_t = self._wrap_internal(self.wrapped_gaussian_mu_r_t(t, v_t, v0))
+        sigma_r_t = self._match_dims(self.wrapped_gaussian_sigma_r_t(t), r_t)
 
-        prefactor_t = self._match_dims(self._prefactor_t(t), r_t_internal)
+        prefactor_t = self._match_dims(self._prefactor_t(t), r_t)
         target_pos_t = prefactor_t * d_log_wrapped_normal(
-            r=r_t_internal,
+            r=r_t,
             mu=mu_r_t,
             sigma=sigma_r_t,
             K=self.k_wn_score,
@@ -220,7 +217,6 @@ class TrivialisedDiffusionDev(nn.Module):
         pred_v: torch.Tensor,
     ) -> torch.Tensor:
         t_internal = self.time_scaling_T * t
-        v_t_internal = self.scale_pos * v_t
         prefactor = self._match_dims(self._prefactor_t(t_internal), pred_v)
         sigma_norm_t = self._match_dims(
             torch.sqrt(self._sigma_norm_t(t_internal)).clamp_min(self.eps),
@@ -231,7 +227,7 @@ class TrivialisedDiffusionDev(nn.Module):
             pred_v,
         ).clamp_min(self.eps)
 
-        return prefactor * sigma_norm_t * pred_v - v_t_internal / gaussian_velocity_sigma_sq
+        return prefactor * sigma_norm_t * pred_v - v_t / gaussian_velocity_sigma_sq
 
     def reverse_exp_step(
         self,
@@ -242,25 +238,23 @@ class TrivialisedDiffusionDev(nn.Module):
         dt: float,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         f_t = self.wrap_displacements(f_t)
-        f_t_internal = self.scale_pos * f_t
-        v_t_internal = self.scale_pos * v_t
 
         dt_t = torch.as_tensor(
             self.time_scaling_T * dt,
             device=v_t.device,
             dtype=v_t.dtype,
         )
-        noise_v = scatter_center(torch.randn_like(v_t_internal), index=index)
+        noise_v = self.sample_velocity_epsilon(v_t, index=index)
 
         exp_dt = torch.exp(dt_t)
         expm1_dt = torch.expm1(dt_t)
         expm1_2dt = torch.expm1(2.0 * dt_t)
         noise_scale = torch.sqrt(expm1_2dt.clamp_min(self.eps))
 
-        v_prev_internal = exp_dt * v_t_internal + 2.0 * expm1_dt * score_v + noise_scale * noise_v
-        f_prev_internal = self._wrap_internal(f_t_internal - dt_t * v_prev_internal)
+        v_prev = exp_dt * v_t + 2.0 * expm1_dt * score_v + noise_scale * noise_v
+        f_prev = self._wrap_internal(f_t - dt_t * v_prev)
 
-        return f_prev_internal / self.scale_pos, v_prev_internal / self.scale_pos
+        return f_prev, v_prev
 
     @staticmethod
     def _match_dims(coeff: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
