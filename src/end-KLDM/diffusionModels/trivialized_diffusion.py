@@ -41,7 +41,8 @@ class TrivialisedDiffusion(nn.Module):
             n_lambdas: int = 256,
             lambda_num_batches: int = 16,
             k_wn_score: int = 13,
-            n_sigmas: int = 2000) -> None:
+            n_sigmas: int = 2000,
+            min_t01_for_log_sigma: float = 0.02) -> None:
         super().__init__()
         self.eps = float(eps)
         self.time_scaling_T = 2
@@ -49,6 +50,7 @@ class TrivialisedDiffusion(nn.Module):
         self.k_wn_score = int(k_wn_score)
         self.n_lambdas = int(n_lambdas)
         self.lambda_num_batches = int(lambda_num_batches)
+        self.min_t01_for_log_sigma = float(min_t01_for_log_sigma)
         self.simplified_parameterization = True
         self.use_lambda_weighting = False
         self.register_buffer("_lambda_t01_grid", torch.linspace(1e-4, 1.0, self.n_lambdas))
@@ -175,8 +177,8 @@ class TrivialisedDiffusion(nn.Module):
         lb: float | None = None,
     ) -> torch.Tensor:
         if lb is None:
-            lb = float(self._log_sigma_t01_grid[0])
-        lb = max(float(lb), float(self._log_sigma_t01_grid[0]))
+            lb = self.min_t01_for_log_sigma
+        lb = max(float(lb), self.min_t01_for_log_sigma, float(self._log_sigma_t01_grid[0]))
 
         lb_t01 = torch.full((), lb, device=device, dtype=self._log_sigma_t01_grid.dtype)
         log_sigma_min = self._interp_log_sigma_r_from_t01(lb_t01)
@@ -195,8 +197,8 @@ class TrivialisedDiffusion(nn.Module):
             raise ValueError("n_steps must be positive.")
 
         if lb is None:
-            lb = float(self._log_sigma_t01_grid[0])
-        lb = max(float(lb), float(self._log_sigma_t01_grid[0]))
+            lb = self.min_t01_for_log_sigma
+        lb = max(float(lb), self.min_t01_for_log_sigma, float(self._log_sigma_t01_grid[0]))
 
         lb_t01 = torch.full((), lb, device=device, dtype=self._log_sigma_t01_grid.dtype)
         log_sigma_min = self._interp_log_sigma_r_from_t01(lb_t01)
