@@ -232,18 +232,24 @@ class ModelKLDM(nn.Module):
             return cached_model
 
         checkpoint = torch.load(checkpoint_path, map_location=device)
+        source_state_dict = checkpoint.get("ema_model_state_dict") or checkpoint["model_state_dict"]
+
+        checkpoint_sigma_norm = source_state_dict.get("tdm._sigma_norms")
+        if checkpoint_sigma_norm is not None and hasattr(checkpoint_sigma_norm, "shape") and len(checkpoint_sigma_norm.shape) > 0:
+            n_sigmas = int(checkpoint_sigma_norm.shape[0])
+        else:
+            n_sigmas = int(getattr(self.tdm, "_sigma_norms", torch.ones(1)).shape[0])
 
         tdm_kwargs = {
             "eps": float(getattr(self.tdm, "eps", self.eps)),
             "n_lambdas": int(getattr(self.tdm, "n_lambdas", 512 if device.type == "cuda" else 128)),
             "lambda_num_batches": int(getattr(self.tdm, "lambda_num_batches", 32 if device.type == "cuda" else 8)),
             "k_wn_score": int(getattr(self.tdm, "k_wn_score", 13)),
-            "n_sigmas": int(getattr(self.tdm, "_sigma_norms", torch.ones(1)).shape[0]),
+            "n_sigmas": n_sigmas,
             "compute_sigma_norm": bool(getattr(self.tdm, "compute_sigma_norm", True)),
         }
         sampling_tdm = TDM(**tdm_kwargs)
         model = ModelKLDM(device=device, diffusion_v=sampling_tdm).to(device)
-        source_state_dict = checkpoint.get("ema_model_state_dict") or checkpoint["model_state_dict"]
 
         # Checkpoints may come from runs with different TDM buffer sizes (for example
         # lambda tables on GPU vs CPU). Filter out any mismatched tensors so sampling
@@ -254,7 +260,6 @@ class ModelKLDM(nn.Module):
         optional_sampling_buffers = {
             "tdm._lambda_t01_grid",
             "tdm._lambda_v_table",
-            "tdm._sigma_norms",
         }
         for key, value in source_state_dict.items():
             if key.startswith("_cached_sampling_model"):
