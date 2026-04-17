@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import math
 from pathlib import Path
-import os
 import sys
 import time
 
@@ -33,6 +32,7 @@ class TrivialisedDiffusionDev(nn.Module):
         lambda_num_batches: int = 16,
         k_wn_score: int = 13,
         n_sigmas: int = 2000,
+        compute_sigma_norm: bool = True,
     ) -> None:
         super().__init__()
         self.eps = float(eps)
@@ -42,32 +42,41 @@ class TrivialisedDiffusionDev(nn.Module):
         self.k_wn_score = int(k_wn_score)
         self.n_lambdas = int(n_lambdas)
         self.lambda_num_batches = int(lambda_num_batches)
+        self.compute_sigma_norm = bool(compute_sigma_norm)
         self.simplified_parameterization = True
         self.use_lambda_weighting = False
 
         self.register_buffer("_lambda_t01_grid", torch.linspace(1e-4, 1.0, self.n_lambdas))
         self.register_buffer("_lambda_v_table", torch.ones(self.n_lambdas))
 
-        sigma_grid_t = torch.linspace(0.0, self.time_scaling_T, int(n_sigmas))
-        sigma_values = self.wrapped_gaussian_sigma_r_t(sigma_grid_t)
-        sigma_precompute_start = time.perf_counter()
-        print(
-            "TDMdev sigma_norm precompute start "
-            f"n_sigmas={n_sigmas} k_wn_score={self.k_wn_score} "
-            f"scale_pos={self.scale_pos:.6f} vel_scale={self.vel_scale:.6f}",
-            flush=True,
-        )
-        sigma_norm_values = sigma_norm(
-            sigma=sigma_values,
-            T=self.scale_pos,
-            K=self.k_wn_score,
-            eps=self.eps,
-        )
-        print(
-            "TDMdev sigma_norm precompute done "
-            f"seconds={time.perf_counter() - sigma_precompute_start:.1f}",
-            flush=True,
-        )
+        if self.compute_sigma_norm:
+            sigma_grid_t = torch.linspace(0.0, self.time_scaling_T, int(n_sigmas))
+            sigma_values = self.wrapped_gaussian_sigma_r_t(sigma_grid_t)
+            sigma_precompute_start = time.perf_counter()
+            print(
+                "TDMdev sigma_norm precompute start "
+                f"n_sigmas={n_sigmas} k_wn_score={self.k_wn_score} "
+                f"scale_pos={self.scale_pos:.6f} vel_scale={self.vel_scale:.6f}",
+                flush=True,
+            )
+            sigma_norm_values = sigma_norm(
+                sigma=sigma_values,
+                T=self.scale_pos,
+                K=self.k_wn_score,
+                eps=self.eps,
+            )
+            print(
+                "TDMdev sigma_norm precompute done "
+                f"seconds={time.perf_counter() - sigma_precompute_start:.1f}",
+                flush=True,
+            )
+        else:
+            sigma_norm_values = torch.ones(int(n_sigmas), dtype=torch.get_default_dtype())
+            print(
+                "TDMdev sigma_norm precompute skipped "
+                f"n_sigmas={n_sigmas} compute_sigma_norm={self.compute_sigma_norm}",
+                flush=True,
+            )
         self.register_buffer("_sigma_norms", sigma_norm_values)
 
     @staticmethod
@@ -179,7 +188,14 @@ class TrivialisedDiffusionDev(nn.Module):
         r_t = self._wrap_internal(mu_r_t + sigma_r_t * epsilon_r)
         f_t = self._wrap_internal(f0 + r_t)
 
+
+
+        f_t = scatter_center(f_t, index=index)
+
+
+
         return f_t, v_t, epsilon_v, epsilon_r, r_t
+
 
     def score_target(
         self,
@@ -238,17 +254,13 @@ class TrivialisedDiffusionDev(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         f_t = self.wrap_displacements(f_t)
 
-        dt_t = torch.as_tensor(
-            self.time_scaling_T * dt,
-            device=v_t.device,
-            dtype=v_t.dtype,
-        )
+        dt_t = torch.as_tensor(self.time_scaling_T * dt, device=v_t.device, dtype=v_t.dtype)
         noise_v = self.sample_velocity_epsilon(v_t, index=index)
 
         exp_dt = torch.exp(dt_t)
         expm1_dt = torch.expm1(dt_t)
         expm1_2dt = torch.expm1(2.0 * dt_t)
-        noise_scale = torch.sqrt(expm1_2dt.clamp_min(self.eps))
+
         score_scale = torch.as_tensor(
             self.vel_scale ** 2,
             device=v_t.device,
@@ -259,7 +271,13 @@ class TrivialisedDiffusionDev(nn.Module):
         # coefficient is reduced by `vel_scale`, so the reverse score drift must
         # carry the matching `vel_scale**2` factor too. Without it, sampling runs
         # far hotter than the trained forward process even when loss looks good.
-        v_prev = exp_dt * v_t + 2.0 * score_scale * expm1_dt * score_v + noise_scale * noise_v
+
+        v_prev = (
+            exp_dt * v_t
+            + 2.0 * score_scale * expm1_dt * score_v
+            + torch.sqrt(expm1_2dt.clamp_min(self.eps)) * noise_v
+        )
+
         f_prev = self._wrap_internal(f_t - dt_t * v_prev)
 
         return f_prev, v_prev

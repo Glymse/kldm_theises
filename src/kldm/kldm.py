@@ -232,14 +232,60 @@ class ModelKLDM(nn.Module):
             return cached_model
 
         checkpoint = torch.load(checkpoint_path, map_location=device)
-        source_state_dict = checkpoint.get("ema_model_state_dict") or checkpoint["model_state_dict"]
-        cleaned_state_dict = {
-            key: value
-            for key, value in source_state_dict.items()
-            if not key.startswith("_cached_sampling_model")
-            and not key.endswith("._lambda_v_table")
+
+        tdm_kwargs = {
+            "eps": float(getattr(self.tdm, "eps", self.eps)),
+            "n_lambdas": int(getattr(self.tdm, "n_lambdas", 512 if device.type == "cuda" else 128)),
+            "lambda_num_batches": int(getattr(self.tdm, "lambda_num_batches", 32 if device.type == "cuda" else 8)),
+            "k_wn_score": int(getattr(self.tdm, "k_wn_score", 13)),
+            "n_sigmas": int(getattr(self.tdm, "_sigma_norms", torch.ones(1)).shape[0]),
+            "compute_sigma_norm": bool(getattr(self.tdm, "compute_sigma_norm", True)),
         }
-        model = ModelKLDM(device=device).to(device)
+        sampling_tdm = TDM(**tdm_kwargs)
+        model = ModelKLDM(device=device, diffusion_v=sampling_tdm).to(device)
+        source_state_dict = checkpoint.get("ema_model_state_dict") or checkpoint["model_state_dict"]
+
+        # Checkpoints may come from runs with different TDM buffer sizes (for example
+        # lambda tables on GPU vs CPU). Filter out any mismatched tensors so sampling
+        # can still load the compatible weights.
+        model_state_dict = model.state_dict()
+        cleaned_state_dict = {}
+        skipped_shape_mismatch = []
+        optional_sampling_buffers = {
+            "tdm._lambda_t01_grid",
+            "tdm._lambda_v_table",
+            "tdm._sigma_norms",
+        }
+        for key, value in source_state_dict.items():
+            if key.startswith("_cached_sampling_model"):
+                continue
+            if key in optional_sampling_buffers:
+                continue
+            if key not in model_state_dict:
+                continue
+            target_value = model_state_dict[key]
+            if hasattr(value, "shape") and hasattr(target_value, "shape") and value.shape != target_value.shape:
+                skipped_shape_mismatch.append((key, tuple(value.shape), tuple(target_value.shape)))
+                continue
+            cleaned_state_dict[key] = value
+
+        if skipped_shape_mismatch:
+            print(
+                "sampling_checkpoint_load: skipped shape-mismatched tensors "
+                f"count={len(skipped_shape_mismatch)}",
+                flush=True,
+            )
+            for key, src_shape, dst_shape in skipped_shape_mismatch[:8]:
+                print(
+                    f"  - {key}: checkpoint{src_shape} != model{dst_shape}",
+                    flush=True,
+                )
+            if len(skipped_shape_mismatch) > 8:
+                print(
+                    f"  ... and {len(skipped_shape_mismatch) - 8} more",
+                    flush=True,
+                )
+
         model.load_state_dict(cleaned_state_dict, strict=False)
         model.eval()
 
@@ -266,19 +312,20 @@ class ModelKLDM(nn.Module):
         edge_node_index = batch.edge_node_index
         num_graphs = batch.num_graphs
 
-        # Algorithm 3 priors:
-        # let the active TDM own the position/velocity prior if it exposes one.
-        if hasattr(self.tdm, "sample_prior"):
-            f_t, v_t = self.tdm.sample_prior(node_index)
-        else:
-            v_t = scatter_center(torch.randn_like(batch.pos), index=node_index)
-            f_t = self.tdm.wrap_displacements(torch.rand_like(batch.pos))
-        l_t = torch.randn_like(batch.l)
-        a_t = batch.h  # CSP conditioning
-
+        # Use the same model object for both prior sampling and reverse denoising.
         sampling_model = self if checkpoint_path is None else self._load_sampling_model(checkpoint_path)
         sampling_tdm = sampling_model.tdm
         sampling_diffusion_l = sampling_model.diffusion_l
+
+        # Algorithm 3 priors:
+        # let the active TDM own the position/velocity prior if it exposes one.
+        if hasattr(sampling_tdm, "sample_prior"):
+            f_t, v_t = sampling_tdm.sample_prior(node_index)
+        else:
+            v_t = scatter_center(torch.randn_like(batch.pos), index=node_index)
+            f_t = sampling_tdm.wrap_displacements(torch.rand_like(batch.pos))
+        l_t = torch.randn_like(batch.l)
+        a_t = batch.h  # CSP conditioning
 
         if checkpoint_path is None:
             score_network = sampling_model.score_network

@@ -3,6 +3,8 @@ from __future__ import annotations
 import argparse
 import csv
 from contextlib import contextmanager
+import errno
+import os
 from pathlib import Path
 import re
 import signal
@@ -286,6 +288,25 @@ def clean_model_state_dict(model: ModelKLDM) -> dict[str, torch.Tensor]:
     }
 
 
+def is_no_space_error(exc: BaseException) -> bool:
+    if isinstance(exc, OSError):
+        return exc.errno == errno.ENOSPC
+    message = str(exc).lower()
+    return "no space left on device" in message
+
+
+def resolve_artifacts_root() -> Path:
+    override = os.environ.get("KLDM_ARTIFACTS_DIR")
+    if override:
+        return Path(override).expanduser()
+
+    tmpdir = os.environ.get("TMPDIR")
+    if tmpdir:
+        return Path(tmpdir) / "kldm_artifacts"
+
+    return Path("artifacts") / "HPC"
+
+
 def export_model_checkpoint(
     model: ModelKLDM,
     optimizer: torch.optim.Optimizer,
@@ -308,12 +329,54 @@ def export_model_checkpoint(
     )
 
 
+def try_export_model_checkpoint(
+    model: ModelKLDM,
+    optimizer: torch.optim.Optimizer,
+    ema: ExponentialMovingAverage | None,
+    output_path: Path,
+    config: dict[str, Any],
+    epoch: int,
+) -> bool:
+    try:
+        export_model_checkpoint(
+            model=model,
+            optimizer=optimizer,
+            ema=ema,
+            output_path=output_path,
+            config=config,
+            epoch=epoch,
+        )
+        return True
+    except Exception as exc:
+        if is_no_space_error(exc):
+            print(
+                f"warning: skipping checkpoint export due to no space left: {output_path}",
+                flush=True,
+            )
+            return False
+        raise
+
+
 def export_csv(rows: list[dict[str, Any]], output_path: Path, fieldnames: list[str]) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with output_path.open("w", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
+
+
+def try_export_csv(rows: list[dict[str, Any]], output_path: Path, fieldnames: list[str]) -> bool:
+    try:
+        export_csv(rows=rows, output_path=output_path, fieldnames=fieldnames)
+        return True
+    except Exception as exc:
+        if is_no_space_error(exc):
+            print(
+                f"warning: skipping csv export due to no space left: {output_path}",
+                flush=True,
+            )
+            return False
+        raise
 
 
 def maybe_plot_training_metrics(rows: list[dict[str, Any]], output_path: Path) -> Path | None:
@@ -675,12 +738,13 @@ def train() -> None:
     wandb.define_metric("train/*", step_metric="epoch")
     wandb.define_metric("val/*", step_metric="epoch")
 
-    artifacts_dir = Path("artifacts") / "HPC"
+    artifacts_dir = resolve_artifacts_root()
     checkpoints_dir = artifacts_dir / "checkpoints"
     history_path = artifacts_dir / "training_history.csv"
     sampling_history_path = artifacts_dir / "sampling_history.csv"
     training_plot_path = artifacts_dir / "training_metrics.png"
     sampling_plot_path = artifacts_dir / "sampling_metrics.png"
+    print(f"using artifacts_dir={artifacts_dir}", flush=True)
 
     history: list[dict[str, Any]] = []
     epoch = start_epoch
@@ -770,7 +834,7 @@ def train() -> None:
                     }
                 )
             wandb.log(train_log_payload)
-            export_csv(
+            try_export_csv(
                 rows=history,
                 output_path=history_path,
                 fieldnames=[
@@ -821,7 +885,7 @@ def train() -> None:
                 f"epoch={epoch:04d} exporting checkpoint",
                 flush=True,
             )
-            export_model_checkpoint(
+            checkpoint_written = try_export_model_checkpoint(
                 model=model,
                 optimizer=optimizer,
                 ema=ema,
@@ -911,7 +975,7 @@ def train() -> None:
                 )
             wandb.log(val_log_payload)
 
-            export_csv(
+            try_export_csv(
                 rows=history,
                 output_path=history_path,
                 fieldnames=[
@@ -927,7 +991,7 @@ def train() -> None:
                     "rmse",
                 ],
             )
-            export_csv(
+            try_export_csv(
                 rows=[
                     {
                         "epoch": row["epoch"],
@@ -956,7 +1020,16 @@ def train() -> None:
                 f"epoch={epoch:04d} writing training metrics plot",
                 flush=True,
             )
-            maybe_plot_training_metrics(history, training_plot_path)
+            try:
+                maybe_plot_training_metrics(history, training_plot_path)
+            except Exception as exc:
+                if is_no_space_error(exc):
+                    print(
+                        f"epoch={epoch:04d} warning: skipping training plot due to no space left",
+                        flush=True,
+                    )
+                else:
+                    raise
             print(
                 f"epoch={epoch:04d} finished training metrics plot",
                 flush=True,
@@ -965,13 +1038,22 @@ def train() -> None:
                 f"epoch={epoch:04d} writing sampling metrics plot",
                 flush=True,
             )
-            maybe_plot_sampling_metrics(history, sampling_plot_path)
+            try:
+                maybe_plot_sampling_metrics(history, sampling_plot_path)
+            except Exception as exc:
+                if is_no_space_error(exc):
+                    print(
+                        f"epoch={epoch:04d} warning: skipping sampling plot due to no space left",
+                        flush=True,
+                    )
+                else:
+                    raise
             print(
                 f"epoch={epoch:04d} finished sampling metrics plot",
                 flush=True,
             )
 
-            if run is not None:
+            if run is not None and checkpoint_written:
                 try:
                     print(
                         f"epoch={epoch:04d} logging checkpoint artifact",
@@ -1028,7 +1110,7 @@ def train() -> None:
 
     finally:
         final_checkpoint_path = checkpoints_dir / f"checkpoint_epoch_{epoch}_final.pt"
-        export_model_checkpoint(
+        final_checkpoint_written = try_export_model_checkpoint(
             model=model,
             optimizer=optimizer,
             ema=ema,
@@ -1038,7 +1120,7 @@ def train() -> None:
         )
 
         final_artifact = wandb.Artifact("csp_hpc_final", type="model")
-        if final_checkpoint_path.exists():
+        if final_checkpoint_written and final_checkpoint_path.exists():
             final_artifact.add_file(str(final_checkpoint_path))
         if history_path.exists():
             final_artifact.add_file(str(history_path))
