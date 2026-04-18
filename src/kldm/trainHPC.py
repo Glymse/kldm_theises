@@ -609,6 +609,12 @@ def parse_args() -> argparse.Namespace:
         help="Learning rate.",
     )
     parser.add_argument(
+        "--weight-decay",
+        type=float,
+        default=1e-8,
+        help="AdamW weight decay.",
+    )
+    parser.add_argument(
         "--max-epochs",
         type=int,
         default=None,
@@ -644,6 +650,7 @@ def train() -> None:
         "task": "CSP",
         "batch_size": args.batch_size,
         "lr": args.lr,
+        "weight_decay": args.weight_decay,
         "lambda_v": 1.0,
         "lambda_l": 1.0,
         "validate_every": args.validate_every,
@@ -690,7 +697,11 @@ def train() -> None:
         train_loader,
         device=device,
     )
-    optimizer = torch.optim.AdamW(model.parameters(), lr=config["lr"])
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=config["lr"],
+        weight_decay=config["weight_decay"],
+    )
     ema = ExponentialMovingAverage(
         model=model,
         decay=config["ema_decay"],
@@ -772,6 +783,7 @@ def train() -> None:
 
             row = {
                 "epoch": epoch,
+                "lr": float(optimizer.param_groups[0]["lr"]),
                 "train_loss_weighted": train_metrics["loss"],
                 "train_loss_v": train_metrics["loss_v"],
                 "train_loss_l": train_metrics["loss_l"],
@@ -787,6 +799,7 @@ def train() -> None:
             if args.dev:
                 print(
                     f"epoch={epoch:04d} "
+                    f"lr={optimizer.param_groups[0]['lr']:.6g} "
                     f"train_loss_weighted={train_metrics['loss']:.6f} "
                     f"(v={train_metrics['loss_v']:.6f}, raw_v={train_metrics['raw_loss_v']:.6f}, l={train_metrics['loss_l']:.6f}) "
                     f"target_v_abs={train_metrics['target_v_abs_mean']:.6f} "
@@ -797,6 +810,7 @@ def train() -> None:
             else:
                 print(
                     f"epoch={epoch:04d} "
+                    f"lr={optimizer.param_groups[0]['lr']:.6g} "
                     f"train_loss_weighted={train_metrics['loss']:.6f} "
                     f"(loss_v={train_metrics['loss_v']:.6f}, loss_l={train_metrics['loss_l']:.6f})"
                 )
@@ -805,6 +819,7 @@ def train() -> None:
 
             train_log_payload = {
                 "epoch": epoch,
+                "train/lr": float(optimizer.param_groups[0]["lr"]),
                 "train/loss_weighted": train_metrics["loss"],
                 "train/loss_v": train_metrics["loss_v"],
                 "train/loss_l": train_metrics["loss_l"],
@@ -839,6 +854,7 @@ def train() -> None:
                 output_path=history_path,
                 fieldnames=[
                     "epoch",
+                    "lr",
                     "train_loss_weighted",
                     "train_loss_v",
                     "train_loss_l",
