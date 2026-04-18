@@ -274,7 +274,7 @@ class TrivialisedDiffusionDev(nn.Module):
 
         v_prev = (
             exp_dt * v_t
-            + 2.0 * expm1_dt * score_v
+            + 2.0 * score_scale * expm1_dt * score_v
             + torch.sqrt(expm1_2dt.clamp_min(self.eps)) * noise_v
         )
 

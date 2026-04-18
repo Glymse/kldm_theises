@@ -303,6 +303,8 @@ class ModelKLDM(nn.Module):
         n_steps: int,
         batch: Batch | Data,
         checkpoint_path: str | None = None,
+        t_start: float = 1.0,
+        t_final: float = 1e-3,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Algorithm 3 sampling for CSP, KLDM-epsilon version.
@@ -340,13 +342,23 @@ class ModelKLDM(nn.Module):
             score_network = sampling_model.score_network
             restore_training = False
 
-        dt = 1.0 / n_steps
+        if n_steps <= 0:
+            raise ValueError("n_steps must be positive.")
+        if not (0.0 < t_final < t_start <= 1.0):
+            raise ValueError("Expected 0 < t_final < t_start <= 1.")
+
+        # Match facit more closely: sample on a descending time grid and stop at a
+        # small positive time instead of marching to exactly t=0, where sigma_v(t)^2
+        # becomes numerically extreme and the final reverse steps get unnecessarily
+        # stiff.
+        ts = torch.linspace(t_start, t_final, n_steps + 1, device=device, dtype=batch.pos.dtype)
 
         try:
             with torch.no_grad():
-                for n in range(1, n_steps + 1):
-                    t_scalar = 1.0 - (n - 1) * dt
-                    t_graph = torch.full((num_graphs, 1), t_scalar, device=device)
+                for n in range(n_steps):
+                    t_scalar = float(ts[n].item())
+                    dt = float((ts[n] - ts[n + 1]).item())
+                    t_graph = torch.full((num_graphs, 1), t_scalar, device=device, dtype=batch.pos.dtype)
                     t_node = t_graph[node_index].squeeze(-1)
 
                     preds = score_network(
@@ -378,7 +390,7 @@ class ModelKLDM(nn.Module):
                         v_t=v_t,
                         score_v=score_v,
                         index=node_index,
-                        dt=dt, #This is scaled internally.
+                        dt=dt, # This is scaled internally.
                     )
 
                     # KLDM-epsilon lattice branch:

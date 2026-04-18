@@ -226,16 +226,22 @@ def main() -> None:
     )
     parser.add_argument("--n-steps", type=int, default=1000, help="Number of Algorithm 3 sampling steps.")
     parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=256,
+        help="Validation dataloader batch size. Match trainHPC validation for closest parity.",
+    )
+    parser.add_argument(
         "--max-samples",
         type=int,
-        default=100,
+        default=1024,
         help="Maximum number of validation CSPs to sample. Use 0 or a negative value to sample the full loader.",
     )
     parser.add_argument(
         "--use-sigma-norm",
         action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Enable sigma_norm precompute in TDMdev. Disabled by default for sampling speed.",
+        default=True,
+        help="Enable sigma_norm behavior in TDMdev. Enabled by default to match trainHPC sampling.",
     )
     args = parser.parse_args()
 
@@ -248,7 +254,7 @@ def main() -> None:
     loader = CSPTask().dataloader(
         root=root,
         split="val",
-        batch_size=1,
+        batch_size=args.batch_size,
         shuffle=False,
         download=True,
     )
