@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 import csv
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 import errno
 import os
 from pathlib import Path
@@ -38,6 +38,35 @@ except ImportError:  # pragma: no cover
 
 
 STOP_REQUESTED = False
+TIME_LOWER_BOUND = 1e-3
+
+NODE_AVERAGED_METRICS = {
+    "loss_v",
+    "raw_loss_v",
+    "target_v_abs_mean",
+    "target_v_norm_mean",
+    "pred_v_abs_mean",
+    "pred_v_norm_mean",
+    "lambda_v_mean",
+    "lambda_v_effective",
+    "v_t_abs_mean",
+    "f_t_abs_mean",
+    "r_t_abs_mean",
+    "score_v_abs_mean",
+}
+
+GRAPH_AVERAGED_METRICS = {
+    "loss_l",
+    "pred_l_abs_mean",
+    "target_l_abs_mean",
+}
+
+BATCH_AVERAGED_METRICS = {
+    "grad_norm",
+    "score_network_grad_norm",
+    "out_v_grad_norm",
+    "out_l_grad_norm",
+}
 
 
 def _request_stop(_signum=None, _frame=None) -> None:
@@ -61,15 +90,86 @@ def should_stop(run) -> bool:
     return False
 
 
+def sample_graph_times(num_graphs: int, device: torch.device) -> torch.Tensor:
+    return sample_uniform(
+        lb=TIME_LOWER_BOUND,
+        size=(num_graphs, 1),
+        device=device,
+    )
+
+
+def aggregate_epoch_metrics(
+    batch_metrics: list[tuple[dict[str, float], float, float]],
+    *,
+    lambda_v: float,
+    lambda_l: float,
+) -> dict[str, float]:
+    if not batch_metrics:
+        raise RuntimeError("Cannot aggregate empty metric list.")
+
+    totals_node: dict[str, float] = {}
+    totals_graph: dict[str, float] = {}
+    totals_batch: dict[str, float] = {}
+    totals_other_graph: dict[str, float] = {}
+    min_metrics: dict[str, float] = {}
+    max_metrics: dict[str, float] = {}
+
+    total_nodes = 0.0
+    total_graphs = 0.0
+    total_batches = 0.0
+
+    for metrics, num_nodes, num_graphs in batch_metrics:
+        total_nodes += num_nodes
+        total_graphs += num_graphs
+        total_batches += 1.0
+
+        for key, value in metrics.items():
+            if key == "loss":
+                continue
+            if key in NODE_AVERAGED_METRICS:
+                totals_node[key] = totals_node.get(key, 0.0) + float(value) * num_nodes
+            elif key in GRAPH_AVERAGED_METRICS:
+                totals_graph[key] = totals_graph.get(key, 0.0) + float(value) * num_graphs
+            elif key == "lambda_v_min":
+                min_metrics[key] = float(value) if key not in min_metrics else min(min_metrics[key], float(value))
+            elif key == "lambda_v_max":
+                max_metrics[key] = float(value) if key not in max_metrics else max(max_metrics[key], float(value))
+            elif key in BATCH_AVERAGED_METRICS:
+                totals_batch[key] = totals_batch.get(key, 0.0) + float(value)
+            else:
+                totals_other_graph[key] = totals_other_graph.get(key, 0.0) + float(value) * num_graphs
+
+    aggregated: dict[str, float] = {}
+    if total_nodes > 0.0:
+        for key, total in totals_node.items():
+            aggregated[key] = total / total_nodes
+    if total_graphs > 0.0:
+        for key, total in totals_graph.items():
+            aggregated[key] = total / total_graphs
+        for key, total in totals_other_graph.items():
+            aggregated[key] = total / total_graphs
+    if total_batches > 0.0:
+        for key, total in totals_batch.items():
+            aggregated[key] = total / total_batches
+
+    aggregated.update(min_metrics)
+    aggregated.update(max_metrics)
+
+    aggregated["loss_v"] = aggregated.get("loss_v", 0.0)
+    aggregated["loss_l"] = aggregated.get("loss_l", 0.0)
+    aggregated["loss"] = lambda_v * aggregated["loss_v"] + lambda_l * aggregated["loss_l"]
+    return aggregated
+
+
 class ExponentialMovingAverage:
     def __init__(
         self,
         model: ModelKLDM,
         decay: float = 0.999,
-        start_step: int = 500,
+        start_epoch: int = 500,
     ) -> None:
         self.decay = float(decay)
-        self.start_step = int(start_step)
+        self.start_epoch = int(start_epoch)
         self.num_updates = 0
         self.shadow = {
             name: param.detach().clone()
@@ -78,28 +178,26 @@ class ExponentialMovingAverage:
         }
         self.backup: dict[str, torch.Tensor] = {}
 
-    def update(self, model: ModelKLDM) -> None:
+    def update(self, model: ModelKLDM, current_epoch: int) -> None:
+        if current_epoch <= self.start_epoch:
+            return
         self.num_updates += 1
-
         for name, param in model.named_parameters():
             if not param.requires_grad:
                 continue
-            if self.num_updates <= self.start_step:
-                self.shadow[name].copy_(param.detach())
-            else:
-                self.shadow[name].mul_(self.decay).add_(param.detach(), alpha=1.0 - self.decay)
+            self.shadow[name].mul_(self.decay).add_(param.detach(), alpha=1.0 - self.decay)
 
     def state_dict(self) -> dict[str, Any]:
         return {
             "decay": self.decay,
-            "start_step": self.start_step,
+            "start_epoch": self.start_epoch,
             "num_updates": self.num_updates,
             "shadow": {name: tensor.clone() for name, tensor in self.shadow.items()},
         }
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
         self.decay = float(state_dict.get("decay", self.decay))
-        self.start_step = int(state_dict.get("start_step", self.start_step))
+        self.start_epoch = int(state_dict.get("start_epoch", state_dict.get("start_step", self.start_epoch)))
         self.num_updates = int(state_dict.get("num_updates", 0))
         self.shadow = {
             name: tensor.clone()
@@ -148,11 +246,7 @@ def validation_step(
     model.eval()
     batch = batch.to(device)
 
-    t_graph = sample_uniform(
-        lb=model.diffusion_l.eps,
-        size=(batch.num_graphs, 1),
-        device=device,
-    )
+    t_graph = sample_graph_times(num_graphs=batch.num_graphs, device=device)
 
     with torch.no_grad():
         loss, metrics = model.algorithm2_loss(
@@ -175,30 +269,28 @@ def train_epoch(
     optimizer: torch.optim.Optimizer,
     ema: ExponentialMovingAverage,
     device: torch.device,
+    epoch: int,
+    lambda_v: float,
     lambda_l: float,
     debug: bool = False,
 ) -> dict[str, float]:
     model.train()
-    running: dict[str, float] = {}
-    num_graphs_total = 0.0
+    batch_metrics: list[tuple[dict[str, float], float, float]] = []
 
     for batch in loader:
         if STOP_REQUESTED:
             break
 
         batch = batch.to(device)
-        batch_weight = float(batch.num_graphs)
-        t_graph = sample_uniform(
-            lb=model.diffusion_l.eps,
-            size=(batch.num_graphs, 1),
-            device=device,
-        )
+        num_graphs = float(batch.num_graphs)
+        num_nodes = float(batch.pos.shape[0])
+        t_graph = sample_graph_times(num_graphs=batch.num_graphs, device=device)
 
         optimizer.zero_grad()
         loss, metrics = model.algorithm2_loss(
             batch=batch,
             t=t_graph,
-            lambda_v=1.0,
+            lambda_v=lambda_v,
             lambda_l=lambda_l,
             debug=debug,
         )
@@ -229,31 +321,31 @@ def train_epoch(
                 }
             )
         optimizer.step()
-        ema.update(model)
+        ema.update(model, current_epoch=epoch)
+        batch_metrics.append(
+            ({key: float(value) for key, value in metrics.items()}, num_nodes, num_graphs)
+        )
 
-        for key, value in metrics.items():
-            running[key] = running.get(key, 0.0) + float(value) * batch_weight
-        num_graphs_total += batch_weight
-
-    if num_graphs_total <= 0.0:
+    if not batch_metrics:
         raise RuntimeError("Training loader is empty or interrupted before any batch was processed.")
-
-    for key in running:
-        running[key] /= num_graphs_total
-    return running
+    return aggregate_epoch_metrics(
+        batch_metrics,
+        lambda_v=lambda_v,
+        lambda_l=lambda_l,
+    )
 
 
 def evaluate_loss(
     model: ModelKLDM,
     loader,
     device: torch.device,
+    lambda_v: float,
     lambda_l: float,
     max_graphs: int | None = None,
     debug: bool = False,
 ) -> dict[str, float]:
-    totals: dict[str, float] = {}
-    num_graphs_total = 0.0
     num_graphs_seen = 0.0
+    batch_metrics: list[tuple[dict[str, float], float, float]] = []
 
     for batch in loader:
         metrics = validation_step(
@@ -263,20 +355,20 @@ def evaluate_loss(
             lambda_l=lambda_l,
             debug=debug,
         )
-        batch_weight = float(batch.num_graphs)
-        for key, value in metrics.items():
-            totals[key] = totals.get(key, 0.0) + value * batch_weight
-        num_graphs_total += batch_weight
-        num_graphs_seen += batch_weight
+        num_graphs = float(batch.num_graphs)
+        num_nodes = float(batch.pos.shape[0])
+        batch_metrics.append((metrics, num_nodes, num_graphs))
+        num_graphs_seen += num_graphs
         if max_graphs is not None and num_graphs_seen >= max_graphs:
             break
 
-    if num_graphs_total <= 0.0:
+    if not batch_metrics:
         raise RuntimeError("Validation loader is empty; cannot compute epoch metrics.")
-
-    for key in totals:
-        totals[key] /= num_graphs_total
-    return totals
+    return aggregate_epoch_metrics(
+        batch_metrics,
+        lambda_v=lambda_v,
+        lambda_l=lambda_l,
+    )
 
 
 def clean_model_state_dict(model: ModelKLDM) -> dict[str, torch.Tensor]:
@@ -605,14 +697,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--lr",
         type=float,
-        default=2e-4,
-        help="Learning rate.",
+        default=1e-3,
+        help="Learning rate. Defaults to facitKLDM's 1e-3.",
     )
     parser.add_argument(
         "--weight-decay",
         type=float,
-        default=1e-8,
-        help="AdamW weight decay.",
+        default=1e-12,
+        help="AdamW weight decay. Defaults to facitKLDM's 1e-12.",
     )
     parser.add_argument(
         "--max-epochs",
@@ -630,7 +722,7 @@ def parse_args() -> argparse.Namespace:
         "--ema-start",
         type=int,
         default=500,
-        help="Number of optimizer steps before EMA switches from copying to decayed updates.",
+        help="Epoch threshold after which EMA starts updating, matching facitKLDM semantics.",
     )
     parser.add_argument(
         "--dev",
@@ -700,12 +792,14 @@ def train() -> None:
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=config["lr"],
+        amsgrad=True,
+        foreach=True,
         weight_decay=config["weight_decay"],
     )
     ema = ExponentialMovingAverage(
         model=model,
         decay=config["ema_decay"],
-        start_step=config["ema_start"],
+        start_epoch=config["ema_start"],
     )
     lambda_table = getattr(model.tdm, "_lambda_v_table", None)
     if args.dev and isinstance(lambda_table, torch.Tensor):
@@ -777,6 +871,8 @@ def train() -> None:
                 optimizer=optimizer,
                 ema=ema,
                 device=device,
+                epoch=epoch,
+                lambda_v=config["lambda_v"],
                 lambda_l=config["lambda_l"],
                 debug=args.dev,
             )
@@ -873,23 +969,23 @@ def train() -> None:
                 flush=True,
             )
 
-            with ema.average_parameters(model):
-                print(
-                    f"epoch={epoch:04d} starting validation loss pass",
-                    flush=True,
-                )
-                val_metrics = evaluate_loss(
-                    model=model,
-                    loader=val_loader,
-                    device=device,
-                    lambda_l=config["lambda_l"],
-                    max_graphs=config["val_subset_graphs"],
-                    debug=args.dev,
-                )
-                print(
-                    f"epoch={epoch:04d} finished validation loss pass",
-                    flush=True,
-                )
+            print(
+                f"epoch={epoch:04d} starting validation loss pass",
+                flush=True,
+            )
+            val_metrics = evaluate_loss(
+                model=model,
+                loader=val_loader,
+                device=device,
+                lambda_v=config["lambda_v"],
+                lambda_l=config["lambda_l"],
+                max_graphs=config["val_subset_graphs"],
+                debug=args.dev,
+            )
+            print(
+                f"epoch={epoch:04d} finished validation loss pass",
+                flush=True,
+            )
 
             checkpoint_path = checkpoints_dir / f"checkpoint_epoch_{epoch}.pt"
             print(
@@ -905,7 +1001,12 @@ def train() -> None:
                 epoch=epoch,
             )
 
-            with ema.average_parameters(model):
+            sampling_context = (
+                ema.average_parameters(model)
+                if epoch > config["ema_start"]
+                else nullcontext()
+            )
+            with sampling_context:
                 print(
                     f"epoch={epoch:04d} starting sampling evaluation",
                     flush=True,
