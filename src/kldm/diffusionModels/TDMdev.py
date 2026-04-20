@@ -190,7 +190,7 @@ class TrivialisedDiffusionDev(nn.Module):
 
 
 
-        f_t = scatter_center(f_t, index=index)
+        #f_t = scatter_center(f_t, index=index)
 
 
 
