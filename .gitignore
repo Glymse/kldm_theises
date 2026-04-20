@@ -8,6 +8,8 @@ møde.txt
 # test cache
 manual_test/
 
+src/torsional
+
 # other local dev info
 .vscode/
 

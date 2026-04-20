@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 import csv
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager
 import errno
 import os
 from pathlib import Path
@@ -554,6 +554,7 @@ def run_sampling_evaluation(
     device: torch.device,
     n_steps: int,
     max_graphs: int | None = None,
+    checkpoint_path: str | None = None,
 ) -> dict[str, float | int]:
     reconstruction_results = []
     num_graphs_seen = 0
@@ -567,6 +568,7 @@ def run_sampling_evaluation(
             pos_t, v_t, l_t, h_t = model.sample_CSP_algorithm3(
                 n_steps=n_steps,
                 batch=batch,
+                checkpoint_path=checkpoint_path,
             )
 
         ptr = batch.ptr.tolist()
@@ -1001,27 +1003,22 @@ def train() -> None:
                 epoch=epoch,
             )
 
-            sampling_context = (
-                ema.average_parameters(model)
-                if epoch > config["ema_start"]
-                else nullcontext()
+            print(
+                f"epoch={epoch:04d} starting sampling evaluation",
+                flush=True,
             )
-            with sampling_context:
-                print(
-                    f"epoch={epoch:04d} starting sampling evaluation",
-                    flush=True,
-                )
-                sampling_metrics = run_sampling_evaluation(
-                    model=model,
-                    loader=val_loader,
-                    device=device,
-                    n_steps=config["sampling_steps"],
-                    max_graphs=config["val_subset_graphs"],
-                )
-                print(
-                    f"epoch={epoch:04d} finished sampling evaluation",
-                    flush=True,
-                )
+            sampling_metrics = run_sampling_evaluation(
+                model=model,
+                loader=val_loader,
+                device=device,
+                n_steps=config["sampling_steps"],
+                max_graphs=config["val_subset_graphs"],
+                checkpoint_path=str(checkpoint_path) if checkpoint_written else None,
+            )
+            print(
+                f"epoch={epoch:04d} finished sampling evaluation",
+                flush=True,
+            )
 
             row["val_loss_weighted"] = val_metrics["loss"]
             row["val_loss_v"] = val_metrics["loss_v"]
