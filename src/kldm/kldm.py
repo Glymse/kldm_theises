@@ -47,7 +47,7 @@ class ModelKLDM(nn.Module):
             num_layers=6,
             num_freqs=128,
             ln=True,
-            h_dim=118,
+            h_dim=100,
             smooth=False,
             pred_v=True,
             pred_l=True,
@@ -135,7 +135,7 @@ class ModelKLDM(nn.Module):
         batch: Data | Batch,
         t: torch.Tensor,
         lambda_v: float = 1.0,
-        lambda_l: float = 0.5,
+        lambda_l: float = 1.0,
         debug: bool = False,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """
@@ -232,7 +232,21 @@ class ModelKLDM(nn.Module):
             return cached_model
 
         checkpoint = torch.load(checkpoint_path, map_location=device)
-        source_state_dict = checkpoint.get("ema_model_state_dict") or checkpoint["model_state_dict"]
+
+        # Match facit's model selection more closely: only sample from EMA once the
+        # checkpoint epoch is past EMA start. Before that, sample from the live model
+        # weights saved in the checkpoint rather than the still-frozen EMA shadow.
+        ema_state_dict = checkpoint.get("ema_model_state_dict")
+        ema_metadata = checkpoint.get("ema_state_dict") or {}
+        ema_start = int(ema_metadata.get("start_epoch", ema_metadata.get("start_step", 500)))
+        ema_num_updates = int(ema_metadata.get("num_updates", 0))
+        checkpoint_epoch = int(checkpoint.get("epoch", 0))
+        use_ema_for_sampling = (
+            ema_state_dict is not None
+            and checkpoint_epoch > ema_start
+            and ema_num_updates > 0
+        )
+        source_state_dict = ema_state_dict if use_ema_for_sampling else checkpoint["model_state_dict"]
 
         checkpoint_sigma_norm = source_state_dict.get("tdm._sigma_norms")
         if checkpoint_sigma_norm is not None and hasattr(checkpoint_sigma_norm, "shape") and len(checkpoint_sigma_norm.shape) > 0:
@@ -402,8 +416,10 @@ class ModelKLDM(nn.Module):
                         dt=dt,
                     )
 
-                # For KLDM-epsilon Algorithm 3, return the final sampled l_N directly
-                return sampling_tdm.wrap_positions(f_t), v_t, l_t, a_t
+                # Match facit's convention and keep the final positional sample in
+                # the centered wrapped chart. Downstream structure conversion handles
+                # the periodic map back into [0, 1) when needed.
+                return f_t, v_t, l_t, a_t
         finally:
             if checkpoint_path is None and restore_training:
                 score_network.train()

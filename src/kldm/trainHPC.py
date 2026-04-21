@@ -15,6 +15,7 @@ if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import torch
+from torch.utils.data import DataLoader, Subset
 
 from kldm.data import CSPTask, resolve_data_root
 # from kldm.diffusionModels.trivialized_diffusion import TrivialisedDiffusion
@@ -39,6 +40,9 @@ except ImportError:  # pragma: no cover
 
 STOP_REQUESTED = False
 TIME_LOWER_BOUND = 1e-3
+VAL_SUBSET_SEED = 123
+LOADER_NUM_WORKERS = 1
+LOADER_PIN_MEMORY = True
 
 NODE_AVERAGED_METRICS = {
     "loss_v",
@@ -96,6 +100,14 @@ def sample_graph_times(num_graphs: int, device: torch.device) -> torch.Tensor:
         size=(num_graphs, 1),
         device=device,
     )
+
+
+def make_fixed_subset(dataset, subset_size: int, seed: int):
+    if subset_size <= 0 or subset_size >= len(dataset):
+        return dataset
+    generator = torch.Generator().manual_seed(seed)
+    indices = torch.randperm(len(dataset), generator=generator)[:subset_size].tolist()
+    return Subset(dataset, indices)
 
 
 def aggregate_epoch_metrics(
@@ -752,10 +764,13 @@ def train() -> None:
         "sampling_samples": args.sampling_samples,
         "sampling_steps": args.sampling_steps,
         "val_subset_graphs": 1024,
+        "val_subset_seed": VAL_SUBSET_SEED,
         "load_from_checkpoint": args.load_from_checkpoint,
         "max_epochs": args.max_epochs,
         "ema_decay": args.ema_decay,
         "ema_start": args.ema_start,
+        "num_workers": LOADER_NUM_WORKERS,
+        "pin_memory": LOADER_PIN_MEMORY,
         "dev": args.dev,
     }
 
@@ -764,17 +779,27 @@ def train() -> None:
         split="train",
         batch_size=config["batch_size"],
         shuffle=True,
+        num_workers=config["num_workers"],
+        pin_memory=config["pin_memory"],
         download=True,
     )
-    #Make sure to use the same validation subset over the validation epochs.
-    #TODO:
-
-    val_loader = CSPTask().dataloader(
+    val_dataset_full = CSPTask().fit_dataset(
         root=root,
         split="val",
+        download=True,
+    )
+    val_dataset = make_fixed_subset(
+        val_dataset_full,
+        subset_size=config["val_subset_graphs"],
+        seed=config["val_subset_seed"],
+    )
+    val_loader = DataLoader(
+        val_dataset,
         batch_size=config["batch_size"],
         shuffle=False,
-        download=True,
+        num_workers=config["num_workers"],
+        pin_memory=config["pin_memory"],
+        collate_fn=val_dataset_full.collate_fn,
     )
 
     print("constructed train/val loaders", flush=True)

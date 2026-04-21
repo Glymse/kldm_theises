@@ -13,6 +13,10 @@ from torch_geometric.utils import dense_to_sparse, one_hot
 
 
 DEFAULT_ATOMIC_VOCAB: list[int] = list(range(1, 119))
+WORKSPACE_ROOT = Path(__file__).resolve().parents[3]
+DEFAULT_DATA_ROOT = WORKSPACE_ROOT / "data"
+DEFAULT_MP20_LENGTHS_LOC_SCALE_PATH = DEFAULT_DATA_ROOT / "mp_20" / "train_loc_scale.json"
+FACIT_ANGLES_LOC_SCALE: tuple[float, float] = (0.0, 0.35)
 
 
 def _cell_lengths_and_angles(cell_matrix: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -22,6 +26,60 @@ def _cell_lengths_and_angles(cell_matrix: torch.Tensor) -> tuple[torch.Tensor, t
     beta = torch.acos(torch.clamp(torch.dot(cell_matrix[0], cell_matrix[2]) / (lengths[0] * lengths[2]), -1.0, 1.0))
     gamma = torch.acos(torch.clamp(torch.dot(cell_matrix[0], cell_matrix[1]) / (lengths[0] * lengths[1]), -1.0, 1.0))
     return lengths, torch.stack([alpha, beta, gamma])
+
+
+def ensure_lengths_loc_scale_cache(
+    *,
+    cache_file: str | Path,
+    processed_dir: str | Path,
+    quantile: float = 0.025,
+    eps: float = 1e-8,
+) -> Path:
+    """Generate facit-style log-length stats from a processed split if missing.
+
+    The KLDM paper/facit preprocessing stores per-atom-count statistics for
+    `log(lengths)` and trims 2.5% from each tail before computing mean/std.
+    """
+    cache_path = Path(cache_file)
+    if cache_path.exists():
+        return cache_path
+
+    processed_path = Path(processed_dir)
+    cell_path = processed_path / "cell.npy"
+    num_atoms_path = processed_path / "num_atoms.npy"
+    if not cell_path.exists() or not num_atoms_path.exists():
+        return cache_path
+
+    import numpy as np
+
+    cells = np.load(cell_path, allow_pickle=True)
+    num_atoms = np.load(num_atoms_path, allow_pickle=True)
+
+    values_by_key: dict[int, list[torch.Tensor]] = defaultdict(list)
+    for cell, n_atoms in zip(cells, num_atoms, strict=False):
+        cell_tensor = torch.as_tensor(cell, dtype=torch.get_default_dtype())
+        if cell_tensor.ndim == 3 and cell_tensor.shape[0] == 1:
+            cell_tensor = cell_tensor.squeeze(0)
+        lengths, _ = _cell_lengths_and_angles(cell_tensor)
+        values_by_key[int(n_atoms)].append(torch.log(lengths.clamp_min(eps)))
+
+    payload: dict[str, list[list[float]]] = {}
+    for n_atoms, values in values_by_key.items():
+        stacked = torch.stack(values, dim=0)
+        sorted_vals, _ = torch.sort(stacked, dim=0)
+        trim = int(len(values) * quantile)
+        if trim > 0 and len(values) > 2 * trim:
+            trimmed = sorted_vals[trim:-trim]
+        else:
+            trimmed = sorted_vals
+        loc = trimmed.mean(dim=0)
+        scale = trimmed.std(dim=0).clamp_min(eps)
+        payload[str(n_atoms)] = [loc.tolist(), scale.tolist()]
+
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    with cache_path.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, sort_keys=True)
+    return cache_path
 
 
 class PlusOneAtomicNumbers(Transform):
@@ -128,10 +186,14 @@ class ContinuousIntervalLattice(Transform):
     Lattice transform for KLDM.
 
     Forward:
-        cell -> [log(lengths), tan(angle - pi/2)] -> optional standardization
+        cell -> [log(lengths), tan(angle - pi/2)]
 
     Inverse:
-        standardized_l -> unconstrained_l -> physical lengths/angles
+        unconstrained_l -> physical lengths/angles
+
+    The KLDM paper's epsilon branch uses the unconstrained 6D lattice chart
+    directly. Extra dataset standardization is optional and corresponds to the
+    later x0/facit-style branch rather than the basic epsilon transform.
     """
 
     def __init__(
@@ -140,31 +202,49 @@ class ContinuousIntervalLattice(Transform):
         normalize_lengths_by_num_atoms: bool = False,
         cache_file: str | Path | None = None,
         quantile: float = 0.025,
-        standardize: bool = True,
+        standardize: bool = False,
         standardize_by_num_atoms: bool = True,
+        angles_loc_scale: tuple[float, float] | None = None,
         eps: float = 1e-8,
     ) -> None:
         self.out_key = out_key
         self.normalize_lengths_by_num_atoms = normalize_lengths_by_num_atoms
+        if cache_file is None and standardize:
+            cache_file = DEFAULT_MP20_LENGTHS_LOC_SCALE_PATH
         self.cache_file = Path(cache_file) if cache_file is not None else None
         self.quantile = float(quantile)
         self.standardize = bool(standardize)
         self.standardize_by_num_atoms = bool(standardize_by_num_atoms)
+        if angles_loc_scale is None:
+            self.angles_loc_scale = None
+        else:
+            self.angles_loc_scale = (float(angles_loc_scale[0]), float(angles_loc_scale[1]))
         self.eps = float(eps)
 
-        # key -> (loc[6], scale[6])
-        self.loc_scale: dict[int | str, tuple[torch.Tensor, torch.Tensor]] = {}
+        # key -> (loc[3], scale[3]) for log-lengths only, matching facit.
+        self.lengths_loc_scale: dict[int | str, tuple[torch.Tensor, torch.Tensor]] = {}
 
         if self.cache_file is not None and self.cache_file.exists():
             with self.cache_file.open("r", encoding="utf-8") as f:
                 raw = json.load(f)
-            self.loc_scale = {
-                self._decode_key(k): (
-                    torch.tensor(v["loc"], dtype=torch.get_default_dtype()),
-                    torch.tensor(v["scale"], dtype=torch.get_default_dtype()),
-                )
-                for k, v in raw.items()
-            }
+            if raw:
+                first_value = next(iter(raw.values()))
+                if isinstance(first_value, dict):
+                    self.lengths_loc_scale = {
+                        self._decode_key(k): (
+                            torch.tensor(v["loc"][:3], dtype=torch.get_default_dtype()),
+                            torch.tensor(v["scale"][:3], dtype=torch.get_default_dtype()),
+                        )
+                        for k, v in raw.items()
+                    }
+                else:
+                    self.lengths_loc_scale = {
+                        self._decode_key(k): (
+                            torch.tensor(v[0], dtype=torch.get_default_dtype()),
+                            torch.tensor(v[1], dtype=torch.get_default_dtype()),
+                        )
+                        for k, v in raw.items()
+                    }
 
     def _group_key(self, n_atoms: int) -> int | str:
         return int(n_atoms) if self.standardize_by_num_atoms else "global"
@@ -187,6 +267,59 @@ class ContinuousIntervalLattice(Transform):
 
         return torch.cat([log_lengths, angle_features], dim=0)
 
+    def _standardize_lengths(self, log_lengths: torch.Tensor, n_atoms: int) -> torch.Tensor:
+        if not self.standardize:
+            return log_lengths
+        key = self._group_key(n_atoms)
+        if key not in self.lengths_loc_scale:
+            return log_lengths
+        loc, scale = self.lengths_loc_scale[key]
+        return (log_lengths - loc.to(device=log_lengths.device, dtype=log_lengths.dtype)) / scale.to(
+            device=log_lengths.device,
+            dtype=log_lengths.dtype,
+        ).clamp_min(self.eps)
+
+    def _unstandardize_lengths(self, log_lengths: torch.Tensor, num_atoms: torch.Tensor | int) -> torch.Tensor:
+        if not self.standardize:
+            return log_lengths
+
+        if isinstance(num_atoms, int):
+            key = self._group_key(num_atoms)
+            if key not in self.lengths_loc_scale:
+                return log_lengths
+            loc, scale = self.lengths_loc_scale[key]
+            loc = loc.to(device=log_lengths.device, dtype=log_lengths.dtype)
+            scale = scale.to(device=log_lengths.device, dtype=log_lengths.dtype)
+            while loc.ndim < log_lengths.ndim:
+                loc = loc.unsqueeze(0)
+                scale = scale.unsqueeze(0)
+            return log_lengths * scale.clamp_min(self.eps) + loc
+
+        num_atoms = num_atoms.to(device=log_lengths.device)
+        out = []
+        for i in range(log_lengths.shape[0]):
+            key = self._group_key(int(num_atoms[i].item()))
+            li = log_lengths[i]
+            if key in self.lengths_loc_scale:
+                loc, scale = self.lengths_loc_scale[key]
+                loc = loc.to(device=li.device, dtype=li.dtype)
+                scale = scale.to(device=li.device, dtype=li.dtype)
+                li = li * scale.clamp_min(self.eps) + loc
+            out.append(li)
+        return torch.stack(out, dim=0)
+
+    def _standardize_angles(self, angle_features: torch.Tensor) -> torch.Tensor:
+        if not self.standardize or self.angles_loc_scale is None:
+            return angle_features
+        loc, scale = self.angles_loc_scale
+        return (angle_features - loc) / max(scale, self.eps)
+
+    def _unstandardize_angles(self, angle_features: torch.Tensor) -> torch.Tensor:
+        if not self.standardize or self.angles_loc_scale is None:
+            return angle_features
+        loc, scale = self.angles_loc_scale
+        return angle_features * max(scale, self.eps) + loc
+
     def __call__(self, sample: ChemGraph) -> ChemGraph:
         if not hasattr(sample, "cell"):
             raise ValueError("ChemGraph must have a 'cell' attribute to use ContinuousIntervalLattice transform.")
@@ -195,12 +328,9 @@ class ContinuousIntervalLattice(Transform):
         cell_matrix = sample.cell.squeeze(0)
         l_unscaled = self._to_unconstrained_lattice(cell_matrix=cell_matrix, n_atoms=n_atoms)
 
-        l = l_unscaled.clone()
-        if self.standardize:
-            key = self._group_key(n_atoms)
-            if key in self.loc_scale:
-                loc, scale = self.loc_scale[key]
-                l = (l - loc) / scale.clamp_min(self.eps)
+        log_lengths = self._standardize_lengths(l_unscaled[:3], n_atoms=n_atoms)
+        angle_features = self._standardize_angles(l_unscaled[3:])
+        l = torch.cat([log_lengths, angle_features], dim=0)
 
         return sample.replace(
             **{
@@ -215,10 +345,10 @@ class ContinuousIntervalLattice(Transform):
         for sample in samples:
             cell_matrix = sample.cell.squeeze(0)
             n_atoms = int(sample.num_atoms)
-            vec = self._to_unconstrained_lattice(cell_matrix=cell_matrix, n_atoms=n_atoms)
+            vec = self._to_unconstrained_lattice(cell_matrix=cell_matrix, n_atoms=n_atoms)[:3]
             values_by_key[self._group_key(n_atoms)].append(vec)
 
-        self.loc_scale = {}
+        self.lengths_loc_scale = {}
         for key, values in values_by_key.items():
             stacked = torch.stack(values, dim=0)
             q = int(len(stacked) * self.quantile)
@@ -231,52 +361,25 @@ class ContinuousIntervalLattice(Transform):
 
             loc = trimmed.mean(dim=0)
             scale = trimmed.std(dim=0).clamp_min(self.eps)
-            self.loc_scale[key] = (loc, scale)
+            self.lengths_loc_scale[key] = (loc, scale)
 
         if self.cache_file is not None:
             self.cache_file.parent.mkdir(parents=True, exist_ok=True)
             payload = {
-                self._encode_key(k): {
-                    "loc": loc.tolist(),
-                    "scale": scale.tolist(),
-                }
-                for k, (loc, scale) in self.loc_scale.items()
+                self._encode_key(k): [loc.tolist(), scale.tolist()]
+                for k, (loc, scale) in self.lengths_loc_scale.items()
             }
             with self.cache_file.open("w", encoding="utf-8") as f:
-                json.dump(payload, f, indent=2)
+                json.dump(payload, f, indent=2, sort_keys=True)
 
     def unstandardize(self, l: torch.Tensor, num_atoms: torch.Tensor | int) -> torch.Tensor:
         """
         l: (..., 6) standardized lattice features
         returns: (..., 6) unscaled unconstrained lattice features
         """
-        if not self.standardize:
-            return l
-
-        if isinstance(num_atoms, int):
-            key = self._group_key(num_atoms)
-            if key not in self.loc_scale:
-                return l
-            loc, scale = self.loc_scale[key]
-            loc = loc.to(device=l.device, dtype=l.dtype)
-            scale = scale.to(device=l.device, dtype=l.dtype)
-            while loc.ndim < l.ndim:
-                loc = loc.unsqueeze(0)
-                scale = scale.unsqueeze(0)
-            return l * scale.clamp_min(self.eps) + loc
-
-        num_atoms = num_atoms.to(device=l.device)
-        out = []
-        for i in range(l.shape[0]):
-            key = self._group_key(int(num_atoms[i].item()))
-            li = l[i]
-            if key in self.loc_scale:
-                loc, scale = self.loc_scale[key]
-                loc = loc.to(device=li.device, dtype=li.dtype)
-                scale = scale.to(device=li.device, dtype=li.dtype)
-                li = li * scale.clamp_min(self.eps) + loc
-            out.append(li)
-        return torch.stack(out, dim=0)
+        log_lengths = self._unstandardize_lengths(l[..., :3], num_atoms=num_atoms)
+        angle_feats = self._unstandardize_angles(l[..., 3:])
+        return torch.cat([log_lengths, angle_feats], dim=-1)
 
     def invert_to_lengths_angles(
         self,

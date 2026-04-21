@@ -25,6 +25,8 @@ except ImportError as exc:  # pragma: no cover
 COMMAND FOR UNNING: uv run src/kldm/train.py --train-fraction 0.2 --subset-seed 42 --no-wandb
 """
 
+TIME_LOWER_BOUND = 1e-3
+
 
 def validation_step(
     model: ModelKLDM,
@@ -34,14 +36,14 @@ def validation_step(
     model.eval()
     batch = batch.to(device)
 
-    t_graph = sample_uniform(lb=model.diffusion_l.eps, size=(batch.num_graphs, 1), device=device)
+    t_graph = sample_uniform(lb=TIME_LOWER_BOUND, size=(batch.num_graphs, 1), device=device)
 
     with torch.no_grad():
         loss, metrics = model.algorithm2_loss(
             batch=batch,
             t=t_graph,
             lambda_v=1.0,
-            lambda_l=0.5,
+            lambda_l=1.0,
         )
 
     return {
@@ -63,14 +65,14 @@ def train_epoch(
 
     for batch in loader:
         batch = batch.to(device)
-        t_graph = sample_uniform(lb=model.diffusion_l.eps, size=(batch.num_graphs, 1), device=device)
+        t_graph = sample_uniform(lb=TIME_LOWER_BOUND, size=(batch.num_graphs, 1), device=device)
 
         optimizer.zero_grad()
         loss, metrics = model.algorithm2_loss(
             batch=batch,
             t=t_graph,
             lambda_v=1.0,
-            lambda_l=0.5,
+            lambda_l=1.0,
         )
         loss.backward()
         optimizer.step()
@@ -206,7 +208,7 @@ def train() -> None:
         "subset_seed": args.subset_seed,
         "lr": 1e-3,
         "lambda_v": 1.0,
-        "lambda_l": 0.5,
+        "lambda_l": 1.0,
     }
 
     csp_task = CSPTask()

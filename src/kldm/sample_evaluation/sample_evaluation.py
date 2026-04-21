@@ -209,7 +209,10 @@ def decode_lattice(
     n_atoms: int,
     lattice_transform: Optional[ContinuousIntervalLattice] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    lattice_transform = lattice_transform or ContinuousIntervalLattice()
+    lattice_transform = lattice_transform or ContinuousIntervalLattice(
+        standardize=False,
+        angles_loc_scale=None,
+    )
     l_tensor = _to_2d_tensor(l)
 
     if l_tensor.shape[-1] != 6:
@@ -635,7 +638,9 @@ def evaluate_sample(
     5. optional stability proxy via `relax_fn`
 
     Notes:
-    - `f` is expected to be fractional coordinates in [0, 1).
+    - `f` may be fractional coordinates either in [0, 1) or in the centered
+      wrapped chart [-0.5, 0.5). Structure construction wraps them into the
+      unit cell before evaluation.
     - `l` is expected to be the model-space 6D lattice representation used by
       `ContinuousIntervalLattice`: [log_lengths, tan(angle - pi/2)].
     - `a` may be either one-hot/logits [N, C] or already-decoded atomic numbers [N].
@@ -653,8 +658,10 @@ def evaluate_sample(
     angles_finite = bool(torch.isfinite(angles_deg).all().item())
     physical_angles = _angles_define_physical_cell(angles_deg) if angles_finite else False
 
+    frac_coords_wrapped = frac_coords % 1.0
+
     basic_validity = {
-        "fractional_coords_in_unit_cell": bool(((frac_coords >= 0.0) & (frac_coords < 1.0)).all().item()),
+        "fractional_coords_in_unit_cell": bool(((frac_coords_wrapped >= 0.0) & (frac_coords_wrapped < 1.0)).all().item()),
         "num_atoms_match": bool(len(atomic_numbers) == n_atoms),
         "all_species_valid": all(not s.startswith("INVALID_") for s in species),
         "finite_lengths": lengths_finite,
@@ -697,7 +704,7 @@ def evaluate_sample(
         structure = Structure(
             lattice=lattice,
             species=species,
-            coords=frac_coords.detach().cpu().tolist(),
+            coords=frac_coords_wrapped.detach().cpu().tolist(),
             coords_are_cartesian=False,
         )
     except Exception as exc:
