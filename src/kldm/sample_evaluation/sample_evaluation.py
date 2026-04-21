@@ -3,18 +3,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 import itertools
 from collections import Counter
-from pathlib import Path
 from typing import Any, Callable, Optional, Sequence
 
 import numpy as np
 import torch
 
-from kldm.data import resolve_data_root
-from kldm.data.dataset import MP20
 from kldm.data.transform import (
     ContinuousIntervalLattice,
     DEFAULT_ATOMIC_VOCAB,
-    FACIT_ANGLES_LOC_SCALE,
 )
 
 try:
@@ -97,12 +93,9 @@ def _to_2d_tensor(x: torch.Tensor | list[float] | list[list[float]]) -> torch.Te
 
 
 def _default_lattice_transform() -> ContinuousIntervalLattice:
-    data_root = resolve_data_root()
-    cache_file = Path(data_root) / MP20.dataset_name / "train_loc_scale.json"
     return ContinuousIntervalLattice(
-        standardize=True,
-        cache_file=cache_file,
-        angles_loc_scale=FACIT_ANGLES_LOC_SCALE,
+        standardize=False,
+        angles_loc_scale=None,
     )
 
 

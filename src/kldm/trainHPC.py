@@ -564,8 +564,9 @@ def run_sampling_evaluation(
     device: torch.device,
     n_steps: int,
     max_graphs: int | None = None,
+    checkpoint_path: str | Path | None = None,
 ) -> dict[str, float | int]:
-    metrics = CSPMetrics()
+    reconstruction_results = []
     num_graphs_seen = 0
 
     model.eval()
@@ -577,30 +578,33 @@ def run_sampling_evaluation(
             pos_t, v_t, l_t, h_t = model.sample_CSP_algorithm3(
                 n_steps=n_steps,
                 batch=batch,
+                checkpoint_path=None if checkpoint_path is None else str(checkpoint_path),
             )
 
-        pred_structures = structures_from_tensors(
-            tensors={"pos": pos_t, "h": h_t, "l": l_t},
-            ptr=batch.ptr,
-        )
-        target_structures = structures_from_batch(batch)
+        ptr = batch.ptr.tolist()
+        for graph_idx, (start, end) in enumerate(zip(ptr[:-1], ptr[1:])):
+            result = evaluate_csp_reconstruction(
+                pred_f=pos_t[start:end],
+                pred_l=l_t[graph_idx],
+                pred_a=h_t[start:end],
+                target_f=batch.pos[start:end],
+                target_l=batch.l[graph_idx],
+                target_a=batch.h[start:end],
+            )
+            reconstruction_results.append(result)
+            num_graphs_seen += 1
 
-        if max_graphs is not None:
-            remaining = max_graphs - num_graphs_seen
-            if remaining <= 0:
+            if max_graphs is not None and num_graphs_seen >= max_graphs:
                 break
-            pred_structures = pred_structures[:remaining]
-            target_structures = target_structures[:remaining]
-
-        metrics.update(pred_structures, target_structures)
-        num_graphs_seen += len(pred_structures)
-
         if max_graphs is not None and num_graphs_seen >= max_graphs:
             break
 
-    summary = metrics.summarize()
+    if not reconstruction_results:
+        raise RuntimeError("Validation sampling produced no reconstruction results.")
+
+    summary = aggregate_csp_reconstruction_metrics(reconstruction_results)
     return {
-        "num_samples": len(metrics.valid),
+        "num_samples": int(summary["num_samples"]),
         "valid": float("nan") if summary["valid"] is None else float(summary["valid"]),
         "match_rate": float("nan") if summary["match_rate"] is None else float(summary["match_rate"]),
         "rmse": float("nan") if summary["rmse"] is None else float(summary["rmse"]),
@@ -1042,6 +1046,7 @@ def train() -> None:
                 config=config,
                 epoch=epoch,
             )
+            sampling_checkpoint_path = checkpoint_path if checkpoint_written else None
 
             print(
                 f"epoch={epoch:04d} starting sampling evaluation",
@@ -1057,14 +1062,25 @@ def train() -> None:
                     f"epoch={epoch:04d} sampling with EMA model (facit-style selection)",
                     flush=True,
                 )
-                with ema.average_parameters(model):
+                if sampling_checkpoint_path is not None:
                     sampling_metrics = run_sampling_evaluation(
                         model=model,
                         loader=val_loader,
                         device=device,
                         n_steps=config["sampling_steps"],
                         max_graphs=config["val_subset_graphs"],
+                        checkpoint_path=sampling_checkpoint_path,
                     )
+                else:
+                    with ema.average_parameters(model):
+                        sampling_metrics = run_sampling_evaluation(
+                            model=model,
+                            loader=val_loader,
+                            device=device,
+                            n_steps=config["sampling_steps"],
+                            max_graphs=config["val_subset_graphs"],
+                            checkpoint_path=None,
+                        )
             else:
                 print(
                     f"epoch={epoch:04d} sampling with current model (EMA not updated yet)",
@@ -1076,6 +1092,7 @@ def train() -> None:
                     device=device,
                     n_steps=config["sampling_steps"],
                     max_graphs=config["val_subset_graphs"],
+                    checkpoint_path=sampling_checkpoint_path,
                 )
             print(
                 f"epoch={epoch:04d} finished sampling evaluation",
