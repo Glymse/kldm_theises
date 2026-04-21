@@ -558,17 +558,14 @@ def maybe_plot_sampling_metrics(rows: list[dict[str, Any]], output_path: Path) -
     fig.savefig(output_path, dpi=200)
     plt.close(fig)
     return output_path
-
-
 def run_sampling_evaluation(
     model: ModelKLDM,
     loader,
     device: torch.device,
     n_steps: int,
     max_graphs: int | None = None,
-    checkpoint_path: str | None = None,
 ) -> dict[str, float | int]:
-    reconstruction_results = []
+    metrics = CSPMetrics()
     num_graphs_seen = 0
 
     model.eval()
@@ -580,41 +577,48 @@ def run_sampling_evaluation(
             pos_t, v_t, l_t, h_t = model.sample_CSP_algorithm3(
                 n_steps=n_steps,
                 batch=batch,
-                checkpoint_path=checkpoint_path,
             )
 
-        ptr = batch.ptr.tolist()
-        for graph_idx, (start, end) in enumerate(zip(ptr[:-1], ptr[1:])):
-            reconstruction_results.append(
-                evaluate_csp_reconstruction(
-                    pred_f=pos_t[start:end],
-                    pred_l=l_t[graph_idx],
-                    pred_a=h_t[start:end],
-                    target_f=batch.pos[start:end],
-                    target_l=batch.l[graph_idx],
-                    target_a=batch.h[start:end],
-                )
-            )
-            num_graphs_seen += 1
-            if max_graphs is not None and num_graphs_seen >= max_graphs:
+        pred_structures = structures_from_tensors(
+            tensors={"pos": pos_t, "h": h_t, "l": l_t},
+            ptr=batch.ptr,
+        )
+        target_structures = structures_from_batch(batch)
+
+        if max_graphs is not None:
+            remaining = max_graphs - num_graphs_seen
+            if remaining <= 0:
                 break
+            pred_structures = pred_structures[:remaining]
+            target_structures = target_structures[:remaining]
+
+        metrics.update(pred_structures, target_structures)
+        num_graphs_seen += len(pred_structures)
+
         if max_graphs is not None and num_graphs_seen >= max_graphs:
             break
 
-    if not reconstruction_results:
-        raise RuntimeError("Validation sampling produced no reconstruction results.")
-
-    summary = aggregate_csp_reconstruction_metrics(reconstruction_results)
-
-    def nan_if_none(x: float | None) -> float:
-        return float("nan") if x is None else float(x)
-
+    summary = metrics.summarize()
     return {
-        "num_samples": int(summary["num_samples"]),
-        "valid": nan_if_none(summary["valid"]),
-        "match_rate": nan_if_none(summary["match_rate"]),
-        "rmse": nan_if_none(summary["rmse"]),
+        "num_samples": len(metrics.valid),
+        "valid": float("nan") if summary["valid"] is None else float(summary["valid"]),
+        "match_rate": float("nan") if summary["match_rate"] is None else float(summary["match_rate"]),
+        "rmse": float("nan") if summary["rmse"] is None else float(summary["rmse"]),
     }
+
+def should_use_ema_for_sampling(
+    ema: ExponentialMovingAverage | None,
+    *,
+    current_epoch: int,
+    force_ema: bool,
+) -> bool:
+    if ema is None:
+        return False
+    # Keep sampling on live model until EMA has received at least one update.
+    if ema.num_updates <= 0:
+        return False
+    # Once EMA is active, match facit-style model selection.
+    return bool(force_ema or current_epoch > ema.start_epoch)
 
 
 def prune_old_checkpoints(
@@ -739,6 +743,16 @@ def parse_args() -> argparse.Namespace:
         help="Epoch threshold after which EMA starts updating, matching facitKLDM semantics.",
     )
     parser.add_argument(
+        "--sampling-force-ema",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Force EMA weights for validation sampling. "
+            "Defaults to true. EMA is still skipped until it has at least one update. "
+            "Disable with --no-sampling-force-ema."
+        ),
+    )
+    parser.add_argument(
         "--dev",
         action="store_true",
         help="Enable detailed KLDM/TDM convergence diagnostics in logs and W&B.",
@@ -769,6 +783,7 @@ def train() -> None:
         "max_epochs": args.max_epochs,
         "ema_decay": args.ema_decay,
         "ema_start": args.ema_start,
+        "sampling_force_ema": args.sampling_force_ema,
         "num_workers": LOADER_NUM_WORKERS,
         "pin_memory": LOADER_PIN_MEMORY,
         "dev": args.dev,
@@ -1032,14 +1047,36 @@ def train() -> None:
                 f"epoch={epoch:04d} starting sampling evaluation",
                 flush=True,
             )
-            sampling_metrics = run_sampling_evaluation(
-                model=model,
-                loader=val_loader,
-                device=device,
-                n_steps=config["sampling_steps"],
-                max_graphs=config["val_subset_graphs"],
-                checkpoint_path=str(checkpoint_path) if checkpoint_written else None,
+            use_ema_sampling = should_use_ema_for_sampling(
+                ema=ema,
+                current_epoch=epoch,
+                force_ema=config["sampling_force_ema"],
             )
+            if use_ema_sampling:
+                print(
+                    f"epoch={epoch:04d} sampling with EMA model (facit-style selection)",
+                    flush=True,
+                )
+                with ema.average_parameters(model):
+                    sampling_metrics = run_sampling_evaluation(
+                        model=model,
+                        loader=val_loader,
+                        device=device,
+                        n_steps=config["sampling_steps"],
+                        max_graphs=config["val_subset_graphs"],
+                    )
+            else:
+                print(
+                    f"epoch={epoch:04d} sampling with current model (EMA not updated yet)",
+                    flush=True,
+                )
+                sampling_metrics = run_sampling_evaluation(
+                    model=model,
+                    loader=val_loader,
+                    device=device,
+                    n_steps=config["sampling_steps"],
+                    max_graphs=config["val_subset_graphs"],
+                )
             print(
                 f"epoch={epoch:04d} finished sampling evaluation",
                 flush=True,

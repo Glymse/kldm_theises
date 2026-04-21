@@ -10,7 +10,7 @@ def d_log_wrapped_normal(
     r: torch.Tensor,
     mu: torch.Tensor,
     sigma: torch.Tensor,
-    K: int = 9,
+    K: int = 13,
     T: float = 1.0,
     eps: float = 1e-8,
 ) -> torch.Tensor:

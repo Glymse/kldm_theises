@@ -2,42 +2,45 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import itertools
-import warnings
 from collections import Counter
-from typing import Any, Callable, Optional
+from pathlib import Path
+from typing import Any, Callable, Optional, Sequence
 
 import numpy as np
 import torch
 
-#TODO: Print amount of valid samples to benchmark.  (percantage)
-#og de 4 der
-
-from kldm.data.transform import ContinuousIntervalLattice, DEFAULT_ATOMIC_VOCAB
+from kldm.data import resolve_data_root
+from kldm.data.dataset import MP20
+from kldm.data.transform import (
+    ContinuousIntervalLattice,
+    DEFAULT_ATOMIC_VOCAB,
+    FACIT_ANGLES_LOC_SCALE,
+)
 
 try:
     from pymatgen.analysis.local_env import MinimumDistanceNN
-    from pymatgen.core import Element, Lattice, Structure
     from pymatgen.analysis.structure_matcher import StructureMatcher
+    from pymatgen.core import Element, Lattice, Structure
     from pymatgen.io.ase import AseAtomsAdaptor
-except ImportError:  # pragma: no cover - depends on local environment
+except ImportError:  # pragma: no cover
     Element = Lattice = Structure = MinimumDistanceNN = StructureMatcher = AseAtomsAdaptor = None
 
 try:
     import smact
     from smact.screening import pauling_test
-except ImportError:  # pragma: no cover - depends on local environment
+except ImportError:  # pragma: no cover
     smact = None
     pauling_test = None
 
 try:
     from ase.data import chemical_symbols
-except ImportError:  # pragma: no cover - depends on local environment
+except ImportError:  # pragma: no cover
     chemical_symbols = None
 
 try:
     from matminer.featurizers.composition.composite import ElementProperty
     from matminer.featurizers.site.fingerprint import CrystalNNFingerprint
-except ImportError:  # pragma: no cover - depends on local environment
+except ImportError:  # pragma: no cover
     ElementProperty = None
     CrystalNNFingerprint = None
 
@@ -72,7 +75,197 @@ class CSPReconstructionResult:
     formula: Optional[str] = None
 
 
-def validity_structure(structure: Structure, cutoff: float = 0.5, max_length: float = 40.0, min_volume: float = 0.1) -> bool:
+def safe_divide(numerator: float, denominator: float) -> float | None:
+    if denominator == 0:
+        return None
+    return float(numerator) / float(denominator)
+
+
+def _require_pymatgen() -> None:
+    if Structure is None or Lattice is None or Element is None:
+        raise ImportError(
+            "sample_evaluation requires pymatgen. Install it in the active environment "
+            "before running structure validity checks."
+        )
+
+
+def _to_2d_tensor(x: torch.Tensor | list[float] | list[list[float]]) -> torch.Tensor:
+    tensor = torch.as_tensor(x, dtype=torch.get_default_dtype())
+    if tensor.ndim == 1:
+        return tensor.unsqueeze(0)
+    return tensor
+
+
+def _default_lattice_transform() -> ContinuousIntervalLattice:
+    data_root = resolve_data_root()
+    cache_file = Path(data_root) / MP20.dataset_name / "train_loc_scale.json"
+    return ContinuousIntervalLattice(
+        standardize=True,
+        cache_file=cache_file,
+        angles_loc_scale=FACIT_ANGLES_LOC_SCALE,
+    )
+
+
+def decode_atom_types(
+    a: torch.Tensor | list[int] | list[list[float]],
+    species_vocab: Optional[list[int]] = None,
+) -> tuple[list[int], list[str]]:
+    species_vocab = species_vocab or DEFAULT_ATOMIC_VOCAB
+    a_tensor = torch.as_tensor(a)
+
+    if a_tensor.ndim == 1:
+        atomic_numbers = [int(x) for x in a_tensor.tolist()]
+    elif a_tensor.ndim == 2:
+        indices = a_tensor.argmax(dim=-1).tolist()
+        atomic_numbers = [int(species_vocab[int(i)]) for i in indices]
+    else:
+        raise ValueError(f"Expected atom tensor with ndim 1 or 2, got shape {tuple(a_tensor.shape)}")
+
+    species: list[str] = []
+    for z in atomic_numbers:
+        try:
+            species.append(Element.from_Z(z).symbol)
+        except Exception:
+            species.append(f"INVALID_{z}")
+
+    return atomic_numbers, species
+
+
+def decode_lattice(
+    l: torch.Tensor | list[float] | list[list[float]],
+    n_atoms: int,
+    lattice_transform: Optional[ContinuousIntervalLattice] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    lattice_transform = lattice_transform or _default_lattice_transform()
+    l_tensor = _to_2d_tensor(l)
+
+    if l_tensor.shape[-1] != 6:
+        raise ValueError(f"Expected lattice tensor with last dim 6, got shape {tuple(l_tensor.shape)}")
+
+    lengths, angles_rad = lattice_transform.invert_to_lengths_angles(
+        l=l_tensor,
+        num_atoms=n_atoms,
+    )
+    lengths = lengths.squeeze(0)
+    angles_rad = angles_rad.squeeze(0)
+    angles_deg = torch.rad2deg(angles_rad)
+    return lengths, angles_deg
+
+
+def _angles_define_physical_cell(angles_deg: torch.Tensor) -> bool:
+    alpha, beta, gamma = [float(x) for x in angles_deg.tolist()]
+    if not (0.0 < alpha < 180.0 and 0.0 < beta < 180.0 and 0.0 < gamma < 180.0):
+        return False
+    return (
+        (alpha + beta > gamma)
+        and (alpha + gamma > beta)
+        and (beta + gamma > alpha)
+        and (alpha + beta + gamma < 360.0)
+    )
+
+
+def build_structure_from_sample(
+    f: torch.Tensor | list[list[float]],
+    l: torch.Tensor | list[float] | list[list[float]],
+    a: torch.Tensor | list[int] | list[list[float]],
+    *,
+    species_vocab: Optional[list[int]] = None,
+    lattice_transform: Optional[ContinuousIntervalLattice] = None,
+    sort_structure: bool = True,
+) -> Structure:
+    _require_pymatgen()
+    lattice_transform = lattice_transform or _default_lattice_transform()
+
+    frac_coords = _to_2d_tensor(f)
+    if frac_coords.shape[-1] != 3:
+        raise ValueError(f"Expected fractional coordinates with last dim 3, got shape {tuple(frac_coords.shape)}")
+
+    n_atoms = int(frac_coords.shape[0])
+    _, species = decode_atom_types(a=a, species_vocab=species_vocab)
+    lengths, angles_deg = decode_lattice(l=l, n_atoms=n_atoms, lattice_transform=lattice_transform)
+
+    if not torch.isfinite(frac_coords).all():
+        raise ValueError("Predicted fractional coordinates contain non-finite values.")
+    if not torch.isfinite(lengths).all() or not torch.isfinite(angles_deg).all():
+        raise ValueError("Decoded lattice contains non-finite lengths or angles.")
+    if not (lengths > 0.0).all():
+        raise ValueError("Decoded lattice contains non-positive lengths.")
+    if not _angles_define_physical_cell(angles_deg):
+        raise ValueError("Decoded lattice angles do not define a physical cell.")
+
+    lattice = Lattice.from_parameters(
+        a=float(lengths[0].item()),
+        b=float(lengths[1].item()),
+        c=float(lengths[2].item()),
+        alpha=float(angles_deg[0].item()),
+        beta=float(angles_deg[1].item()),
+        gamma=float(angles_deg[2].item()),
+    )
+    structure = Structure(
+        lattice=lattice,
+        species=species,
+        coords=(frac_coords % 1.0).detach().cpu().tolist(),
+        coords_are_cartesian=False,
+    )
+    if sort_structure:
+        structure = structure.get_sorted_structure()
+    return structure
+
+
+def structures_from_tensors(
+    tensors: dict[str, torch.Tensor],
+    ptr: torch.Tensor,
+    *,
+    species_vocab: Optional[list[int]] = None,
+    lattice_transform: Optional[ContinuousIntervalLattice] = None,
+) -> list[Structure | None]:
+    _require_pymatgen()
+    lattice_transform = lattice_transform or _default_lattice_transform()
+
+    pos = tensors["pos"]
+    h = tensors["h"]
+    l = tensors["l"]
+
+    ptr_list = ptr.detach().cpu().tolist()
+    structures: list[Structure | None] = []
+
+    for graph_idx, (start_idx, end_idx) in enumerate(zip(ptr_list[:-1], ptr_list[1:])):
+        try:
+            structure = build_structure_from_sample(
+                f=pos[start_idx:end_idx],
+                l=l[graph_idx],
+                a=h[start_idx:end_idx],
+                species_vocab=species_vocab,
+                lattice_transform=lattice_transform,
+            )
+        except Exception:
+            structure = None
+        structures.append(structure)
+
+    return structures
+
+
+def structures_from_batch(
+    batch,
+    *,
+    species_vocab: Optional[list[int]] = None,
+    lattice_transform: Optional[ContinuousIntervalLattice] = None,
+) -> list[Structure | None]:
+    tensors = {"h": batch.h, "pos": batch.pos, "l": batch.l}
+    return structures_from_tensors(
+        tensors=tensors,
+        ptr=batch.ptr,
+        species_vocab=species_vocab,
+        lattice_transform=lattice_transform,
+    )
+
+
+def validity_structure(
+    structure: Structure,
+    cutoff: float = 0.5,
+    max_length: float = 40.0,
+    min_volume: float = 0.1,
+) -> bool:
     try:
         distance_matrix = np.asarray(structure.distance_matrix, dtype=float)
     except Exception:
@@ -164,126 +357,6 @@ def fp_structural(structure: Structure) -> Optional[list[float]]:
         return None
 
 
-def _require_pymatgen() -> None:
-    if Structure is None or Lattice is None or Element is None:
-        raise ImportError(
-            "sample_evaluation requires pymatgen. Install it in the active environment "
-            "before running structure validity checks."
-        )
-
-
-def _to_2d_tensor(x: torch.Tensor | list[float] | list[list[float]]) -> torch.Tensor:
-    tensor = torch.as_tensor(x, dtype=torch.get_default_dtype())
-    if tensor.ndim == 1:
-        return tensor.unsqueeze(0)
-    return tensor
-
-
-def decode_atom_types(
-    a: torch.Tensor | list[int] | list[list[float]],
-    species_vocab: Optional[list[int]] = None,
-) -> tuple[list[int], list[str]]:
-    species_vocab = species_vocab or DEFAULT_ATOMIC_VOCAB
-    a_tensor = torch.as_tensor(a)
-
-    if a_tensor.ndim == 1:
-        atomic_numbers = [int(x) for x in a_tensor.tolist()]
-    elif a_tensor.ndim == 2:
-        indices = a_tensor.argmax(dim=-1).tolist()
-        atomic_numbers = [int(species_vocab[int(i)]) for i in indices]
-    else:
-        raise ValueError(f"Expected atom tensor with ndim 1 or 2, got shape {tuple(a_tensor.shape)}")
-
-    species: list[str] = []
-    for z in atomic_numbers:
-        try:
-            species.append(Element.from_Z(z).symbol)
-        except Exception:
-            species.append(f"INVALID_{z}")
-
-    return atomic_numbers, species
-
-
-def decode_lattice(
-    l: torch.Tensor | list[float] | list[list[float]],
-    n_atoms: int,
-    lattice_transform: Optional[ContinuousIntervalLattice] = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    lattice_transform = lattice_transform or ContinuousIntervalLattice(
-        standardize=False,
-        angles_loc_scale=None,
-    )
-    l_tensor = _to_2d_tensor(l)
-
-    if l_tensor.shape[-1] != 6:
-        raise ValueError(f"Expected lattice tensor with last dim 6, got shape {tuple(l_tensor.shape)}")
-
-    lengths, angles_rad = lattice_transform.invert_to_lengths_angles(
-        l=l_tensor,
-        num_atoms=n_atoms,
-    )
-    lengths = lengths.squeeze(0)
-    angles_rad = angles_rad.squeeze(0)
-    angles_deg = torch.rad2deg(angles_rad)
-
-    return lengths, angles_deg
-
-
-def build_structure_from_sample(
-    f: torch.Tensor | list[list[float]],
-    l: torch.Tensor | list[float] | list[list[float]],
-    a: torch.Tensor | list[int] | list[list[float]],
-    *,
-    species_vocab: Optional[list[int]] = None,
-    lattice_transform: Optional[ContinuousIntervalLattice] = None,
-    sort_structure: bool = True,
-) -> Structure:
-    _require_pymatgen()
-
-    frac_coords = _to_2d_tensor(f)
-    if frac_coords.shape[-1] != 3:
-        raise ValueError(f"Expected fractional coordinates with last dim 3, got shape {tuple(frac_coords.shape)}")
-
-    n_atoms = int(frac_coords.shape[0])
-    _, species = decode_atom_types(a=a, species_vocab=species_vocab)
-    lengths, angles_deg = decode_lattice(l=l, n_atoms=n_atoms, lattice_transform=lattice_transform)
-    if not torch.isfinite(frac_coords).all():
-        raise ValueError("Predicted fractional coordinates contain non-finite values.")
-    if not torch.isfinite(lengths).all() or not torch.isfinite(angles_deg).all():
-        raise ValueError("Decoded lattice contains non-finite lengths or angles.")
-    if not (lengths > 0.0).all():
-        raise ValueError("Decoded lattice contains non-positive lengths.")
-    if not _angles_define_physical_cell(angles_deg):
-        raise ValueError("Decoded lattice angles do not define a physical cell.")
-
-    lattice = Lattice.from_parameters(
-        a=float(lengths[0].item()),
-        b=float(lengths[1].item()),
-        c=float(lengths[2].item()),
-        alpha=float(angles_deg[0].item()),
-        beta=float(angles_deg[1].item()),
-        gamma=float(angles_deg[2].item()),
-    )
-    structure = Structure(
-        lattice=lattice,
-        species=species,
-        coords=(frac_coords % 1.0).detach().cpu().tolist(),
-        coords_are_cartesian=False,
-    )
-    if sort_structure:
-        structure = structure.get_sorted_structure()
-    return structure
-
-
-def _angles_define_physical_cell(angles_deg: torch.Tensor) -> bool:
-    alpha, beta, gamma = [float(x) for x in angles_deg.tolist()]
-    if not (0.0 < alpha < 180.0 and 0.0 < beta < 180.0 and 0.0 < gamma < 180.0):
-        return False
-    return (alpha + beta > gamma) and (alpha + gamma > beta) and (beta + gamma > alpha) and (
-        alpha + beta + gamma < 360.0
-    )
-
-
 def _single_sample_percentage(flag: Any) -> Optional[float]:
     if flag is None:
         return None
@@ -296,6 +369,66 @@ def _compute_rmsd_angstrom(
 ) -> Optional[float]:
     if structure is None or relaxed_structure is None or StructureMatcher is None:
         return None
+    try:
+        matcher = StructureMatcher(primitive_cell=False, scale=True)
+        rmsd = matcher.get_rms_dist(structure, relaxed_structure)
+        if rmsd is None:
+            return None
+        return float(rmsd[0])
+    except Exception:
+        return None
+
+
+class CSPMetrics:
+    def __init__(
+        self,
+        stol: float = 0.5,
+        angle_tol: float = 10.0,
+        ltol: float = 0.3,
+    ) -> None:
+        self.matcher = StructureMatcher(stol=stol, angle_tol=angle_tol, ltol=ltol)
+        self.valid: list[int] = []
+        self.match: list[int] = []
+        self.rmse: list[float] = []
+
+    def __call__(self, input_s: list[Structure | None], target_s: list[Structure | None]) -> None:
+        self.update(input_s, target_s)
+
+    def update(self, input_s: list[Structure | None], target_s: list[Structure | None]) -> None:
+        assert len(input_s) == len(target_s)
+
+        for si, st in zip(input_s, target_s):
+            v, m = 0, 0
+            if si is not None and st is not None:
+                v = int(validity_structure(si))
+                if v:
+                    rms = self.matcher.get_rms_dist(si, st)
+                    m = int(rms is not None)
+                    if rms is not None:
+                        self.rmse.append(float(rms[0]))  # only for valid + matching
+
+            self.valid.append(v)
+            self.match.append(m)
+
+    def summarize(self) -> dict[str, float | None]:
+        return {
+            "valid": safe_divide(sum(self.valid), len(self.valid)),
+            "match_rate": safe_divide(sum(self.match), len(self.match)),
+            "rmse": safe_divide(sum(self.rmse), len(self.rmse)),
+        }
+
+    def reset(self) -> None:
+        self.valid = []
+        self.match = []
+        self.rmse = []
+
+    @property
+    def details(self) -> dict[str, list[float] | list[int]]:
+        return {
+            "valid": self.valid,
+            "match": self.match,
+            "rmse": self.rmse,
+        }
 
 
 def evaluate_csp_reconstruction(
@@ -312,6 +445,8 @@ def evaluate_csp_reconstruction(
     angle_tol: float = 10.0,
     ltol: float = 0.3,
 ) -> CSPReconstructionResult:
+    lattice_transform = lattice_transform or _default_lattice_transform()
+
     try:
         pred_structure = build_structure_from_sample(
             f=pred_f,
@@ -348,13 +483,13 @@ def evaluate_csp_reconstruction(
             formula=pred_structure.composition.formula if pred_structure is not None else None,
         )
 
+    matcher = StructureMatcher(stol=stol, angle_tol=angle_tol, ltol=ltol)
     valid = validity_structure(pred_structure)
     match = False
     rmse = None
 
     if valid:
         try:
-            matcher = StructureMatcher(stol=stol, angle_tol=angle_tol, ltol=ltol)
             rms = matcher.get_rms_dist(pred_structure, target_structure)
             match = rms is not None
             if rms is not None:
@@ -392,14 +527,6 @@ def aggregate_csp_reconstruction_metrics(results: list[CSPReconstructionResult])
         "match_rate": float(sum(match_values) / len(match_values)),
         "rmse": None if not rmses else float(sum(rmses) / len(rmses)),
     }
-    try:
-        matcher = StructureMatcher(primitive_cell=False, scale=True)
-        rmsd = matcher.get_rms_dist(structure, relaxed_structure)
-        if rmsd is None:
-            return None
-        return float(rmsd[0])
-    except Exception:
-        return None
 
 
 def make_mattersim_relax_fn(
@@ -413,30 +540,13 @@ def make_mattersim_relax_fn(
     hull_fn: Optional[Callable[[Structure, Optional[float]], Optional[float]]] = None,
     novelty_fn: Optional[Callable[[Structure], Optional[bool]]] = None,
 ) -> Callable[[Structure], dict[str, Any]]:
-    """
-    Build a one-sample MatterSim-backed relaxation function.
-
-    Returns a callable that maps a pymatgen Structure to a dict with keys such as:
-      - relaxed_structure
-      - energy_per_atom
-      - energy_above_hull
-      - stable
-      - unique
-      - novel
-      - sun
-
-    Notes:
-    - MatterSim is only used for relaxation and energy prediction here.
-    - `hull_fn` and `novelty_fn` are optional hooks for the parts that depend on
-      external reference data.
-    """
     if AseAtomsAdaptor is None:
         raise ImportError("pymatgen's ASE adaptor is required to use make_mattersim_relax_fn().")
 
     try:
         from mattersim.applications.relax import Relaxer
         from mattersim.forcefield.potential import MatterSimCalculator
-    except ImportError as exc:  # pragma: no cover - depends on environment
+    except ImportError as exc:  # pragma: no cover
         raise ImportError(
             "MatterSim is not installed in the active environment, so a MatterSim-backed "
             "relax_fn cannot be created."
@@ -458,6 +568,7 @@ def make_mattersim_relax_fn(
     def relax_fn(structure: Structure) -> dict[str, Any]:
         atoms = adaptor.get_atoms(structure)
         atoms.calc = MatterSimCalculator(**calculator_kwargs)
+
         try:
             relaxed = relaxer.relax(atoms, steps=steps, verbose=False)
         except TypeError:
@@ -465,6 +576,7 @@ def make_mattersim_relax_fn(
                 relaxed = relaxer.relax(atoms, steps=steps, logfile=None)
             except TypeError:
                 relaxed = relaxer.relax(atoms, steps=steps)
+
         relax_debug = {
             "type": type(relaxed).__name__,
             "module": type(relaxed).__module__,
@@ -565,7 +677,6 @@ def make_mattersim_relax_fn(
 
 
 def aggregate_csp_metrics(results: list[SampleEvaluationResult]) -> dict[str, Any]:
-    """Aggregate KLDM-style metrics over many CSP samples."""
     if not results:
         return {
             "num_samples": 0,
@@ -583,35 +694,30 @@ def aggregate_csp_metrics(results: list[SampleEvaluationResult]) -> dict[str, An
             return None
         return float(sum(present) / len(present))
 
-    validity_structure = [
-        _single_sample_percentage(r.metrics.get("validity_structure"))
-        for r in results
-    ]
-    validity_composition = [
-        _single_sample_percentage(r.metrics.get("validity_composition"))
-        for r in results
-    ]
+    validity_structure_vals = [_single_sample_percentage(r.metrics.get("validity_structure")) for r in results]
+    validity_composition_vals = [_single_sample_percentage(r.metrics.get("validity_composition")) for r in results]
 
     return {
         "num_samples": len(results),
-        "validity_structure_percent": _mean_optional(validity_structure),
-        "validity_composition_percent": _mean_optional(validity_composition),
+        "validity_structure_percent": _mean_optional(validity_structure_vals),
+        "validity_composition_percent": _mean_optional(validity_composition_vals),
         "rmsd_angstrom": _mean_optional([r.metrics.get("rmsd_angstrom") for r in results]),
         "avg_above_hull_ev_atom": _mean_optional([r.metrics.get("avg_above_hull_ev_atom") for r in results]),
         "stable_percent": _mean_optional([_single_sample_percentage(r.metrics.get("stable_flag")) for r in results]),
         "sun_percent": _mean_optional(
-            [_single_sample_percentage(r.stability_proxy.get("relaxation_result", {}).get("sun") if isinstance(r.stability_proxy.get("relaxation_result"), dict) else None) for r in results]
+            [
+                _single_sample_percentage(
+                    r.stability_proxy.get("relaxation_result", {}).get("sun")
+                    if isinstance(r.stability_proxy.get("relaxation_result"), dict)
+                    else None
+                )
+                for r in results
+            ]
         ),
     }
 
 
 def aggregate_dng_metrics(results: list[SampleEvaluationResult]) -> dict[str, Any]:
-    """
-    Backward-compatible alias for the previous name.
-
-    The aggregation logic is task-agnostic, but CSP now uses the same metric
-    summary path.
-    """
     return aggregate_csp_metrics(results)
 
 
@@ -629,23 +735,8 @@ def evaluate_sample(
     relax_fn: Optional[Callable[[Any], dict[str, Any]]] = None,
     reference_structure: Optional[Structure] = None,
 ) -> SampleEvaluationResult:
-    """
-    Evaluate a sampled crystal in layers:
-    1. basic validity
-    2. structure construction
-    3. geometric sanity
-    4. chemical sanity
-    5. optional stability proxy via `relax_fn`
-
-    Notes:
-    - `f` may be fractional coordinates either in [0, 1) or in the centered
-      wrapped chart [-0.5, 0.5). Structure construction wraps them into the
-      unit cell before evaluation.
-    - `l` is expected to be the model-space 6D lattice representation used by
-      `ContinuousIntervalLattice`: [log_lengths, tan(angle - pi/2)].
-    - `a` may be either one-hot/logits [N, C] or already-decoded atomic numbers [N].
-    """
     _require_pymatgen()
+    lattice_transform = lattice_transform or _default_lattice_transform()
 
     frac_coords = _to_2d_tensor(f)
     if frac_coords.shape[-1] != 3:
