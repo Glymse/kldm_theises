@@ -9,11 +9,9 @@ from .transform import (
     DEFAULT_ATOMIC_VOCAB,
     ContinuousIntervalLattice,
     CopyProperty,
-    FACIT_ANGLES_LOC_SCALE,
     FullyConnectedGraph,
     OneHot,
     TaskMetadata,
-    ensure_lengths_loc_scale_cache,
 )
 
 TASK_CSP = 0
@@ -26,20 +24,11 @@ class CSPTask:
         self.species_vocab = species_vocab or DEFAULT_ATOMIC_VOCAB
 
     def _make_transforms(self, root: str | Path | None = None) -> list:
-        data_root = resolve_data_root(root)
-        cache_file = data_root / MP20.dataset_name / "train_loc_scale.json"
-        processed_train_dir = data_root / MP20.dataset_name / "processed" / "train"
-        ensure_lengths_loc_scale_cache(
-            cache_file=cache_file,
-            processed_dir=processed_train_dir,
-        )
-
         return [
             FullyConnectedGraph(),
             ContinuousIntervalLattice(
-                standardize=True,
-                cache_file=cache_file,
-                angles_loc_scale=FACIT_ANGLES_LOC_SCALE,
+                standardize=False,
+                angles_loc_scale=None,
             ),
             CopyProperty("atomic_numbers", "h"),
             TaskMetadata(task_id=TASK_CSP, diffuse_h=False),
