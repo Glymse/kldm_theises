@@ -15,8 +15,8 @@ from torch_geometric.data import Data, Batch
 
 from kldm.data import CSPTask
 from kldm.diffusionModels.continuous import ContinuousVPDiffusion
-from kldm.diffusionModels.trivialized_diffusion import TrivialisedDiffusion as TDM
-from kldm.distribution.uniform import sample_uniform
+# from kldm.diffusionModels.trivialized_diffusion import TrivialisedDiffusion as TDM
+from kldm.diffusionModels.TDMdev import TrivialisedDiffusionDev as TDM
 from kldm.scoreNetwork.scoreNetwork import CSPVNet
 from kldm.scoreNetwork.utils import scatter_center
 
@@ -39,11 +39,15 @@ class ModelKLDM(nn.Module):
         eps: float = 1e-3,
     ) -> None:
         super().__init__()
+        self.device = device or torch.device("cpu")
 
         self.score_network = score_network or CSPVNet(
-            hidden_dim=128,
-            num_layers=4,
-            h_dim=118,
+            hidden_dim=512,
+            time_dim=256,
+            num_layers=6,
+            num_freqs=128,
+            ln=True,
+            h_dim=100,
             smooth=False,
             pred_v=True,
             pred_l=True,
@@ -51,13 +55,16 @@ class ModelKLDM(nn.Module):
             zero_cog=True # center-of-mass / zero mean per graph.
         )
 
-        self.tdm = diffusion_v or TDM(eps=eps)
+        self.tdm = diffusion_v or TDM(
+            eps=eps,
+            n_lambdas=512 if self.device.type == "cuda" else 128,
+            lambda_num_batches=32 if self.device.type == "cuda" else 8,
+        )
         self.diffusion_l = diffusion_l or ContinuousVPDiffusion(eps=eps)
-        self.device = device or torch.device("cpu")
         self.eps = eps
         self.task_type: Optional[str] = None
         self._cached_sampling_checkpoint_path: Optional[str] = None
-        self.__dict__["_cached_sampling_score_network_obj"] = None
+        self.__dict__["_cached_sampling_model_obj"] = None
 
     # ============================================================================
     # ALGORITHM 1
@@ -129,6 +136,7 @@ class ModelKLDM(nn.Module):
         t: torch.Tensor,
         lambda_v: float = 1.0,
         lambda_l: float = 1.0,
+        debug: bool = False,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """
         Algorithm 2 in KLDM:
@@ -142,7 +150,6 @@ class ModelKLDM(nn.Module):
             t_graph = t_graph[:, None]
 
         index = batch.batch
-        t_node = t_graph[index].squeeze(-1)
         # Algorithm 1
         noisy, targets = self.algorithm1_training_targets(batch=batch, t=t_graph)
 
@@ -165,61 +172,153 @@ class ModelKLDM(nn.Module):
         out_v = preds["v"]
         out_l = preds["l"]
 
-        # Full velocity score, KLDM Eq. (19)
-        t_internal = self.tdm.time_scaling_T * t_node #Time scaling for TDM
-        exp_coef = self.tdm._match_dims((1.0 - torch.exp(-t_internal)) / (1.0 + torch.exp(-t_internal)), out_v)
-        sigma_v_sq = self.tdm._match_dims(self.tdm.sigma_v(t_internal) ** 2, out_v)
-
-        #The simplified score, assuming initial velocity is 0
-        score_v = exp_coef * out_v - v_t / sigma_v_sq.clamp_min(1e-8)
-
         # KLDM: plain squared error for lattice targets.
-        loss_l = self.mse_loss_per_sample(preds["l"], target_l).mean()
+        loss_l = self.mse_loss_per_sample(out_l, target_l).mean()
 
-        # KLDM: plain squared error for velocity targets.
-        loss_v = self.mse_loss_per_sample(score_v, target_v).mean()
+        # Precomputed λ(t) weighting on the simplified velocity target.
+        raw_loss_v_per_sample = self.mse_loss_per_sample(out_v, target_v)
+        if getattr(self.tdm, "use_lambda_weighting", True):
+            lambda_v_t = self.tdm.lambda_v(t_graph.squeeze(-1))[index]
+            loss_v = (lambda_v_t * raw_loss_v_per_sample).mean()
+        else:
+            lambda_v_t = torch.ones_like(raw_loss_v_per_sample)
+            loss_v = raw_loss_v_per_sample.mean()
+        raw_loss_v = raw_loss_v_per_sample.mean()
 
         total_loss = lambda_v * loss_v + lambda_l * loss_l
-        return total_loss, {
+        metrics = {
             "loss": total_loss.detach(),
             "loss_v": loss_v.detach(),
             "loss_l": loss_l.detach(),
         }
+        if debug:
+            t_node = t_graph[index].squeeze(-1)
+            score_v = self.tdm.construct_velocity_score(t=t_node, v_t=v_t, pred_v=out_v)
+            metrics.update(
+                {
+                    "raw_loss_v": raw_loss_v.detach(),
+                    "target_v_abs_mean": target_v.abs().mean().detach(),
+                    "target_v_norm_mean": target_v.norm(dim=-1).mean().detach(),
+                    "pred_v_abs_mean": out_v.abs().mean().detach(),
+                    "pred_v_norm_mean": out_v.norm(dim=-1).mean().detach(),
+                    "lambda_v_mean": lambda_v_t.mean().detach(),
+                    "lambda_v_min": lambda_v_t.min().detach(),
+                    "lambda_v_max": lambda_v_t.max().detach(),
+                    "lambda_v_effective": (
+                        loss_v.detach() / raw_loss_v.detach().clamp_min(self.eps)
+                    ),
+                    "v_t_abs_mean": v_t.abs().mean().detach(),
+                    "f_t_abs_mean": f_t.abs().mean().detach(),
+                    "r_t_abs_mean": self.tdm.wrap_displacements(f_t - self.tdm.wrap_displacements(batch.pos)).abs().mean().detach(),
+                    "score_v_abs_mean": score_v.abs().mean().detach(),
+                    "pred_l_abs_mean": out_l.abs().mean().detach(),
+                    "target_l_abs_mean": target_l.abs().mean().detach(),
+                }
+            )
+        return total_loss, metrics
 
 
 
     # ============================================================================
     # ALGORITHM 3 - Sampling algorithm
     # ============================================================================
-    def _load_csp_score_network(self, checkpoint_path: str = "artifacts/csp_final_model.pt") -> CSPVNet:
+    def _load_sampling_model(self, checkpoint_path: str = "artifacts/csp_final_model.pt") -> "ModelKLDM":
         device = next(self.parameters()).device
-        cached_score_network = self.__dict__.get("_cached_sampling_score_network_obj")
+        cached_model = self.__dict__.get("_cached_sampling_model_obj")
         if (
-            cached_score_network is not None
+            cached_model is not None
             and self._cached_sampling_checkpoint_path == checkpoint_path
         ):
-            return cached_score_network
+            return cached_model
 
         checkpoint = torch.load(checkpoint_path, map_location=device)
-        cleaned_state_dict = {
-            key: value
-            for key, value in checkpoint["model_state_dict"].items()
-            if not key.startswith("_cached_sampling_score_network")
+
+        # Match facit's model selection more closely: only sample from EMA once the
+        # checkpoint epoch is past EMA start. Before that, sample from the live model
+        # weights saved in the checkpoint rather than the still-frozen EMA shadow.
+        ema_state_dict = checkpoint.get("ema_model_state_dict")
+        ema_metadata = checkpoint.get("ema_state_dict") or {}
+        ema_start = int(ema_metadata.get("start_epoch", ema_metadata.get("start_step", 500)))
+        ema_num_updates = int(ema_metadata.get("num_updates", 0))
+        checkpoint_epoch = int(checkpoint.get("epoch", 0))
+        use_ema_for_sampling = (
+            ema_state_dict is not None
+            and checkpoint_epoch > ema_start
+            and ema_num_updates > 0
+        )
+        source_state_dict = ema_state_dict if use_ema_for_sampling else checkpoint["model_state_dict"]
+
+        checkpoint_sigma_norm = source_state_dict.get("tdm._sigma_norms")
+        if checkpoint_sigma_norm is not None and hasattr(checkpoint_sigma_norm, "shape") and len(checkpoint_sigma_norm.shape) > 0:
+            n_sigmas = int(checkpoint_sigma_norm.shape[0])
+        else:
+            n_sigmas = int(getattr(self.tdm, "_sigma_norms", torch.ones(1)).shape[0])
+
+        tdm_kwargs = {
+            "eps": float(getattr(self.tdm, "eps", self.eps)),
+            "n_lambdas": int(getattr(self.tdm, "n_lambdas", 512 if device.type == "cuda" else 128)),
+            "lambda_num_batches": int(getattr(self.tdm, "lambda_num_batches", 32 if device.type == "cuda" else 8)),
+            "k_wn_score": int(getattr(self.tdm, "k_wn_score", 13)),
+            "n_sigmas": n_sigmas,
+            "compute_sigma_norm": bool(getattr(self.tdm, "compute_sigma_norm", True)),
         }
-        model = ModelKLDM(device=device).to(device)
+        sampling_tdm = TDM(**tdm_kwargs)
+        model = ModelKLDM(device=device, diffusion_v=sampling_tdm).to(device)
+
+        # Checkpoints may come from runs with different TDM buffer sizes (for example
+        # lambda tables on GPU vs CPU). Filter out any mismatched tensors so sampling
+        # can still load the compatible weights.
+        model_state_dict = model.state_dict()
+        cleaned_state_dict = {}
+        skipped_shape_mismatch = []
+        optional_sampling_buffers = {
+            "tdm._lambda_t01_grid",
+            "tdm._lambda_v_table",
+        }
+        for key, value in source_state_dict.items():
+            if key.startswith("_cached_sampling_model"):
+                continue
+            if key in optional_sampling_buffers:
+                continue
+            if key not in model_state_dict:
+                continue
+            target_value = model_state_dict[key]
+            if hasattr(value, "shape") and hasattr(target_value, "shape") and value.shape != target_value.shape:
+                skipped_shape_mismatch.append((key, tuple(value.shape), tuple(target_value.shape)))
+                continue
+            cleaned_state_dict[key] = value
+
+        if skipped_shape_mismatch:
+            print(
+                "sampling_checkpoint_load: skipped shape-mismatched tensors "
+                f"count={len(skipped_shape_mismatch)}",
+                flush=True,
+            )
+            for key, src_shape, dst_shape in skipped_shape_mismatch[:8]:
+                print(
+                    f"  - {key}: checkpoint{src_shape} != model{dst_shape}",
+                    flush=True,
+                )
+            if len(skipped_shape_mismatch) > 8:
+                print(
+                    f"  ... and {len(skipped_shape_mismatch) - 8} more",
+                    flush=True,
+                )
+
         model.load_state_dict(cleaned_state_dict, strict=False)
-        score_network = model.score_network.to(device)
-        score_network.eval()
+        model.eval()
 
         self._cached_sampling_checkpoint_path = checkpoint_path
-        self.__dict__["_cached_sampling_score_network_obj"] = score_network
-        return score_network
+        self.__dict__["_cached_sampling_model_obj"] = model
+        return model
 
     def sample_CSP_algorithm3(
         self,
         n_steps: int,
         batch: Batch | Data,
         checkpoint_path: str | None = None,
+        t_start: float = 1.0,
+        t_final: float = 1e-3,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Algorithm 3 sampling for CSP, KLDM-epsilon version.
@@ -234,30 +333,46 @@ class ModelKLDM(nn.Module):
         edge_node_index = batch.edge_node_index
         num_graphs = batch.num_graphs
 
+        # Use the same model object for both prior sampling and reverse denoising.
+        sampling_model = self if checkpoint_path is None else self._load_sampling_model(checkpoint_path)
+        sampling_tdm = sampling_model.tdm
+        sampling_diffusion_l = sampling_model.diffusion_l
+
         # Algorithm 3 priors:
-        # v_T ~ N_v(0, I) with zero-net translation
-        # f_T ~ U(0, 1)
-        # l_T ~ N(0, I)
-        v_t = scatter_center(torch.randn_like(batch.pos), index=node_index)
-        f_t = self.tdm.wrap_fractional(torch.rand_like(batch.pos))
+        # let the active TDM own the position/velocity prior if it exposes one.
+        if hasattr(sampling_tdm, "sample_prior"):
+            f_t, v_t = sampling_tdm.sample_prior(node_index)
+        else:
+            v_t = scatter_center(torch.randn_like(batch.pos), index=node_index)
+            f_t = sampling_tdm.wrap_displacements(torch.rand_like(batch.pos))
         l_t = torch.randn_like(batch.l)
         a_t = batch.h  # CSP conditioning
 
         if checkpoint_path is None:
-            score_network = self.score_network
+            score_network = sampling_model.score_network
             restore_training = score_network.training
             score_network.eval()
         else:
-            score_network = self._load_csp_score_network(checkpoint_path)
+            score_network = sampling_model.score_network
             restore_training = False
 
-        dt = 1.0 / n_steps
+        if n_steps <= 0:
+            raise ValueError("n_steps must be positive.")
+        if not (0.0 < t_final < t_start <= 1.0):
+            raise ValueError("Expected 0 < t_final < t_start <= 1.")
+
+        # Match facit more closely: sample on a descending time grid and stop at a
+        # small positive time instead of marching to exactly t=0, where sigma_v(t)^2
+        # becomes numerically extreme and the final reverse steps get unnecessarily
+        # stiff.
+        ts = torch.linspace(t_start, t_final, n_steps + 1, device=device, dtype=batch.pos.dtype)
 
         try:
             with torch.no_grad():
-                for n in range(1, n_steps + 1):
-                    t_scalar = 1.0 - (n - 1) * dt
-                    t_graph = torch.full((num_graphs, 1), t_scalar, device=device)
+                for n in range(n_steps):
+                    t_scalar = float(ts[n].item())
+                    dt = float((ts[n] - ts[n + 1]).item())
+                    t_graph = torch.full((num_graphs, 1), t_scalar, device=device, dtype=batch.pos.dtype)
                     t_node = t_graph[node_index].squeeze(-1)
 
                     preds = score_network(
@@ -277,31 +392,33 @@ class ModelKLDM(nn.Module):
                     # Full velocity score:
                     # s_v(x_t, t) = ((1 - exp(-t)) / (1 + exp(-t))) * s_f_theta(x_t, t) - v_t / sigma_v(t)^2
 
-                    score_v = self.tdm.construct_velocity_score(
+                    score_v = sampling_tdm.construct_velocity_score(
                         t=t_node,
                         v_t=v_t,
                         pred_v=pred_v,
                     )
 
                     # Update v and f with exponential integrator
-                    f_t, v_t = self.tdm.reverse_exp_step(
+                    f_t, v_t = sampling_tdm.reverse_exp_step(
                         f_t=f_t,
                         v_t=v_t,
                         score_v=score_v,
                         index=node_index,
-                        dt=dt, #This is scaled internally.
+                        dt=dt, # This is scaled internally.
                     )
 
                     # KLDM-epsilon lattice branch:
                     # Algorithm 3 does EM on l using the score corresponding to out_l
-                    l_t = self.diffusion_l.reverse_em_step_from_eps(
+                    l_t = sampling_diffusion_l.reverse_em_step_from_eps(
                         t=t_graph.squeeze(-1),
                         x_t=l_t,
                         pred_eps=pred_l,
                         dt=dt,
                     )
 
-                # For KLDM-epsilon Algorithm 3, return the final sampled l_N directly
+                # Match facit's convention and keep the final positional sample in
+                # the centered wrapped chart. Downstream structure conversion handles
+                # the periodic map back into [0, 1) when needed.
                 return f_t, v_t, l_t, a_t
         finally:
             if checkpoint_path is None and restore_training:

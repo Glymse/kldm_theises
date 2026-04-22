@@ -5,14 +5,15 @@ import sys
 
 import torch
 from torch import nn
-from torch_geometric.utils import scatter
 
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from kldm.data import CSPTask, DNGTask, resolve_data_root
-
 from kldm.distribution import d_log_wrapped_normal
+from kldm.diffusionModels.lambda_t import (
+    interpolate_lambda_table,
+    precompute_lambda_time_grid_from_loader,
+)
 from kldm.scoreNetwork.utils import scatter_center
 
 ################################################################
@@ -22,7 +23,15 @@ from kldm.scoreNetwork.utils import scatter_center
 #######       t = tf * t01.        [Appendix T = 2]         ####
 ################################################################
 
-
+############################################################
+##### Prøv at sample tid fra en log distrubution,
+##### Then recompute dt on the fly, since its different on the time grid, since its not uniform
+#####
+##### Start med 2pi scaling
+##### Herefter prøv at scale epsilon, W(0, sigmaI) hvor sigma = sqrt(2pi).
+##### Add to metrics, compute error metric on lattice.
+##### Use EMA version to validation metrics.
+#############################################################
 
 class TrivialisedDiffusion(nn.Module):
     """
@@ -30,25 +39,31 @@ class TrivialisedDiffusion(nn.Module):
     """
     def __init__(
             self,
-            eps: float = 1e-5) -> None:
+            eps: float = 1e-5,
+            n_lambdas: int = 256,
+            lambda_num_batches: int = 16) -> None:
         super().__init__()
         self.eps = float(eps)
         self.time_scaling_T = 2
+        self.n_lambdas = int(n_lambdas)
+        self.lambda_num_batches = int(lambda_num_batches)
+        self.register_buffer("_lambda_t01_grid", torch.linspace(1e-4, 1.0, self.n_lambdas))
+        self.register_buffer("_lambda_v_table", torch.ones(self.n_lambdas))
 
     # -------------------------------------------------
     #  Wrapping function.
     # -------------------------------------------------
 
     @staticmethod
-    def wrap_fractional(x: torch.Tensor) -> torch.Tensor:
-        """Wrap coordinates into [0, 1)."""
+    def wrap_positions(x: torch.Tensor) -> torch.Tensor:
+        """Wrap unit-cell fractional coordinates into [0, 1)."""
         return torch.remainder(x, 1.0)
 
     #displacements usually should be in [-0.5,0.5), see report.
     #
     #Måske ikke nødvendigt.
     @staticmethod
-    def wrap_signed_unit(x: torch.Tensor) -> torch.Tensor:
+    def wrap_displacements(x: torch.Tensor) -> torch.Tensor:
         """Wrap signed periodic displacements into [-0.5, 0.5)."""
         return torch.remainder(x + 0.5, 1.0) - 0.5
 
@@ -57,23 +72,68 @@ class TrivialisedDiffusion(nn.Module):
     # -------------------------------------------------
 
     # v_t | v_0 ~ N(exp(-t) v_0, (1 - exp(-2t)) I)
-    def alpha_v(self, t: torch.Tensor) -> torch.Tensor:
-        """Mean coefficient of the forward kernel."""
+    def gaussian_velocity_mean_coeff(self, t: torch.Tensor) -> torch.Tensor:
+        """Mean coefficient of the Gaussian velocity forward kernel."""
         return torch.exp(-t)
 
-    def sigma_v(self, t: torch.Tensor) -> torch.Tensor:
-        """Standard deviation of the forward kernel."""
+    def gaussian_velocity_sigma(self, t: torch.Tensor) -> torch.Tensor:
+        """Standard deviation of the Gaussian velocity forward kernel."""
         return torch.sqrt(torch.clamp(1.0 - torch.exp(-2.0 * t), min=self.eps))
 
-    def mu_r_t(self, t: torch.Tensor, v_t: torch.Tensor, v0: torch.Tensor) -> torch.Tensor:
+    def wrapped_gaussian_mu_r_t_pre_wrap(self, t: torch.Tensor, v_t: torch.Tensor, v0: torch.Tensor) -> torch.Tensor:
+        """Unwrapped wrapped-Gaussian mean in the internal unit-period chart."""
         coeff = (1.0 - torch.exp(-t)) / (1.0 + torch.exp(-t))  # Eq. (22)
         coeff = self._match_dims(coeff, v_t)
         return coeff * (v_t + v0)
 
-    def sigma_r_t(self, t: torch.Tensor) -> torch.Tensor:
+    def wrapped_gaussian_mu_r_t(self, t: torch.Tensor, v_t: torch.Tensor, v0: torch.Tensor) -> torch.Tensor:
+        """Backward-compatible alias for the pre-wrap mean helper."""
+        return self.wrapped_gaussian_mu_r_t_pre_wrap(t=t, v_t=v_t, v0=v0)
+
+    def wrapped_gaussian_sigma_r_t(self, t: torch.Tensor) -> torch.Tensor:
         return torch.sqrt(
             torch.clamp(2.0 * t + 8.0 / (1.0 + torch.exp(t)) - 4.0, min=self.eps)
         )  # Eq. (23)
+
+    def lambda_v(self, t01: torch.Tensor) -> torch.Tensor:
+        """
+        Interpolate λ(t) for normalized time t01 in [0,1].
+        """
+        return interpolate_lambda_table(self._lambda_v_table, t01)
+
+    # NO GRAD HERE!!!, THIS IS PURELY PRECOMPUTED!!!
+    @torch.no_grad()
+    def precompute_lambda_v_table_from_loader(
+        self,
+        loader,
+        device: torch.device | None = None,
+        num_batches: int | None = None,
+        clamp_min: float | None = None,
+        clamp_max: float | None = None,
+        smooth: bool = False,
+        mean_normalize: bool = False,
+        target_mean_weight: float = 1.0,
+    ) -> torch.Tensor:
+        """
+        Precompute λ(t) using a torsional-diffusion-style score norm estimate.
+
+        By default this uses the raw paper-style estimate with no smoothing,
+        mean normalization, or clipping.
+        """
+        lambda_table = precompute_lambda_time_grid_from_loader(
+            diffusion=self,
+            loader=loader,
+            t01_grid=self._lambda_t01_grid,
+            num_batches=self.lambda_num_batches if num_batches is None else int(num_batches),
+            clamp_min=clamp_min,
+            clamp_max=clamp_max,
+            smooth=smooth,
+            mean_normalize=mean_normalize,
+            target_mean_weight=target_mean_weight,
+            device=self._lambda_v_table.device if device is None else device,
+        )
+        self._lambda_v_table.copy_(lambda_table.to(self._lambda_v_table))
+        return self._lambda_v_table
 
 
     #TODO: We do not center the distribution around = 0 yet. Ask francois.
@@ -94,7 +154,7 @@ class TrivialisedDiffusion(nn.Module):
 
         """
         The transition kernel is defined as follow:
-            p_t|0 (ft, vt | f0, v0) = WN(r, | mu_r_t, sigma_r_t) * Nv(vt | mu_v_t, sigma_v_r)
+            p_t|0 (ft, vt | f0, v0) = WN(r | wrapped_gaussian_mu_r_t, wrapped_gaussian_sigma_r_t) * Nv(vt | mu_v_t, sigma_v)
 
             transition kernel =          sample r_t              *         sample v_t
 
@@ -108,6 +168,9 @@ class TrivialisedDiffusion(nn.Module):
         #Vi sætter v0 = 0, [Design choice] at time t = 0
         if v0 is None:
             v0 = torch.zeros_like(f0)                               #Design choice: Initial zero velocities
+        # Keep all state variables in native unit-period coordinates.
+        # Introducing angular 2π scaling here changes the optimization problem.
+        f0 = self.wrap_displacements(f0)
 
         #TODO: Scatter center mean free, også det de gør i KLDM
 
@@ -116,22 +179,19 @@ class TrivialisedDiffusion(nn.Module):
             epsilon_v = torch.randn_like(v0)
         epsilon_v = scatter_center(epsilon_v, index=index) #Zero mean
 
-        #Alpha_v_t = exp(-t)
-        alpha_v_t = self._match_dims(self.alpha_v(t), v0)       #Equation 22
-        #Sigma_v_t = 1-exp(-2t)
-        sigma_v_t = self._match_dims(self.sigma_v(t), v0)       #Equation 23
+        gaussian_velocity_mean_coeff_t = self._match_dims(self.gaussian_velocity_mean_coeff(t), v0)
+        gaussian_velocity_sigma_t = self._match_dims(self.gaussian_velocity_sigma(t), v0)
 
         #Sample v_t, given initial velocity.
-        v_t = alpha_v_t * v0 + sigma_v_t * epsilon_v            #Equation 16: Reparamization sample of Nv(vt | mu_v_t, sigma_v_r)
+        v_t = gaussian_velocity_mean_coeff_t * v0 + gaussian_velocity_sigma_t * epsilon_v
 
         ######################################
         ###    Calculate displacement ft   ###
         ######################################
-        #Now we calculate f_t = f_0 * expm(r_t),  where r_t = WN(r, | mu_r_t, sigma_r_t)
+        #Now we calculate f_t = f_0 * expm(r_t), where r_t follows a wrapped Gaussian.
+        wrapped_gaussian_mu_r_t_pre_wrap = self.wrapped_gaussian_mu_r_t_pre_wrap(t, v_t, v0)
 
-        #First we sample r_t = WN(r, | mu_r_t, sigma_r_t)
-        mu_r_t = self.mu_r_t(t, v_t, v0)
-        sigma_r_t = self._match_dims(self.sigma_r_t(t), f0)
+        wrapped_gaussian_sigma_r_t = self._match_dims(self.wrapped_gaussian_sigma_r_t(t), f0)
 
         #Sample normal noise on epsilon
         if epsilon_r is None:
@@ -139,26 +199,17 @@ class TrivialisedDiffusion(nn.Module):
         epsilon_r = scatter_center(epsilon_r, index=index)
 
 
-        """ OLD VERSION, CHAT MIGHT SAY IT IS A PROBLEM
-        r_t = self.wrap_signed_unit(mu_r_t + sigma_r_t * epsilon_r)  # Signed wrapped displacement
+        # Native fractional pipeline: wrap in period 1 directly.
+        # Hidden angular scaling here would change both target norms and reverse dynamics.
+        r_t = self.wrap_displacements(wrapped_gaussian_mu_r_t_pre_wrap + wrapped_gaussian_sigma_r_t * epsilon_r)
 
         #Now we calculate displacement, and while we stay on the manifold.
-        f_t = self.wrap_fractional(f0 + r_t)                               # Map back to [0, 1)
+        f_t = self.wrap_displacements(f0 + r_t)
 
         #Center again
-        f_t = scatter_center(f_t, index=index)
-        f_t = self.wrap_fractional(f_t)
-        """
-        #Move to [-0.5, 0.5]
-
-        #PSEUDO: rt = w(µrt(t, v0, vt) + σrt, (t, v0, vt) · ϵrt ) ▷ w indicates the wrap function. ft = w(f0 + rt) ft = center(ft) ▷ center(·) keeps the center of gravity fixed
-        r_t = self.wrap_signed_unit(mu_r_t + sigma_r_t * epsilon_r)
-        #Remove mean
-        r_t = scatter_center(r_t, index=index)
-        r_t = self.wrap_signed_unit(r_t)
-        f_t = self.wrap_fractional(f0 + r_t)
-
-
+        #f_t = scatter_center(f_t, index=index) DEACTIVED WHILE FRANCOIS ANSWERS MAIL.
+        #Then we wrap to ensure we stay within [0,1]
+        #f_t = self.wrap_positions(f_t)
 
         return f_t, v_t, epsilon_v, epsilon_r, r_t
 
@@ -171,7 +222,12 @@ class TrivialisedDiffusion(nn.Module):
         index: torch.Tensor,
         v0: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Return the TDM velocity training target used by KLDM. """
+        """Return the simplified TDM target predicted by the network.
+
+        In the simplified parameterization we train on the stripped-down
+        wrapped-normal term only. The prefactor is reinserted later in
+        `construct_velocity_score(...)` when reconstructing Eq. (19).
+        """
 
         #We do time scaling.
         t = self.time_scaling_T * t
@@ -179,26 +235,32 @@ class TrivialisedDiffusion(nn.Module):
         #Design choice, makes the target quite simple to calculate.
         v0 = torch.zeros_like(v_t) if v0 is None else v0
 
-        sigma_v_t = self._match_dims(self.sigma_v(t), v_t)
-
-        #Simplified target of normal velocity distribution
-        gaussian_target = -v_t / sigma_v_t.clamp_min(self.eps).pow(2)
-
         #Now we find target of the wrapped normal fractional distribution
-        mu_r_t = self.mu_r_t(t, v_t, v0)
+        # Keep target construction in exactly the same unit-period chart as training.
+        wrapped_gaussian_mu_r_t_pre_wrap = self.wrapped_gaussian_mu_r_t_pre_wrap(t, v_t, v0)
 
-        sigma_r_t = self._match_dims(self.sigma_r_t(t), r_t)
+        # Keep the wrapped mean in the centered unit chart so the finite image truncation in
+        # d_log_wrapped_normal(...) stays numerically stable. Verify this TODO
+        wrapped_gaussian_mu_r_t = self.wrap_displacements(wrapped_gaussian_mu_r_t_pre_wrap)
 
-        wrapped_normal_target = self._match_dims((1.0 - torch.exp(-t)) / (1.0 + torch.exp(-t)), r_t) * d_log_wrapped_normal(
+        wrapped_gaussian_sigma_r_t = self._match_dims(self.wrapped_gaussian_sigma_r_t(t), r_t)
+
+
+
+        wrapped_gaussian_target = d_log_wrapped_normal(
             r=r_t,
-            mu=mu_r_t,
-            sigma=sigma_r_t,
+            mu=wrapped_gaussian_mu_r_t,
+            sigma=wrapped_gaussian_sigma_r_t,
         )
 
-        wrapped_normal_target = scatter_center(wrapped_normal_target, index=index)
 
-        target = gaussian_target + wrapped_normal_target
-        return target
+
+        #Center the target
+        wrapped_gaussian_target = scatter_center(wrapped_gaussian_target, index=index)
+
+        #target = gaussian_velocity_target + wrapped_gaussian_target
+        return wrapped_gaussian_target #Simplified version, might explain later.
+
         #return target_s
 
     def construct_velocity_score(
@@ -207,14 +269,19 @@ class TrivialisedDiffusion(nn.Module):
         v_t: torch.Tensor,
         pred_v: torch.Tensor,
     ) -> torch.Tensor:
-        """Construct the full KLDM velocity score from the network prediction."""
+        """Construct the full KLDM velocity score from the simplified prediction."""
         t_internal = self.time_scaling_T * t
-        sigma_v_sq = self._match_dims(self.sigma_v(t_internal) ** 2, pred_v)
-
-        return self._match_dims(
+        prefactor = self._match_dims(
             (1.0 - torch.exp(-t_internal)) / (1.0 + torch.exp(-t_internal)),
             pred_v,
-        ) * pred_v - v_t / sigma_v_sq.clamp_min(self.eps)
+        )
+        gaussian_velocity_sigma_sq = self._match_dims(
+            self.gaussian_velocity_sigma(t_internal) ** 2,
+            pred_v,
+        ).clamp_min(self.eps)
+
+        # Native period-1 reconstruction: no hidden chart conversion here.
+        return prefactor * pred_v - v_t / gaussian_velocity_sigma_sq
 
     def reverse_exp_step(
         self,
@@ -225,19 +292,27 @@ class TrivialisedDiffusion(nn.Module):
         dt: float,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """One exponential-integrator reverse step for the TDM process."""
+        f_t = self.wrap_displacements(f_t)
+
         dt_t = torch.as_tensor(
             self.time_scaling_T * dt,
             device=v_t.device,
             dtype=v_t.dtype,
         )
+        # Reverse noise must stay in the same unit-period scaling as v_t and score_v.
         noise_v = scatter_center(torch.randn_like(v_t), index=index)
 
         exp_dt = torch.exp(dt_t)
         exp_2dt_minus_1 = torch.exp(2.0 * dt_t) - 1.0
-        noise_scale = torch.sqrt(exp_2dt_minus_1.clamp_min(self.eps))
+        expm1_dt = torch.expm1(dt_t)
+        expm1_2dt = torch.expm1(2.0 * dt_t)
+        noise_scale = torch.sqrt(expm1_2dt.clamp_min(self.eps))
 
-        v_prev = exp_dt * v_t + 2.0 * exp_2dt_minus_1 * score_v + noise_scale * noise_v
-        f_prev = self.wrap_fractional(f_t - dt_t * v_prev)
+        # Keep reverse drift native too; mixing angular-sized score/noise here is an easy way
+        # to silently change the sampler.
+        v_prev = exp_dt * v_t + 2.0 * expm1_dt * score_v + noise_scale * noise_v
+
+        f_prev = self.wrap_displacements(f_t - dt_t * v_prev)
 
         return f_prev, v_prev
 

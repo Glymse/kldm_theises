@@ -1,10 +1,9 @@
 from __future__ import annotations
 
+import csv
 from pathlib import Path
 import shutil
 
-import pandas as pd
-import requests
 from mattergen.common.data.chemgraph import ChemGraph
 from mattergen.common.data.dataset import CrystalDataset, CrystalDatasetBuilder, DatasetTransform
 from mattergen.common.data.transform import Transform
@@ -13,6 +12,16 @@ from pymatgen.symmetry.groups import SpaceGroup
 from torch.utils.data import Dataset
 from torch_geometric.data import Batch
 from tqdm.auto import tqdm
+
+try:
+    import pandas as pd
+except ModuleNotFoundError:  # pragma: no cover - optional dependency in notebook environments
+    pd = None
+
+try:
+    import requests
+except ModuleNotFoundError:  # pragma: no cover - optional dependency in notebook environments
+    requests = None
 
 
 WORKSPACE_ROOT = Path(__file__).resolve().parents[3]
@@ -67,7 +76,17 @@ class CrystalDatasetWrapper(Dataset):
         return Batch.from_data_list(samples)
 
     def _prepare_df(self) -> tuple[pd.DataFrame, list[str]]:
-        df = pd.read_csv(self.raw_folder / f"{self.split}.csv")
+        csv_path = self.raw_folder / f"{self.split}.csv"
+
+        if pd is None:
+            with csv_path.open(newline="") as handle:
+                reader = csv.DictReader(handle)
+                raw_columns = reader.fieldnames or []
+            renamed_columns = [self.properties_map.get(column, column) for column in raw_columns]
+            properties = list(set(renamed_columns) & set(PROPERTY_SOURCE_IDS))
+            return None, properties
+
+        df = pd.read_csv(csv_path)
         df = df.rename(columns=self.properties_map)
 
         space_group_map = {
@@ -84,6 +103,11 @@ class CrystalDatasetWrapper(Dataset):
         processed_path = self.processed_folder / f"{self.split}"
 
         if not self._check_exists_processed():
+            if self._df_raw is None:
+                raise RuntimeError(
+                    "pandas is required to build processed datasets from raw CSV files. "
+                    "Install pandas or use an existing processed cache."
+                )
             if processed_path.exists():
                 shutil.rmtree(processed_path)
             self.processed_folder.mkdir(parents=True, exist_ok=True)
@@ -115,6 +139,10 @@ class CrystalDatasetWrapper(Dataset):
 
     @property
     def df(self) -> pd.DataFrame:
+        if self._df_raw is None:
+            raise RuntimeError(
+                "pandas is not installed in this environment, so the raw dataframe view is unavailable."
+            )
         if len(self.data) != len(self._df_raw):
             mask = self._df_raw["material_id"].isin(self.data.structure_id)
             return self._df_raw[mask].reset_index(drop=True)
@@ -155,6 +183,11 @@ class CrystalDatasetWrapper(Dataset):
     def download(self) -> None:
         if self._check_exists_raw():
             return
+
+        if requests is None:
+            raise RuntimeError(
+                "requests is required to download raw datasets. Install requests or use the local cached data."
+            )
 
         self.raw_folder.mkdir(parents=True, exist_ok=True)
         response = requests.get(url=self.url + f"{self.split}.csv", stream=True, timeout=40)

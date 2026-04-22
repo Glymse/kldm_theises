@@ -12,6 +12,24 @@ if __package__ in {None, ""}:
 from kldm.data import CSPTask, DNGTask, resolve_data_root
 
 
+#INspired by
+#https://github.com/yang-song/score_sde_pytorch/blob/main/sde_lib.py
+
+class LinearBetaSchedule(nn.Module):
+    """Simple linear beta schedule for a VP SDE."""
+
+    def __init__(self, beta_min: float = 0.1, beta_max: float = 20.0) -> None:
+        super().__init__()
+        self.beta_min = float(beta_min)
+        self.beta_max = float(beta_max)
+
+    def beta(self, t: torch.Tensor) -> torch.Tensor:
+        return self.beta_min + (self.beta_max - self.beta_min) * t
+
+    def integral_beta(self, t: torch.Tensor) -> torch.Tensor:
+        return self.beta_min * t + 0.5 * (self.beta_max - self.beta_min) * t.pow(2)
+
+
 class ContinuousVPDiffusion(nn.Module):
     """Small variance-preserving diffusion for Euclidean modalities.
 
@@ -33,24 +51,32 @@ class ContinuousVPDiffusion(nn.Module):
     target in closed form.
     """
 
-    def __init__(self, eps: float = 1e-5) -> None:
+    def __init__(
+        self,
+        eps: float = 1e-5,
+        beta_min: float = 0.1,
+        beta_max: float = 20.0,
+    ) -> None:
         super().__init__()
         self.eps = float(eps)
+        self.schedule = LinearBetaSchedule(beta_min=beta_min, beta_max=beta_max)
 
     # For the VP SDE
     #
-    #   dx = -beta x dt + sqrt(2 beta) dW_t
+    #   dx = -0.5 * beta(t) * x dt + sqrt(beta(t)) dW_t
     #
-    # with constant beta = 1, the marginal mean coefficient becomes exp(-t)
-    # and the variance becomes 1 - exp(-2t). In this file we expose those two
-    # pieces directly as alpha(t) and sigma(t).
+    # the marginal moments are:
+    #   alpha(t) = exp(-0.5 * integral_0^t beta(s) ds)
+    #   sigma(t) = sqrt(1 - alpha(t)^2)
     def alpha(self, t: torch.Tensor) -> torch.Tensor:
         """Mean coefficient of the forward kernel."""
-        return torch.exp(-t)
+        beta_integral = self.schedule.integral_beta(t)
+        return torch.exp(-0.5 * beta_integral)
 
     def sigma(self, t: torch.Tensor) -> torch.Tensor:
         """Standard deviation of the forward kernel."""
-        return torch.sqrt(torch.clamp(1.0 - torch.exp(-2.0 * t), min=self.eps))
+        alpha_t = self.alpha(t)
+        return torch.sqrt(torch.clamp(1.0 - alpha_t.pow(2), min=self.eps))
 
     def forward_sample(
         self,
@@ -116,14 +142,16 @@ class ContinuousVPDiffusion(nn.Module):
         """
         One reverse Euler-Maruyama step for the VP SDE
 
-            dx = -x dt + sqrt(2) dW
+            dx = -0.5 * beta(t) * x dt + sqrt(beta(t)) dW
 
-        reverse-time discretization:
-            x_prev = x_t + (x_t + 2 score_x) dt + sqrt(2 dt) z
+        reverse-time discretization for a positive step size `dt` from t to t-dt:
+            x_prev = x_t + (0.5 * beta(t) * x_t + beta(t) * score_x) dt
+                     + sqrt(beta(t) dt) z
         """
-
+        beta_t = self._match_dims(self.schedule.beta(t), x_t)
         noise = torch.randn_like(x_t)
-        x_prev = x_t + (x_t + 2.0 * score_x) * dt + (2.0 * dt) ** 0.5 * noise
+        x_prev = x_t + (0.5 * beta_t * x_t + beta_t * score_x) * dt
+        x_prev = x_prev + torch.sqrt(beta_t * dt) * noise
         return x_prev
 
     def reverse_em_step_from_eps(

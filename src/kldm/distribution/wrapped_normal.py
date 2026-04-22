@@ -1,3 +1,5 @@
+import os
+
 import torch
 
 
@@ -9,30 +11,6 @@ def d_log_wrapped_normal(
     mu: torch.Tensor,
     sigma: torch.Tensor,
     K: int = 13,
-    eps: float = 1e-8,
-) -> torch.Tensor:
-    while sigma.ndim < r.ndim:
-        sigma = sigma.unsqueeze(-1)
-    while mu.ndim < r.ndim:
-        mu = mu.unsqueeze(-1)
-
-    k = torch.arange(-K, K + 1, device=r.device, dtype=r.dtype)
-    diff = r.unsqueeze(-1) - mu.unsqueeze(-1) + k
-    sigma2 = sigma.unsqueeze(-1).square().clamp_min(eps)
-
-    logw = -0.5 * diff.square() / sigma2
-    logw = logw - torch.logsumexp(logw, dim=-1, keepdim=True)
-    w = torch.exp(logw)
-
-    return ((diff) / sigma2 * w).sum(dim=-1)
-
-
-
-def d_log_wrapped_normal_2pi_version(
-    r: torch.Tensor,
-    mu: torch.Tensor,
-    sigma: torch.Tensor,
-    N: int = 13,
     T: float = 1.0,
     eps: float = 1e-8,
 ) -> torch.Tensor:
@@ -41,45 +19,98 @@ def d_log_wrapped_normal_2pi_version(
     while mu.ndim < r.ndim:
         mu = mu.unsqueeze(-1)
 
-    total = torch.zeros_like(r)
-    denom = torch.zeros_like(r)
-    sigma2 = sigma.square().clamp_min(eps)
+    k = torch.arange(-K, K + 1, device=r.device, dtype=r.dtype)
+    diff = r.unsqueeze(-1) - mu.unsqueeze(-1) + T * k
+    sigma2 = sigma.unsqueeze(-1).pow(2).clamp_min(eps)
 
-    for i in range(-N, N + 1):
-        shifted = r - mu + T * i
-        weight = torch.exp(-(shifted.square()) / (2.0 * sigma2))
-        total = total + (shifted / sigma2) * weight
-        denom = denom + weight
+    log_terms = -0.5 * diff.pow(2) / sigma2
+    log_weights = log_terms - torch.logsumexp(log_terms, dim=-1, keepdim=True)
+    weights = torch.exp(log_weights)
 
-    return total / denom.clamp_min(eps)
-
-
-def main() -> None:
-    torch.manual_seed(7)
-
-    r = torch.rand(8, 3) - 0.5
-    mu = torch.rand(8, 3) - 0.5
-    sigma = 0.05 + 0.95 * torch.rand(8, 1)
-    K = 13
-
-    ours = d_log_wrapped_normal(r=r, mu=mu, sigma=sigma, K=K)
-    two_pi_version = d_log_wrapped_normal_2pi_version(r=r, mu=mu, sigma=sigma, N=K, T=1.0)
-
-    max_abs_diff = float((ours - two_pi_version).abs().max().item())
-    max_abs_diff_negated = float((ours + two_pi_version).abs().max().item())
-    same_value = torch.allclose(ours, two_pi_version, atol=1e-6, rtol=1e-5)
-    same_value_if_negated = torch.allclose(ours, -two_pi_version, atol=1e-6, rtol=1e-5)
-
-    print("Wrapped normal comparison")
-    print("K/N:", K)
-    print("T:", 1.0)
-    print("ours[0]:", ours[0])
-    print("2pi_version[0]:", two_pi_version[0])
-    print("max_abs_diff:", max_abs_diff)
-    print("allclose_same_value:", same_value)
-    print("max_abs_diff_if_negated:", max_abs_diff_negated)
-    print("allclose_if_negated:", same_value_if_negated)
+    grad_mu = (weights * diff / sigma2).sum(dim=-1)
+    return grad_mu
 
 
-if __name__ == "__main__":
-    main()
+def sigma_norm(
+    sigma: torch.Tensor,
+    T: float = 1.0,
+    K: int = 9,
+    sn: int = 20000,
+    sigma_chunk_size: int = 128,
+    sample_chunk_size: int = 2048,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    debug = os.environ.get("KLDM_SIGMA_NORM_DEBUG", "").lower() in {"1", "true", "yes", "on"}
+    sigma = sigma.reshape(-1)
+    if sigma_chunk_size <= 0 or sample_chunk_size <= 0:
+        raise ValueError("sigma_chunk_size and sample_chunk_size must be positive.")
+
+    result = torch.empty_like(sigma)
+
+    if debug:
+        print(
+            "sigma_norm_debug "
+            f"sigmas={sigma.numel()} sn={sn} K={K} "
+            f"sigma_chunk_size={sigma_chunk_size} sample_chunk_size={sample_chunk_size} "
+            f"dtype={sigma.dtype} device={sigma.device}",
+            flush=True,
+        )
+
+    with torch.no_grad():
+        for sigma_start in range(0, sigma.numel(), sigma_chunk_size):
+            sigma_end = min(sigma_start + sigma_chunk_size, sigma.numel())
+            sigma_chunk = sigma[sigma_start:sigma_end].clamp_min(eps)
+            accum = torch.zeros_like(sigma_chunk)
+            seen = 0
+
+            if debug:
+                diff_elements = sample_chunk_size * sigma_chunk.numel() * (2 * K + 1)
+                diff_mb = diff_elements * sigma.element_size() / (1024 ** 2)
+                print(
+                    "sigma_norm_debug "
+                    f"chunk={sigma_start}:{sigma_end} "
+                    f"chunk_sigmas={sigma_chunk.numel()} "
+                    f"estimated_diff_tensor_mb={diff_mb:.1f}",
+                    flush=True,
+                )
+
+            while seen < sn:
+                current_samples = min(sample_chunk_size, sn - seen)
+                sigmas = sigma_chunk.unsqueeze(0).expand(current_samples, -1)
+                x_sample = sigmas * torch.randn_like(sigmas)
+                x_sample = torch.remainder(x_sample + 0.5 * T, T) - 0.5 * T
+                normal_ = d_log_wrapped_normal(
+                    r=x_sample,
+                    mu=torch.zeros_like(x_sample),
+                    sigma=sigmas,
+                    K=K,
+                    T=T,
+                    eps=eps,
+                )
+                accum += (normal_ ** 2).sum(dim=0)
+                seen += current_samples
+
+                if debug and (seen == current_samples or seen == sn or seen % max(sample_chunk_size * 4, 1) == 0):
+                    print(
+                        "sigma_norm_debug "
+                        f"chunk={sigma_start}:{sigma_end} "
+                        f"progress={seen}/{sn}",
+                        flush=True,
+                    )
+
+            result[sigma_start:sigma_end] = accum / float(sn)
+
+            if debug:
+                print(
+                    "sigma_norm_debug "
+                    f"chunk={sigma_start}:{sigma_end} done",
+                    flush=True,
+                )
+
+    if debug:
+        print("sigma_norm_debug complete", flush=True)
+
+    return result
+
+#∇μ​logWN    not   ∇𝑟log⁡W.
+#HUSK DETTE I RAPPORT

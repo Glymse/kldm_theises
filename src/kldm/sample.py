@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-import itertools
+import argparse
+import glob
+import re
 from pathlib import Path
 import sys
 
@@ -10,6 +12,7 @@ if __package__ in {None, ""}:
 import torch
 
 from kldm.data import CSPTask, resolve_data_root
+from kldm.diffusionModels.TDMdev import TrivialisedDiffusionDev
 from kldm.kldm import ModelKLDM
 from kldm.sample_evaluation.sample_evaluation import (
     aggregate_csp_reconstruction_metrics,
@@ -19,6 +22,53 @@ from kldm.sample_evaluation.sample_evaluation import (
     evaluate_csp_reconstruction,
     validity_structure,
 )
+
+#Here is how we run this sampling code.
+# uv run src/kldm/sample.py --model "artifacts/HPC/checkpoints/checkpoint_epoch_800.pt" --max-samples 5 --n-steps 1000
+
+DEFAULT_MODEL_SPEC = "artifacts/HPC/checkpoint_epoch_*.pt"
+
+
+def resolve_checkpoint_path(model_spec: str) -> Path:
+    path = Path(model_spec).expanduser()
+    if any(ch in model_spec for ch in "*?[]"):
+        matches = [Path(match) for match in glob.glob(str(path))]
+        if not matches:
+            raise FileNotFoundError(f"No checkpoints matched model spec: {model_spec}")
+
+        def sort_key(candidate: Path) -> tuple[int, float, str]:
+            match = re.search(r"_epoch_(\d+)", candidate.stem)
+            epoch = int(match.group(1)) if match is not None else -1
+            mtime = candidate.stat().st_mtime
+            return epoch, mtime, str(candidate)
+
+        return max(matches, key=sort_key)
+
+    if not path.exists():
+        fallback_paths = [path]
+        if path.parent.name == "checkpoints":
+            fallback_paths.append(path.parent.parent / path.name)
+        fallback_paths.append(Path("artifacts") / "HPC" / path.name)
+
+        for candidate in fallback_paths:
+            if candidate.exists():
+                return candidate
+
+        if path.name.startswith("checkpoint_epoch_"):
+            search_roots = [path.parent, path.parent.parent, Path("artifacts") / "HPC"]
+            for root in search_roots:
+                if not root.exists():
+                    continue
+                direct_match = root / path.name
+                if direct_match.exists():
+                    return direct_match
+                matches = sorted(Path(match) for match in glob.glob(str(root / path.name)))
+                if matches:
+                    return matches[-1]
+
+        raise FileNotFoundError(f"Checkpoint not found: {path}")
+
+    return path
 
 
 def print_invalid_sample_diagnostic(
@@ -93,118 +143,147 @@ def print_matching_sample(
     print("formula:", result.formula)
 
 
+def sample_validation_csp(
+    *,
+    model: ModelKLDM,
+    loader,
+    checkpoint_path: Path,
+    n_steps: int,
+    max_graphs: int | None,
+) -> dict[str, float | int | None]:
+    reconstruction_results = []
+    num_graphs_seen = 0
+
+    model.eval()
+
+    for batch in loader:
+        batch = batch.to(model.device)
+        with torch.no_grad():
+            pos_t, v_t, l_t, h_t = model.sample_CSP_algorithm3(
+                n_steps=n_steps,
+                batch=batch,
+                checkpoint_path=str(checkpoint_path),
+            )
+
+        ptr = batch.ptr.tolist()
+        for graph_idx, (start, end) in enumerate(zip(ptr[:-1], ptr[1:])):
+            sample_idx = num_graphs_seen
+            try:
+                result = evaluate_csp_reconstruction(
+                    pred_f=pos_t[start:end],
+                    pred_l=l_t[graph_idx],
+                    pred_a=h_t[start:end],
+                    target_f=batch.pos[start:end],
+                    target_l=batch.l[graph_idx],
+                    target_a=batch.h[start:end],
+                )
+            except Exception as exc:
+                print(f"[sample {sample_idx:15d}] evaluation_error: {exc}")
+                continue
+
+            reconstruction_results.append(result)
+
+            if result.match:
+                print_matching_sample(
+                    sample_idx=sample_idx,
+                    pred_f=pos_t[start:end],
+                    pred_v=v_t[start:end],
+                    pred_l=l_t[graph_idx],
+                    pred_a=h_t[start:end],
+                    result=result,
+                )
+            else:
+                print_invalid_sample_diagnostic(
+                    sample_idx=sample_idx,
+                    pred_f=pos_t[start:end],
+                    pred_l=l_t[graph_idx],
+                    pred_a=h_t[start:end],
+                )
+                print("valid:", result.valid)
+                print("match:", result.match)
+                print("RMSE:", result.rmse)
+
+            num_graphs_seen += 1
+            if max_graphs is not None and num_graphs_seen >= max_graphs:
+                break
+        if max_graphs is not None and num_graphs_seen >= max_graphs:
+            break
+
+    if not reconstruction_results:
+        raise RuntimeError("Validation sampling produced no reconstruction results.")
+
+    summary = aggregate_csp_reconstruction_metrics(reconstruction_results)
+    return summary
+
+
 def main() -> None:
+    parser = argparse.ArgumentParser(description="Sample validation CSPs with a KLDM checkpoint and report metrics.")
+    parser.add_argument(
+        "--model",
+        type=str,
+        default=DEFAULT_MODEL_SPEC,
+        help="Checkpoint path or glob for an artifacts/HPC checkpoint, for example artifacts/HPC/checkpoint_epoch_*.pt",
+    )
+    parser.add_argument("--n-steps", type=int, default=1000, help="Number of Algorithm 3 sampling steps.")
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=256,
+        help="Validation dataloader batch size. Match trainHPC validation for closest parity.",
+    )
+    parser.add_argument(
+        "--max-samples",
+        type=int,
+        default=1024,
+        help="Maximum number of validation CSPs to sample. Use 0 or a negative value to sample the full loader.",
+    )
+    parser.add_argument(
+        "--use-sigma-norm",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable sigma_norm behavior in TDMdev. Enabled by default to match trainHPC sampling.",
+    )
+    args = parser.parse_args()
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     root = resolve_data_root()
+    checkpoint_path = resolve_checkpoint_path(args.model)
+
+    print(f"using checkpoint: {checkpoint_path}")
 
     loader = CSPTask().dataloader(
         root=root,
         split="val",
-        batch_size=1,
+        batch_size=args.batch_size,
         shuffle=False,
         download=True,
     )
 
-    model = ModelKLDM(device=device).to(device)
-    max_samples = 100
-    n_steps = 1000
-    reconstruction_results = []
-    oracle_lattice_results = []
-    oracle_coordinate_results = []
-    template_iter = itertools.cycle(loader)
+    sampling_tdm = TrivialisedDiffusionDev(
+        eps=1e-3,
+        n_lambdas=512 if device.type == "cuda" else 128,
+        lambda_num_batches=32 if device.type == "cuda" else 8,
+        k_wn_score=13,
+        n_sigmas=2000 if device.type == "cuda" else 512,
+        compute_sigma_norm=bool(args.use_sigma_norm),
+    )
+    model = ModelKLDM(device=device, diffusion_v=sampling_tdm).to(device)
+    max_graphs = None if args.max_samples <= 0 else args.max_samples
+    summary = sample_validation_csp(
+        model=model,
+        loader=loader,
+        checkpoint_path=checkpoint_path,
+        n_steps=args.n_steps,
+        max_graphs=max_graphs,
+    )
 
-    for sample_idx in range(max_samples):
-        batch = next(template_iter)
-        batch = batch.to(device)
-        pos_t, v_t, l_t, h_t = model.sample_CSP_algorithm3(
-            n_steps=n_steps,
-            batch=batch,
-        )
-
-        try:
-            result = evaluate_csp_reconstruction(
-                pred_f=pos_t,
-                pred_l=l_t[0],
-                pred_a=h_t,
-                target_f=batch.pos,
-                target_l=batch.l[0],
-                target_a=batch.h,
-            )
-        except Exception as exc:
-            print(f"[sample {sample_idx:15d}] evaluation_error: {exc}")
-            continue
-
-        try:
-            oracle_lattice_result = evaluate_csp_reconstruction(
-                pred_f=pos_t,
-                pred_l=batch.l[0],
-                pred_a=h_t,
-                target_f=batch.pos,
-                target_l=batch.l[0],
-                target_a=batch.h,
-            )
-            oracle_lattice_results.append(oracle_lattice_result)
-        except Exception as exc:
-            print(f"[sample {sample_idx:15d}] oracle_lattice_error: {exc}")
-
-        try:
-            oracle_coordinate_result = evaluate_csp_reconstruction(
-                pred_f=batch.pos,
-                pred_l=l_t[0],
-                pred_a=h_t,
-                target_f=batch.pos,
-                target_l=batch.l[0],
-                target_a=batch.h,
-            )
-            oracle_coordinate_results.append(oracle_coordinate_result)
-        except Exception as exc:
-            print(f"[sample {sample_idx:15d}] oracle_coordinate_error: {exc}")
-
-        reconstruction_results.append(result)
-
-        if not result.match:
-            print_invalid_sample_diagnostic(
-                sample_idx=sample_idx,
-                pred_f=pos_t,
-                pred_l=l_t[0],
-                pred_a=h_t,
-            )
-            print("valid:", result.valid)
-            print("match:", result.match)
-            print("RMSE:", result.rmse)
-            continue
-
-        print_matching_sample(
-            sample_idx=sample_idx,
-            pred_f=pos_t,
-            pred_v=v_t,
-            pred_l=l_t,
-            pred_a=h_t,
-            result=result,
-        )
-
-    summary = aggregate_csp_reconstruction_metrics(reconstruction_results)
-    oracle_lattice_summary = aggregate_csp_reconstruction_metrics(oracle_lattice_results)
-    oracle_coordinate_summary = aggregate_csp_reconstruction_metrics(oracle_coordinate_results)
-    print("\nSampling summary")
-    print("generated_samples:", max_samples)
-    print("valid_samples:", sum(r.valid for r in reconstruction_results))
-    print("matching_samples:", sum(r.match for r in reconstruction_results))
-    print("MR:", summary["match_rate"])
-    print("RMSE:", summary["rmse"])
+    print("\nValidation summary")
+    print("model:", str(checkpoint_path))
+    print("val/valid:", summary["valid"])
+    print("val/match:", summary["match_rate"])
+    print("val/match_rate:", summary["match_rate"])
+    print("val/rmse:", summary["rmse"])
     print("csp_metrics:", summary)
-    print("\nOracle-lattice summary")
-    print("valid_samples:", sum(r.valid for r in oracle_lattice_results))
-    print("matching_samples:", sum(r.match for r in oracle_lattice_results))
-    print("MR:", oracle_lattice_summary["match_rate"])
-    print("RMSE:", oracle_lattice_summary["rmse"])
-    print("csp_metrics:", oracle_lattice_summary)
-    print("\nOracle-coordinate summary")
-    print("valid_samples:", sum(r.valid for r in oracle_coordinate_results))
-    print("matching_samples:", sum(r.match for r in oracle_coordinate_results))
-    print("MR:", oracle_coordinate_summary["match_rate"])
-    print("RMSE:", oracle_coordinate_summary["rmse"])
-    print("csp_metrics:", oracle_coordinate_summary)
 
 
 if __name__ == "__main__":
