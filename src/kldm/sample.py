@@ -5,6 +5,7 @@ import glob
 import re
 from pathlib import Path
 import sys
+from typing import Any
 
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -16,15 +17,11 @@ from kldm.diffusionModels.TDMdev import TrivialisedDiffusionDev
 from kldm.kldm import ModelKLDM
 from kldm.sample_evaluation.sample_evaluation import (
     aggregate_csp_reconstruction_metrics,
-    build_structure_from_sample,
-    decode_atom_types,
-    decode_lattice,
     evaluate_csp_reconstruction,
-    validity_structure,
 )
 
-#Here is how we run this sampling code.
-# uv run src/kldm/sample.py --model "artifacts/HPC/checkpoints/checkpoint_epoch_800.pt" --max-samples 5 --n-steps 1000
+# Here is how we run this sampling evaluation code.
+# uv run src/kldm/sample.py --model "artifacts/HPC/checkpoints/checkpoint_epoch_800.pt" --num-total-samples 1000 --samples-per-target 25 --n-steps 1000
 
 DEFAULT_MODEL_SPEC = "artifacts/HPC/checkpoint_epoch_*.pt"
 
@@ -71,153 +68,119 @@ def resolve_checkpoint_path(model_spec: str) -> Path:
     return path
 
 
-def print_invalid_sample_diagnostic(
-    *,
-    sample_idx: int,
-    pred_f: torch.Tensor,
-    pred_l: torch.Tensor,
-    pred_a: torch.Tensor,
-) -> None:
-    print(f"\nInvalid CSP sample {sample_idx + 1:03d}")
-    print("pos shape:", tuple(pred_f.shape))
-    print("l shape:", tuple(pred_l.shape))
-    print("h shape:", tuple(pred_a.shape))
-    print("First 3 sampled fractional coordinates:")
-    print(pred_f[:3])
-
-    try:
-        atomic_numbers, species = decode_atom_types(pred_a)
-        lengths, angles_deg = decode_lattice(pred_l, n_atoms=int(pred_f.shape[0]))
-        print("decoded_species:", species)
-        print("decoded_atomic_numbers:", atomic_numbers)
-        print("decoded_lengths:", [float(x) for x in lengths.detach().cpu().tolist()])
-        print("decoded_angles_deg:", [float(x) for x in angles_deg.detach().cpu().tolist()])
-    except Exception as exc:
-        print("decode_error:", str(exc))
-        return
-
-    try:
-        structure = build_structure_from_sample(f=pred_f, l=pred_l, a=pred_a)
-    except Exception as exc:
-        print("structure_build_error:", str(exc))
-        return
-
-    try:
-        dmat = torch.as_tensor(structure.distance_matrix, dtype=torch.float32)
-        nonzero = dmat[dmat > 1e-8]
-        min_dist = None if nonzero.numel() == 0 else float(nonzero.min().item())
-    except Exception as exc:
-        print("distance_matrix_error:", str(exc))
-        min_dist = None
-
-    print("structure_valid:", validity_structure(structure))
-    print("volume:", float(structure.volume))
-    print("min_interatomic_distance:", min_dist)
-
-def print_matching_sample(
-    *,
-    sample_idx: int,
-    pred_f: torch.Tensor,
-    pred_v: torch.Tensor,
-    pred_l: torch.Tensor,
-    pred_a: torch.Tensor,
-    result,
-) -> None:
-    atom_type_index = pred_a if pred_a.ndim == 1 else pred_a.argmax(dim=-1)
-
-    print(f"\nMatching CSP sample {sample_idx + 1:03d}")
-    print("pos shape:", tuple(pred_f.shape))
-    print("v shape:", tuple(pred_v.shape))
-    print("l shape:", tuple(pred_l.shape))
-    print("h shape:", tuple(pred_a.shape))
-    print("atom_type_index shape:", tuple(atom_type_index.shape))
-    print("First 3 sampled fractional coordinates:")
-    print(pred_f[:3])
-    print("Predicted atom type indices:")
-    print(atom_type_index)
-    print("Sampled lattice:")
-    print(pred_l)
-    print("valid:", result.valid)
-    print("match:", result.match)
-    print("RMSE:", result.rmse)
-    print("formula:", result.formula)
+def _match_rate_at_n(grouped_results: list[list[Any]]) -> float | None:
+    if not grouped_results:
+        return None
+    hits = [1.0 if any(result.match for result in group) else 0.0 for group in grouped_results]
+    return float(sum(hits) / len(hits))
 
 
-def sample_validation_csp(
+def _rmse_at_n(grouped_results: list[list[Any]]) -> float | None:
+    if not grouped_results:
+        return None
+
+    best_rmses: list[float] = []
+    for group in grouped_results:
+        group_rmses = [float(result.rmse) for result in group if result.rmse is not None]
+        if group_rmses:
+            best_rmses.append(min(group_rmses))
+
+    if not best_rmses:
+        return None
+    return float(sum(best_rmses) / len(best_rmses))
+
+
+def evaluate_sampling_csp(
     *,
     model: ModelKLDM,
     loader,
     checkpoint_path: Path,
     n_steps: int,
-    max_graphs: int | None,
+    num_targets: int,
+    samples_per_target: int,
+    progress_every: int = 1,
 ) -> dict[str, float | int | None]:
-    reconstruction_results = []
-    num_graphs_seen = 0
+    if num_targets <= 0:
+        raise ValueError("num_targets must be positive.")
+    if samples_per_target <= 0:
+        raise ValueError("samples_per_target must be positive.")
+
+    grouped_results: list[list[Any]] = [[] for _ in range(num_targets)]
+    all_results = []
 
     model.eval()
 
-    for batch in loader:
-        batch = batch.to(model.device)
-        with torch.no_grad():
-            pos_t, v_t, l_t, h_t = model.sample_CSP_algorithm3(
-                n_steps=n_steps,
-                batch=batch,
-                checkpoint_path=str(checkpoint_path),
+    for repeat_idx in range(samples_per_target):
+        if progress_every > 0 and ((repeat_idx + 1) % progress_every == 0 or repeat_idx == 0):
+            print(
+                f"sampling repeat {repeat_idx + 1}/{samples_per_target} "
+                f"over {num_targets} targets",
+                flush=True,
             )
 
-        ptr = batch.ptr.tolist()
-        for graph_idx, (start, end) in enumerate(zip(ptr[:-1], ptr[1:])):
-            sample_idx = num_graphs_seen
-            try:
-                result = evaluate_csp_reconstruction(
-                    pred_f=pos_t[start:end],
-                    pred_l=l_t[graph_idx],
-                    pred_a=h_t[start:end],
-                    target_f=batch.pos[start:end],
-                    target_l=batch.l[graph_idx],
-                    target_a=batch.h[start:end],
-                )
-            except Exception as exc:
-                print(f"[sample {sample_idx:15d}] evaluation_error: {exc}")
-                continue
-
-            reconstruction_results.append(result)
-
-            if result.match:
-                print_matching_sample(
-                    sample_idx=sample_idx,
-                    pred_f=pos_t[start:end],
-                    pred_v=v_t[start:end],
-                    pred_l=l_t[graph_idx],
-                    pred_a=h_t[start:end],
-                    result=result,
-                )
-            else:
-                print_invalid_sample_diagnostic(
-                    sample_idx=sample_idx,
-                    pred_f=pos_t[start:end],
-                    pred_l=l_t[graph_idx],
-                    pred_a=h_t[start:end],
-                )
-                print("valid:", result.valid)
-                print("match:", result.match)
-                print("RMSE:", result.rmse)
-
-            num_graphs_seen += 1
-            if max_graphs is not None and num_graphs_seen >= max_graphs:
+        target_offset = 0
+        for batch in loader:
+            if target_offset >= num_targets:
                 break
-        if max_graphs is not None and num_graphs_seen >= max_graphs:
-            break
+            batch = batch.to(model.device)
 
-    if not reconstruction_results:
-        raise RuntimeError("Validation sampling produced no reconstruction results.")
+            with torch.no_grad():
+                pos_t, v_t, l_t, h_t = model.sample_CSP_algorithm3(
+                    n_steps=n_steps,
+                    batch=batch,
+                    checkpoint_path=str(checkpoint_path),
+                )
 
-    summary = aggregate_csp_reconstruction_metrics(reconstruction_results)
-    return summary
+            ptr = batch.ptr.tolist()
+            for graph_idx, (start, end) in enumerate(zip(ptr[:-1], ptr[1:])):
+                target_idx = target_offset + graph_idx
+                if target_idx >= num_targets:
+                    break
+                try:
+                    result = evaluate_csp_reconstruction(
+                        pred_f=pos_t[start:end],
+                        pred_l=l_t[graph_idx],
+                        pred_a=h_t[start:end],
+                        target_f=batch.pos[start:end],
+                        target_l=batch.l[graph_idx],
+                        target_a=batch.h[start:end],
+                    )
+                except Exception as exc:
+                    print(
+                        f"[target {target_idx:03d} repeat {repeat_idx + 1:02d}] "
+                        f"evaluation_error: {exc}",
+                        flush=True,
+                    )
+                    continue
+
+                grouped_results[target_idx].append(result)
+                all_results.append(result)
+
+            target_offset += batch.num_graphs
+
+    if not all_results:
+        raise RuntimeError("Sampling evaluation produced no reconstruction results.")
+
+    summary_at_1 = aggregate_csp_reconstruction_metrics(all_results)
+    summary_at_n = {
+        "match_rate": _match_rate_at_n(grouped_results),
+        "rmse": _rmse_at_n(grouped_results),
+    }
+
+    return {
+        "num_targets": int(num_targets),
+        "samples_per_target": int(samples_per_target),
+        "num_total_samples": int(len(all_results)),
+        "valid": summary_at_1["valid"],
+        "match_rate": summary_at_1["match_rate"],
+        "rmse": summary_at_1["rmse"],
+        f"match_rate@{samples_per_target}": summary_at_n["match_rate"],
+        f"rmse@{samples_per_target}": summary_at_n["rmse"],
+    }
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Sample validation CSPs with a KLDM checkpoint and report metrics.")
+    parser = argparse.ArgumentParser(description="Evaluate CSP sampling with repeated draws from a KLDM checkpoint.")
     parser.add_argument(
         "--model",
         type=str,
@@ -225,17 +188,18 @@ def main() -> None:
         help="Checkpoint path or glob for an artifacts/HPC checkpoint, for example artifacts/HPC/checkpoint_epoch_*.pt",
     )
     parser.add_argument("--n-steps", type=int, default=1000, help="Number of Algorithm 3 sampling steps.")
+    parser.add_argument("--batch-size", type=int, default=256, help="Validation dataloader batch size.")
     parser.add_argument(
-        "--batch-size",
+        "--num-total-samples",
         type=int,
-        default=256,
-        help="Validation dataloader batch size. Match trainHPC validation for closest parity.",
+        default=1000,
+        help="Total number of sampled structures to evaluate.",
     )
     parser.add_argument(
-        "--max-samples",
+        "--samples-per-target",
         type=int,
-        default=1024,
-        help="Maximum number of validation CSPs to sample. Use 0 or a negative value to sample the full loader.",
+        default=25,
+        help="How many independent samples to draw per target structure.",
     )
     parser.add_argument(
         "--use-sigma-norm",
@@ -268,22 +232,35 @@ def main() -> None:
         compute_sigma_norm=bool(args.use_sigma_norm),
     )
     model = ModelKLDM(device=device, diffusion_v=sampling_tdm).to(device)
-    max_graphs = None if args.max_samples <= 0 else args.max_samples
-    summary = sample_validation_csp(
+    if args.num_total_samples <= 0:
+        raise ValueError("--num-total-samples must be positive.")
+    if args.samples_per_target <= 0:
+        raise ValueError("--samples-per-target must be positive.")
+    if args.num_total_samples % args.samples_per_target != 0:
+        raise ValueError("--num-total-samples must be divisible by --samples-per-target.")
+
+    num_targets = args.num_total_samples // args.samples_per_target
+
+    summary = evaluate_sampling_csp(
         model=model,
         loader=loader,
         checkpoint_path=checkpoint_path,
         n_steps=args.n_steps,
-        max_graphs=max_graphs,
+        num_targets=num_targets,
+        samples_per_target=args.samples_per_target,
     )
 
-    print("\nValidation summary")
+    print("\nSampling evaluation summary")
     print("model:", str(checkpoint_path))
-    print("val/valid:", summary["valid"])
-    print("val/match:", summary["match_rate"])
-    print("val/match_rate:", summary["match_rate"])
-    print("val/rmse:", summary["rmse"])
-    print("csp_metrics:", summary)
+    print("num_targets:", summary["num_targets"])
+    print("samples_per_target:", summary["samples_per_target"])
+    print("num_total_samples:", summary["num_total_samples"])
+    print("valid:", summary["valid"])
+    print("match_rate:", summary["match_rate"])
+    print("rmse:", summary["rmse"])
+    print(f"match_rate@{args.samples_per_target}:", summary[f"match_rate@{args.samples_per_target}"])
+    print(f"rmse@{args.samples_per_target}:", summary[f"rmse@{args.samples_per_target}"])
+    print("summary:", summary)
 
 
 if __name__ == "__main__":
