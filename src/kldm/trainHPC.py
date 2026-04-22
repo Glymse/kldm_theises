@@ -6,6 +6,7 @@ from contextlib import contextmanager
 import errno
 import os
 from pathlib import Path
+import random
 import re
 import signal
 import sys
@@ -14,6 +15,7 @@ from typing import Any
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+import numpy as np
 import torch
 from torch.utils.data import DataLoader, Subset
 
@@ -40,7 +42,8 @@ except ImportError:  # pragma: no cover
 
 STOP_REQUESTED = False
 TIME_LOWER_BOUND = 1e-3
-VAL_SUBSET_SEED = 123
+GLOBAL_SEED = 42
+VAL_SUBSET_SEED = 42
 LOADER_NUM_WORKERS = 1
 LOADER_PIN_MEMORY = True
 
@@ -105,9 +108,18 @@ def sample_graph_times(num_graphs: int, device: torch.device) -> torch.Tensor:
 def make_fixed_subset(dataset, subset_size: int, seed: int):
     if subset_size <= 0 or subset_size >= len(dataset):
         return dataset
-    generator = torch.Generator().manual_seed(seed)
-    indices = torch.randperm(len(dataset), generator=generator)[:subset_size].tolist()
+    # Match facit's current DataModule subset selection exactly.
+    rnd = np.random.RandomState(seed=seed)
+    indices = rnd.permutation(np.arange(subset_size)).tolist()
     return Subset(dataset, indices)
+
+
+def set_global_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 
 def aggregate_epoch_metrics(
@@ -564,7 +576,6 @@ def run_sampling_evaluation(
     device: torch.device,
     n_steps: int,
     max_graphs: int | None = None,
-    checkpoint_path: str | Path | None = None,
 ) -> dict[str, float | int]:
     reconstruction_results = []
     num_graphs_seen = 0
@@ -578,7 +589,7 @@ def run_sampling_evaluation(
             pos_t, v_t, l_t, h_t = model.sample_CSP_algorithm3(
                 n_steps=n_steps,
                 batch=batch,
-                checkpoint_path=None if checkpoint_path is None else str(checkpoint_path),
+                checkpoint_path=None,
             )
 
         ptr = batch.ptr.tolist()
@@ -772,6 +783,7 @@ def train() -> None:
 
     config = {
         "task": "CSP",
+        "seed": GLOBAL_SEED,
         "batch_size": args.batch_size,
         "lr": args.lr,
         "weight_decay": args.weight_decay,
@@ -792,6 +804,8 @@ def train() -> None:
         "pin_memory": LOADER_PIN_MEMORY,
         "dev": args.dev,
     }
+
+    set_global_seed(config["seed"])
 
     train_loader = CSPTask().dataloader(
         root=root,
@@ -1046,8 +1060,6 @@ def train() -> None:
                 config=config,
                 epoch=epoch,
             )
-            sampling_checkpoint_path = checkpoint_path if checkpoint_written else None
-
             print(
                 f"epoch={epoch:04d} starting sampling evaluation",
                 flush=True,
@@ -1062,25 +1074,14 @@ def train() -> None:
                     f"epoch={epoch:04d} sampling with EMA model (facit-style selection)",
                     flush=True,
                 )
-                if sampling_checkpoint_path is not None:
+                with ema.average_parameters(model):
                     sampling_metrics = run_sampling_evaluation(
                         model=model,
                         loader=val_loader,
                         device=device,
                         n_steps=config["sampling_steps"],
                         max_graphs=config["val_subset_graphs"],
-                        checkpoint_path=sampling_checkpoint_path,
                     )
-                else:
-                    with ema.average_parameters(model):
-                        sampling_metrics = run_sampling_evaluation(
-                            model=model,
-                            loader=val_loader,
-                            device=device,
-                            n_steps=config["sampling_steps"],
-                            max_graphs=config["val_subset_graphs"],
-                            checkpoint_path=None,
-                        )
             else:
                 print(
                     f"epoch={epoch:04d} sampling with current model (EMA not updated yet)",
@@ -1092,7 +1093,6 @@ def train() -> None:
                     device=device,
                     n_steps=config["sampling_steps"],
                     max_graphs=config["val_subset_graphs"],
-                    checkpoint_path=sampling_checkpoint_path,
                 )
             print(
                 f"epoch={epoch:04d} finished sampling evaluation",
