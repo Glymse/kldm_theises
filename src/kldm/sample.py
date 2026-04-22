@@ -1,3 +1,5 @@
+#28254763
+
 from __future__ import annotations
 
 import argparse
@@ -15,13 +17,14 @@ import torch
 from kldm.data import CSPTask, resolve_data_root
 from kldm.diffusionModels.TDMdev import TrivialisedDiffusionDev
 from kldm.kldm import ModelKLDM
-from kldm.sample_evaluation.sample_evaluation import (
-    aggregate_csp_reconstruction_metrics,
-    evaluate_csp_reconstruction,
-)
+from kldm.sample_evaluation.sample_evaluation import evaluate_csp_reconstruction
 
-# Here is how we run this sampling evaluation code.
-# uv run src/kldm/sample.py --model "artifacts/HPC/checkpoints/checkpoint_epoch_800.pt" --num-total-samples 1000 --samples-per-target 25 --n-steps 1000
+# Example:
+# uv run src/kldm/sample.py \
+#   --model "artifacts/HPC/checkpoint_epoch_800.pt" \
+#   --num-total-samples 1000 \
+#   --samples-per-target 20 \
+#   --n-steps 1000
 
 DEFAULT_MODEL_SPEC = "artifacts/HPC/checkpoint_epoch_*.pt"
 
@@ -68,26 +71,61 @@ def resolve_checkpoint_path(model_spec: str) -> Path:
     return path
 
 
-def _match_rate_at_n(grouped_results: list[list[Any]]) -> float | None:
-    if not grouped_results:
+def _safe_mean(values: list[float]) -> float | None:
+    if not values:
         return None
-    hits = [1.0 if any(result.match for result in group) else 0.0 for group in grouped_results]
-    return float(sum(hits) / len(hits))
+    return float(sum(values) / len(values))
 
 
-def _rmse_at_n(grouped_results: list[list[Any]]) -> float | None:
+def summarize_grouped_csp_results(
+    grouped_results: list[list[Any]],
+    samples_per_target: int,
+) -> dict[str, float | int | None]:
     if not grouped_results:
-        return None
+        return {
+            "num_targets": 0,
+            "samples_per_target": samples_per_target,
+            "num_total_samples": 0,
+            "mr@1": None,
+            "rmse@1": None,
+            f"mr@{samples_per_target}": None,
+            f"rmse@{samples_per_target}": None,
+        }
 
-    best_rmses: list[float] = []
+    first_results = [group[0] for group in grouped_results if group]
+    if not first_results:
+        raise RuntimeError("No first-sample results were collected.")
+
+    mr_at_1 = _safe_mean([1.0 if r.match else 0.0 for r in first_results])
+    rmse_at_1 = _safe_mean([float(r.rmse) for r in first_results if r.rmse is not None])
+
+    hit_at_n: list[float] = []
+    best_rmse_at_n: list[float] = []
+
     for group in grouped_results:
-        group_rmses = [float(result.rmse) for result in group if result.rmse is not None]
-        if group_rmses:
-            best_rmses.append(min(group_rmses))
+        if not group:
+            hit_at_n.append(0.0)
+            continue
 
-    if not best_rmses:
-        return None
-    return float(sum(best_rmses) / len(best_rmses))
+        matches = [r for r in group if r.match]
+        hit_at_n.append(1.0 if matches else 0.0)
+
+        rmses = [float(r.rmse) for r in matches if r.rmse is not None]
+        if rmses:
+            best_rmse_at_n.append(min(rmses))
+
+    mr_at_n = _safe_mean(hit_at_n)
+    rmse_at_n = _safe_mean(best_rmse_at_n)
+
+    return {
+        "num_targets": len(grouped_results),
+        "samples_per_target": samples_per_target,
+        "num_total_samples": sum(len(group) for group in grouped_results),
+        "mr@1": mr_at_1,
+        "rmse@1": rmse_at_1,
+        f"mr@{samples_per_target}": mr_at_n,
+        f"rmse@{samples_per_target}": rmse_at_n,
+    }
 
 
 def evaluate_sampling_csp(
@@ -106,8 +144,6 @@ def evaluate_sampling_csp(
         raise ValueError("samples_per_target must be positive.")
 
     grouped_results: list[list[Any]] = [[] for _ in range(num_targets)]
-    all_results = []
-
     model.eval()
 
     for repeat_idx in range(samples_per_target):
@@ -122,6 +158,7 @@ def evaluate_sampling_csp(
         for batch in loader:
             if target_offset >= num_targets:
                 break
+
             batch = batch.to(model.device)
 
             with torch.no_grad():
@@ -136,6 +173,7 @@ def evaluate_sampling_csp(
                 target_idx = target_offset + graph_idx
                 if target_idx >= num_targets:
                     break
+
                 try:
                     result = evaluate_csp_reconstruction(
                         pred_f=pos_t[start:end],
@@ -154,38 +192,27 @@ def evaluate_sampling_csp(
                     continue
 
                 grouped_results[target_idx].append(result)
-                all_results.append(result)
 
             target_offset += batch.num_graphs
 
-    if not all_results:
+    if not any(grouped_results):
         raise RuntimeError("Sampling evaluation produced no reconstruction results.")
 
-    summary_at_1 = aggregate_csp_reconstruction_metrics(all_results)
-    summary_at_n = {
-        "match_rate": _match_rate_at_n(grouped_results),
-        "rmse": _rmse_at_n(grouped_results),
-    }
-
-    return {
-        "num_targets": int(num_targets),
-        "samples_per_target": int(samples_per_target),
-        "num_total_samples": int(len(all_results)),
-        "valid": summary_at_1["valid"],
-        "match_rate": summary_at_1["match_rate"],
-        "rmse": summary_at_1["rmse"],
-        f"match_rate@{samples_per_target}": summary_at_n["match_rate"],
-        f"rmse@{samples_per_target}": summary_at_n["rmse"],
-    }
+    return summarize_grouped_csp_results(
+        grouped_results=grouped_results,
+        samples_per_target=samples_per_target,
+    )
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Evaluate CSP sampling with repeated draws from a KLDM checkpoint.")
+    parser = argparse.ArgumentParser(
+        description="Evaluate CSP sampling with repeated draws from a KLDM checkpoint."
+    )
     parser.add_argument(
         "--model",
         type=str,
         default=DEFAULT_MODEL_SPEC,
-        help="Checkpoint path or glob for an artifacts/HPC checkpoint, for example artifacts/HPC/checkpoint_epoch_*.pt",
+        help="Checkpoint path or glob for an artifacts/HPC checkpoint.",
     )
     parser.add_argument("--n-steps", type=int, default=1000, help="Number of Algorithm 3 sampling steps.")
     parser.add_argument("--batch-size", type=int, default=256, help="Validation dataloader batch size.")
@@ -198,8 +225,8 @@ def main() -> None:
     parser.add_argument(
         "--samples-per-target",
         type=int,
-        default=25,
-        help="How many independent samples to draw per target structure.",
+        default=20,
+        help="How many independent samples to draw per target structure. Use 20 to match KLDM CSP tables.",
     )
     parser.add_argument(
         "--use-sigma-norm",
@@ -208,6 +235,13 @@ def main() -> None:
         help="Enable sigma_norm behavior in TDMdev. Enabled by default to match trainHPC sampling.",
     )
     args = parser.parse_args()
+
+    if args.num_total_samples <= 0:
+        raise ValueError("--num-total-samples must be positive.")
+    if args.samples_per_target <= 0:
+        raise ValueError("--samples-per-target must be positive.")
+    if args.num_total_samples % args.samples_per_target != 0:
+        raise ValueError("--num-total-samples must be divisible by --samples-per-target.")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     root = resolve_data_root()
@@ -232,12 +266,6 @@ def main() -> None:
         compute_sigma_norm=bool(args.use_sigma_norm),
     )
     model = ModelKLDM(device=device, diffusion_v=sampling_tdm).to(device)
-    if args.num_total_samples <= 0:
-        raise ValueError("--num-total-samples must be positive.")
-    if args.samples_per_target <= 0:
-        raise ValueError("--samples-per-target must be positive.")
-    if args.num_total_samples % args.samples_per_target != 0:
-        raise ValueError("--num-total-samples must be divisible by --samples-per-target.")
 
     num_targets = args.num_total_samples // args.samples_per_target
 
@@ -250,16 +278,15 @@ def main() -> None:
         samples_per_target=args.samples_per_target,
     )
 
-    print("\nSampling evaluation summary")
+    print("\nCSP sampling evaluation summary")
     print("model:", str(checkpoint_path))
     print("num_targets:", summary["num_targets"])
     print("samples_per_target:", summary["samples_per_target"])
     print("num_total_samples:", summary["num_total_samples"])
-    print("valid:", summary["valid"])
-    print("match_rate:", summary["match_rate"])
-    print("rmse:", summary["rmse"])
-    print(f"match_rate@{args.samples_per_target}:", summary[f"match_rate@{args.samples_per_target}"])
-    print(f"rmse@{args.samples_per_target}:", summary[f"rmse@{args.samples_per_target}"])
+    print("MR@1:", summary["mr@1"])
+    print("RMSE@1:", summary["rmse@1"])
+    print(f"MR@{args.samples_per_target}:", summary[f"mr@{args.samples_per_target}"])
+    print(f"RMSE@{args.samples_per_target}:", summary[f"rmse@{args.samples_per_target}"])
     print("summary:", summary)
 
 

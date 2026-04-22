@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import itertools
 from collections import Counter
-from typing import Any, Callable, Optional, Sequence
+from typing import Any, Callable, Optional
 
 import numpy as np
 import torch
@@ -389,7 +389,13 @@ class CSPMetrics:
         angle_tol: float = 10.0,
         ltol: float = 0.3,
     ) -> None:
-        self.matcher = StructureMatcher(stol=stol, angle_tol=angle_tol, ltol=ltol)
+        self.matcher = StructureMatcher(
+            stol=stol,
+            angle_tol=angle_tol,
+            ltol=ltol,
+            primitive_cell=False,
+            scale=True,
+        )
         self.valid: list[int] = []
         self.match: list[int] = []
         self.rmse: list[float] = []
@@ -401,17 +407,18 @@ class CSPMetrics:
         assert len(input_s) == len(target_s)
 
         for si, st in zip(input_s, target_s):
-            v, m = 0, 0
+            valid = 0
+            match = 0
             if si is not None and st is not None:
-                v = int(validity_structure(si))
-                if v:
+                valid = int(validity_structure(si))
+                if valid:
                     rms = self.matcher.get_rms_dist(si, st)
-                    m = int(rms is not None)
+                    match = int(rms is not None)
                     if rms is not None:
-                        self.rmse.append(float(rms[0]))  # only for valid + matching
+                        self.rmse.append(float(rms[0]))
 
-            self.valid.append(v)
-            self.match.append(m)
+            self.valid.append(valid)
+            self.match.append(match)
 
     def summarize(self) -> dict[str, float | None]:
         return {
@@ -458,17 +465,6 @@ def evaluate_csp_reconstruction(
             species_vocab=species_vocab,
             lattice_transform=lattice_transform,
         )
-    except Exception:
-        return CSPReconstructionResult(
-            valid=False,
-            match=False,
-            rmse=None,
-            predicted_structure=None,
-            target_structure=None,
-            formula=None,
-        )
-
-    try:
         target_structure = build_structure_from_sample(
             f=target_f,
             l=target_l,
@@ -481,25 +477,37 @@ def evaluate_csp_reconstruction(
             valid=False,
             match=False,
             rmse=None,
-            predicted_structure=pred_structure,
+            predicted_structure=None,
             target_structure=None,
+            formula=None,
+        )
+
+    valid = validity_structure(pred_structure)
+    if not valid:
+        return CSPReconstructionResult(
+            valid=False,
+            match=False,
+            rmse=None,
+            predicted_structure=pred_structure,
+            target_structure=target_structure,
             formula=pred_structure.composition.formula if pred_structure is not None else None,
         )
 
-    matcher = StructureMatcher(stol=stol, angle_tol=angle_tol, ltol=ltol)
-    valid = validity_structure(pred_structure)
-    match = False
-    rmse = None
+    matcher = StructureMatcher(
+        stol=stol,
+        angle_tol=angle_tol,
+        ltol=ltol,
+        primitive_cell=False,
+        scale=True,
+    )
 
-    if valid:
-        try:
-            rms = matcher.get_rms_dist(pred_structure, target_structure)
-            match = rms is not None
-            if rms is not None:
-                rmse = float(rms[0])
-        except Exception:
-            match = False
-            rmse = None
+    try:
+        rms = matcher.get_rms_dist(pred_structure, target_structure)
+        match = rms is not None
+        rmse = float(rms[0]) if rms is not None else None
+    except Exception:
+        match = False
+        rmse = None
 
     return CSPReconstructionResult(
         valid=valid,
