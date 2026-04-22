@@ -3,6 +3,7 @@ from .dataset_transform import filter_elements, filter_energy_above_hull
 from .transform import (
     DEFAULT_ATOMIC_VOCAB,
     ConcatFeatures,
+    ContinuousIntervalAngles,
     ContinuousIntervalLattice,
     ContinuousIntervalLengths,
     CopyProperty,
@@ -26,6 +27,7 @@ __all__ = [
     "filter_energy_above_hull",
     "DEFAULT_ATOMIC_VOCAB",
     "ConcatFeatures",
+    "ContinuousIntervalAngles",
     "ContinuousIntervalLattice",
     "ContinuousIntervalLengths",
     "CopyProperty",

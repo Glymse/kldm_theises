@@ -10,7 +10,11 @@ import torch
 
 from kldm.data.transform import (
     ContinuousIntervalLattice,
+    DEFAULT_DATA_ROOT,
+    DEFAULT_MP20_LENGTHS_LOC_SCALE_PATH,
     DEFAULT_ATOMIC_VOCAB,
+    FACIT_ANGLES_LOC_SCALE,
+    ensure_lengths_loc_scale_cache,
 )
 
 try:
@@ -93,9 +97,15 @@ def _to_2d_tensor(x: torch.Tensor | list[float] | list[list[float]]) -> torch.Te
 
 
 def _default_lattice_transform() -> ContinuousIntervalLattice:
+    cache_file = DEFAULT_MP20_LENGTHS_LOC_SCALE_PATH
+    ensure_lengths_loc_scale_cache(
+        cache_file=cache_file,
+        processed_dir=DEFAULT_DATA_ROOT / "mp_20" / "processed" / "train",
+    )
     return ContinuousIntervalLattice(
-        standardize=False,
-        angles_loc_scale=None,
+        standardize=True,
+        cache_file=cache_file,
+        angles_loc_scale=FACIT_ANGLES_LOC_SCALE,
     )
 
 
