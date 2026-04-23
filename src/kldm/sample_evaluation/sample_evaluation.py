@@ -152,6 +152,8 @@ def decode_lattice(
     l: torch.Tensor | list[float] | list[list[float]],
     n_atoms: int,
     lattice_transform: Optional[ContinuousIntervalLattice] = None,
+    transform_lengths: Optional[ContinuousIntervalLengths] = None,
+    transform_angles: Optional[ContinuousIntervalAngles] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     l_tensor = _to_2d_tensor(l)
 
@@ -168,7 +170,8 @@ def decode_lattice(
         angles_deg = torch.rad2deg(angles_rad)
         return lengths, angles_deg
 
-    transform_lengths, transform_angles = _default_interval_transforms()
+    if transform_lengths is None or transform_angles is None:
+        transform_lengths, transform_angles = _default_interval_transforms()
     li = l_tensor.squeeze(0)
     lengths = transform_lengths.invert_one(li[:3], n_atoms)
     angles_deg = transform_angles.invert_one(li[3:])
@@ -194,10 +197,13 @@ def build_structure_from_sample(
     *,
     species_vocab: Optional[list[int]] = None,
     lattice_transform: Optional[ContinuousIntervalLattice] = None,
+    transform_lengths: Optional[ContinuousIntervalLengths] = None,
+    transform_angles: Optional[ContinuousIntervalAngles] = None,
     sort_structure: bool = True,
 ) -> Structure:
     _require_pymatgen()
-    lattice_transform = lattice_transform or _default_lattice_transform()
+    if lattice_transform is None and (transform_lengths is None or transform_angles is None):
+        lattice_transform = _default_lattice_transform()
 
     frac_coords = _to_2d_tensor(f)
     if frac_coords.shape[-1] != 3:
@@ -205,7 +211,13 @@ def build_structure_from_sample(
 
     n_atoms = int(frac_coords.shape[0])
     _, species = decode_atom_types(a=a, species_vocab=species_vocab)
-    lengths, angles_deg = decode_lattice(l=l, n_atoms=n_atoms, lattice_transform=lattice_transform)
+    lengths, angles_deg = decode_lattice(
+        l=l,
+        n_atoms=n_atoms,
+        lattice_transform=lattice_transform,
+        transform_lengths=transform_lengths,
+        transform_angles=transform_angles,
+    )
 
     if not torch.isfinite(frac_coords).all():
         raise ValueError("Predicted fractional coordinates contain non-finite values.")
@@ -241,9 +253,12 @@ def structures_from_tensors(
     *,
     species_vocab: Optional[list[int]] = None,
     lattice_transform: Optional[ContinuousIntervalLattice] = None,
+    transform_lengths: Optional[ContinuousIntervalLengths] = None,
+    transform_angles: Optional[ContinuousIntervalAngles] = None,
 ) -> list[Structure | None]:
     _require_pymatgen()
-    lattice_transform = lattice_transform or _default_lattice_transform()
+    if lattice_transform is None and (transform_lengths is None or transform_angles is None):
+        lattice_transform = _default_lattice_transform()
 
     pos = tensors["pos"]
     h = tensors["h"]
@@ -260,6 +275,8 @@ def structures_from_tensors(
                 a=h[start_idx:end_idx],
                 species_vocab=species_vocab,
                 lattice_transform=lattice_transform,
+                transform_lengths=transform_lengths,
+                transform_angles=transform_angles,
             )
         except Exception:
             structure = None
@@ -273,6 +290,8 @@ def structures_from_batch(
     *,
     species_vocab: Optional[list[int]] = None,
     lattice_transform: Optional[ContinuousIntervalLattice] = None,
+    transform_lengths: Optional[ContinuousIntervalLengths] = None,
+    transform_angles: Optional[ContinuousIntervalAngles] = None,
 ) -> list[Structure | None]:
     tensors = {"h": batch.h, "pos": batch.pos, "l": batch.l}
     return structures_from_tensors(
@@ -280,6 +299,8 @@ def structures_from_batch(
         ptr=batch.ptr,
         species_vocab=species_vocab,
         lattice_transform=lattice_transform,
+        transform_lengths=transform_lengths,
+        transform_angles=transform_angles,
     )
 
 

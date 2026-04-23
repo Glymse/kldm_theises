@@ -14,11 +14,9 @@ from .transform import (
     ContinuousIntervalLengths,
     FullyConnectedGraph,
     MatterGenToFacitFields,
-    TaskMetadata,
+    ToPyGData,
     ensure_lengths_loc_scale_cache,
 )
-
-TASK_CSP = 0
 
 
 class CSPTask:
@@ -27,26 +25,35 @@ class CSPTask:
     def __init__(self, species_vocab: list[int] | None = None) -> None:
         self.species_vocab = species_vocab or DEFAULT_ATOMIC_VOCAB
 
-    def _make_transforms(self, root: str | Path | None = None) -> list:
+    def _cache_file(self, root: str | Path | None = None) -> Path:
         data_root = resolve_data_root(root)
         cache_file = data_root / "mp_20" / DEFAULT_MP20_LENGTHS_LOC_SCALE_PATH.name
         ensure_lengths_loc_scale_cache(
             cache_file=cache_file,
             processed_dir=data_root / "mp_20" / "processed" / "train",
         )
+        return cache_file
+
+    def make_lengths_transform(self, root: str | Path | None = None) -> ContinuousIntervalLengths:
+        return ContinuousIntervalLengths(
+            out_key="lengths",
+            lengths_loc_scale=self._cache_file(root=root),
+        )
+
+    def make_angles_transform(self) -> ContinuousIntervalAngles:
+        return ContinuousIntervalAngles(
+            out_key="angles",
+            angles_loc_scale=FACIT_ANGLES_LOC_SCALE,
+        )
+
+    def _make_transforms(self, root: str | Path | None = None) -> list:
         return [
             MatterGenToFacitFields(),
             FullyConnectedGraph(),
-            ContinuousIntervalLengths(
-                out_key="lengths",
-                lengths_loc_scale=cache_file,
-            ),
-            ContinuousIntervalAngles(
-                out_key="angles",
-                angles_loc_scale=FACIT_ANGLES_LOC_SCALE,
-            ),
+            self.make_lengths_transform(root=root),
+            self.make_angles_transform(),
             ConcatFeatures(in_keys=["lengths", "angles"], out_key="l"),
-            TaskMetadata(task_id=TASK_CSP, diffuse_h=False),
+            ToPyGData(),
         ]
 
     def fit_dataset(self, root: str | Path | None = None, split: str = "train", download: bool = False) -> MP20:

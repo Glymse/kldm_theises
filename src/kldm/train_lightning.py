@@ -12,11 +12,13 @@ from pytorch_lightning import Trainer, seed_everything
 from pytorch_lightning.callbacks import ModelCheckpoint
 from pytorch_lightning.loggers import WandbLogger
 
+from kldm.data.transform import ContinuousIntervalAngles, ContinuousIntervalLengths
 from kldm.diffusionModels.TDMdev import TrivialisedDiffusionDev
 from kldm.kldm import ModelKLDM
 from kldm.lightning_datamodule import CSPDataModule
 from kldm.lightning_module import LitKLDM
 from kldm.sample_evaluation.sample_evaluation import CSPMetrics
+from kldm.utils import LogSampledAtomsCallback
 
 
 def parse_args() -> argparse.Namespace:
@@ -53,22 +55,30 @@ def main() -> None:
         lambda_num_batches=32 if device.type == "cuda" else 8,
         n_sigmas=2000 if device.type == "cuda" else 512,
     )
-    model = ModelKLDM(device=device, diffusion_v=tdm).to(device)
+    model = ModelKLDM(
+        device=device,
+        diffusion_v=tdm,
+        lattice_parameterization="x0",
+    ).to(device)
     datamodule.setup()
+    transform_lengths: ContinuousIntervalLengths = datamodule.task.make_lengths_transform(root=datamodule.root)
+    transform_angles: ContinuousIntervalAngles = datamodule.task.make_angles_transform()
     model.tdm.precompute_lambda_v_table_from_loader(
         datamodule.train_dataloader(),
         device=device,
     )
     lit_module = LitKLDM(
         model=model,
+        transform_lengths=transform_lengths,
+        transform_angles=transform_angles,
         lr=1e-3,
         with_ema=True,
         ema_decay=0.999,
         ema_start=500,
         metrics=CSPMetrics(),
         sampling_kwargs={
-            "val": {"force_ema": False, "n_steps": args.sampling_steps},
-            "test": {"force_ema": True, "n_steps": args.sampling_steps},
+            "val": {"force_ema": False, "method": "em", "n_steps": args.sampling_steps},
+            "test": {"force_ema": True, "method": "pc", "n_steps": args.sampling_steps},
         },
     )
 
@@ -82,6 +92,11 @@ def main() -> None:
         every_n_epochs=args.validate_every,
         save_on_train_epoch_end=True,
     )
+    sampled_atoms_callback = LogSampledAtomsCallback(
+        dirpath="artifacts/HPC/samples",
+        save_atoms=True,
+        num_log_wandb=25,
+    )
     wandb_logger = WandbLogger(project=args.project, log_model=False)
 
     trainer = Trainer(
@@ -90,7 +105,7 @@ def main() -> None:
         max_epochs=args.max_epochs,
         check_val_every_n_epoch=args.validate_every,
         num_sanity_val_steps=0,
-        callbacks=[checkpoint_callback],
+        callbacks=[checkpoint_callback, sampled_atoms_callback],
         logger=[wandb_logger],
     )
     trainer.fit(model=lit_module, datamodule=datamodule)

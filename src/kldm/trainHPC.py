@@ -1146,7 +1146,11 @@ def train() -> None:
         lambda_num_batches=32 if device.type == "cuda" else 8,
         n_sigmas=2000 if device.type == "cuda" else 512,
     )
-    model = ModelKLDM(device=device, diffusion_v=tdm).to(device)
+    model = ModelKLDM(
+        device=device,
+        diffusion_v=tdm,
+        lattice_parameterization="x0",
+    ).to(device)
     print("precomputing TDM tables on real train batches", flush=True)
     model.tdm.precompute_lambda_v_table_from_loader(
         train_loader,

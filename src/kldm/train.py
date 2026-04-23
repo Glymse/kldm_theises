@@ -240,7 +240,10 @@ def train() -> None:
         download=True,
     )
 
-    model = ModelKLDM(device=device).to(device)
+    model = ModelKLDM(
+        device=device,
+        lattice_parameterization="x0",
+    ).to(device)
     print("precomputing lambda_v table on real train batches", flush=True)
     model.tdm.precompute_lambda_v_table_from_loader(
         train_loader,

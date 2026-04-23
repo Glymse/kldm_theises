@@ -8,6 +8,7 @@ import torch
 from mattergen.common.data.chemgraph import ChemGraph
 from mattergen.common.data.transform import Transform
 from torch import Tensor
+from torch_geometric.data import Data
 from torch_geometric.data.datapipes import functional_transform
 from torch_geometric.utils import dense_to_sparse, one_hot
 
@@ -140,6 +141,35 @@ class MatterGenToFacitFields(Transform):
                 self.atom_key: getattr(sample, self.atomic_numbers_key),
             }
         )
+
+
+@functional_transform("to_pyg_data")
+class ToPyGData(Transform):
+    """Convert a MatterGen ``ChemGraph`` into a plain facit-style PyG ``Data`` object.
+
+    facit's dataset loader yields ``torch_geometric.data.Data`` instances with a
+    small, explicit attribute set. After the MatterGen transforms have populated
+    the matching fields, we drop back to a plain ``Data`` object so batching and
+    downstream code see the same object shape facit expects.
+    """
+
+    def __init__(self, keep_keys: list[str] | None = None) -> None:
+        self.keep_keys = keep_keys or [
+            "pos",
+            "h",
+            "lengths",
+            "angles",
+            "l",
+            "edge_node_index",
+        ]
+
+    def __call__(self, sample: ChemGraph) -> Data:
+        payload = {
+            key: getattr(sample, key)
+            for key in self.keep_keys
+            if hasattr(sample, key)
+        }
+        return Data(**payload)
 
 
 @functional_transform("fully_connected_graph")

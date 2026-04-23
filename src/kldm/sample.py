@@ -265,7 +265,11 @@ def main() -> None:
         n_sigmas=2000 if device.type == "cuda" else 512,
         compute_sigma_norm=bool(args.use_sigma_norm),
     )
-    model = ModelKLDM(device=device, diffusion_v=sampling_tdm).to(device)
+    model = ModelKLDM(
+        device=device,
+        diffusion_v=sampling_tdm,
+        lattice_parameterization="x0",
+    ).to(device)
 
     num_targets = args.num_total_samples // args.samples_per_target
 

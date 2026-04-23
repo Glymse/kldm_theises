@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import warnings
 from typing import Literal, Optional, Sequence
 
 import torch
 from ase.data import chemical_symbols
 from pytorch_lightning import LightningModule
 
+from kldm.data.transform import ContinuousIntervalAngles, ContinuousIntervalLengths
 from kldm.distribution.uniform import sample_uniform
 from kldm.kldm import ModelKLDM
 from kldm.sample_evaluation.sample_evaluation import (
@@ -20,6 +22,8 @@ class LitKLDM(LightningModule):
         self,
         model: ModelKLDM,
         task: Literal["csp"] = "csp",
+        transform_lengths: Optional[ContinuousIntervalLengths] = None,
+        transform_angles: Optional[ContinuousIntervalAngles] = None,
         decoder: Sequence[str] = chemical_symbols,
         lr: float = 1e-3,
         with_ema: bool = True,
@@ -32,10 +36,15 @@ class LitKLDM(LightningModule):
         super().__init__()
         self.model = model
         self.decoder = list(decoder)
+        self.transform_lengths = transform_lengths
+        self.transform_angles = transform_angles
         self.metrics = metrics or CSPMetrics()
         self.loss_weights = {"v": 1.0, "l": 1.0} if loss_weights is None else loss_weights
         self.sampling_kwargs = (
-            {"val": {"force_ema": False, "n_steps": 1000}, "test": {"force_ema": True, "n_steps": 1000}}
+            {
+                "val": {"force_ema": False, "method": "em", "n_steps": 1000},
+                "test": {"force_ema": True, "method": "pc", "n_steps": 1000},
+            }
             if sampling_kwargs is None
             else sampling_kwargs
         )
@@ -48,7 +57,7 @@ class LitKLDM(LightningModule):
         else:
             self.ema_model = None
 
-        self.save_hyperparameters(ignore=["model", "metrics", "decoder"])
+        self.save_hyperparameters(ignore=["model", "metrics", "decoder", "transform_lengths", "transform_angles"])
 
     def basic_step(self, batch):
         t = sample_uniform(lb=1e-3, size=(batch.num_graphs, 1), device=self.device)
@@ -107,19 +116,29 @@ class LitKLDM(LightningModule):
         self,
         batch,
         force_ema: bool = True,
+        method: str = "em",
         n_steps: int = 1000,
         **_: dict,
     ):
+        if method != "em":
+            warnings.warn(
+                f"Requested sampling method '{method}', but the local ModelKLDM sampler "
+                "currently only implements the EM-style path. Falling back to 'em'."
+            )
         model = self.get_model(ema=force_ema)
         pos_t, _v_t, l_t, h_t = model.sample_CSP_algorithm3(
             n_steps=n_steps,
             batch=batch,
             checkpoint_path=None,
         )
-        return self.structures_from_tensors(
-            {"h": h_t, "pos": pos_t, "l": l_t},
-            ptr=batch.ptr,
-        )
+        try:
+            return self.structures_from_tensors(
+                {"h": h_t, "pos": pos_t, "l": l_t},
+                ptr=batch.ptr,
+            )
+        except Exception as exc:
+            warnings.warn(f"In the conversion the following error occurred: {exc}")
+            return []
 
     def configure_optimizers(self):
         return torch.optim.AdamW(
@@ -136,7 +155,16 @@ class LitKLDM(LightningModule):
         return self.model
 
     def structures_from_batch(self, batch):
-        return structures_from_batch(batch)
+        return structures_from_batch(
+            batch,
+            transform_lengths=self.transform_lengths,
+            transform_angles=self.transform_angles,
+        )
 
     def structures_from_tensors(self, samples: dict[str, torch.Tensor], ptr: torch.Tensor):
-        return structures_from_tensors(samples, ptr)
+        return structures_from_tensors(
+            samples,
+            ptr,
+            transform_lengths=self.transform_lengths,
+            transform_angles=self.transform_angles,
+        )

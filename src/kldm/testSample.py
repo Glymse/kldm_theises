@@ -58,7 +58,11 @@ def load_model_from_checkpoint(
         lambda_num_batches=32 if device.type == "cuda" else 8,
         n_sigmas=2000 if device.type == "cuda" else 2000,
     )
-    model = ModelKLDM(device=device, diffusion_v=tdm).to(device)
+    model = ModelKLDM(
+        device=device,
+        diffusion_v=tdm,
+        lattice_parameterization="x0",
+    ).to(device)
 
     ema_state_dict = checkpoint.get("ema_model_state_dict")
     ema_meta = checkpoint.get("ema_state_dict") or {}

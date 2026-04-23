@@ -5,6 +5,7 @@ import sys
 
 import torch
 from torch import nn
+from typing import Literal, Sequence
 
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -56,10 +57,16 @@ class ContinuousVPDiffusion(nn.Module):
         eps: float = 1e-5,
         beta_min: float = 0.1,
         beta_max: float = 20.0,
+        parameterization: Literal["eps", "x0"] = "x0",
+        dim: Sequence[int] | int = 6,
     ) -> None:
         super().__init__()
         self.eps = float(eps)
         self.schedule = LinearBetaSchedule(beta_min=beta_min, beta_max=beta_max)
+        self.parameterization = parameterization
+        if isinstance(dim, int):
+            dim = [dim]
+        self.register_buffer("dim", torch.as_tensor(dim, dtype=torch.long))
 
     # For the VP SDE
     #
@@ -100,6 +107,26 @@ class ContinuousVPDiffusion(nn.Module):
         x_t = alpha_t * x0 + sigma_t * noise
         return x_t, noise
 
+    def training_targets(
+        self,
+        t: torch.Tensor,
+        x: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return noisy latents plus the active training target.
+
+        This mirrors facit's continuous diffusion API:
+        - `eps` parameterization trains on the sampled Gaussian noise
+        - `x0` parameterization trains directly on the clean variable
+        """
+        x_t, eps = self.forward_sample(t=t, x0=x)
+        if self.parameterization == "eps":
+            target = eps
+        elif self.parameterization == "x0":
+            target = x
+        else:  # pragma: no cover - guarded by constructor type
+            raise NotImplementedError(f"Unsupported parameterization: {self.parameterization}")
+        return x_t, target
+
     def score_target(self, t: torch.Tensor, eps: torch.Tensor) -> torch.Tensor:
         """Return the exact score target for the Gaussian forward kernel.
 
@@ -123,6 +150,30 @@ class ContinuousVPDiffusion(nn.Module):
         """Convert an epsilon prediction into the corresponding VP score."""
         sigma_t = self._match_dims(self.sigma(t), pred_eps)
         return -pred_eps / sigma_t.clamp_min(self.eps)
+
+    def score_from_x0(
+        self,
+        t: torch.Tensor,
+        x_t: torch.Tensor,
+        pred_x0: torch.Tensor,
+    ) -> torch.Tensor:
+        """Convert an x0 prediction into the corresponding VP score."""
+        alpha_t = self._match_dims(self.alpha(t), x_t)
+        sigma_t = self._match_dims(self.sigma(t), x_t).clamp_min(self.eps)
+        return (alpha_t * pred_x0 - x_t) / sigma_t.pow(2)
+
+    def construct_score(
+        self,
+        t: torch.Tensor,
+        x_t: torch.Tensor,
+        pred: torch.Tensor,
+    ) -> torch.Tensor:
+        """Map the active parameterization output to a score estimate."""
+        if self.parameterization == "eps":
+            return self.score_from_eps(t=t, pred_eps=pred)
+        if self.parameterization == "x0":
+            return self.score_from_x0(t=t, x_t=x_t, pred_x0=pred)
+        raise NotImplementedError(f"Unsupported parameterization: {self.parameterization}")
 
     @staticmethod
     def _match_dims(coeff: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
@@ -154,6 +205,17 @@ class ContinuousVPDiffusion(nn.Module):
         x_prev = x_prev + torch.sqrt(beta_t * dt) * noise
         return x_prev
 
+    def reverse_step(
+        self,
+        t: torch.Tensor,
+        x_t: torch.Tensor,
+        pred: torch.Tensor,
+        dt: float,
+    ) -> torch.Tensor:
+        """One reverse step using the active parameterization."""
+        score_x = self.construct_score(t=t, x_t=x_t, pred=pred)
+        return self.reverse_em_step(t=t, x_t=x_t, score_x=score_x, dt=dt)
+
     def reverse_em_step_from_eps(
         self,
         t: torch.Tensor,
@@ -164,6 +226,11 @@ class ContinuousVPDiffusion(nn.Module):
         """Reverse Euler-Maruyama step using epsilon parameterization directly."""
         score_x = self.score_from_eps(t=t, pred_eps=pred_eps)
         return self.reverse_em_step(t=t, x_t=x_t, score_x=score_x, dt=dt)
+
+    @torch.inference_mode()
+    def sample_prior(self, n: int) -> torch.Tensor:
+        shape = (n, *self.dim.tolist())
+        return torch.randn(shape, device=self.dim.device)
 
 
 

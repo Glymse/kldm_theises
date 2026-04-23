@@ -30,53 +30,48 @@ class CSPDataModule(LightningDataModule):
         self.task = CSPTask()
         self.save_hyperparameters(logger=False)
 
-        self.train_dataset = None
-        self.val_dataset = None
-        self.test_dataset = None
+        self.train_dataset = self.task.fit_dataset(
+            root=self.root,
+            split="train",
+            download=self.hparams.download,
+        )
+
+        val_dataset = self.task.fit_dataset(
+            root=self.root,
+            split="val",
+            download=self.hparams.download,
+        )
+        if (
+            isinstance(self.hparams.num_val_subset, int)
+            and self.hparams.num_val_subset > -1
+            and self.hparams.num_val_subset < len(val_dataset)
+        ):
+            val_dataset = self.get_random_subset(
+                val_dataset,
+                subset_size=self.hparams.num_val_subset,
+                seed=self.hparams.subset_seed,
+            )
+        self.val_dataset = val_dataset
+
+        test_dataset = self.task.fit_dataset(
+            root=self.root,
+            split="test",
+            download=self.hparams.download,
+        )
+        if (
+            isinstance(self.hparams.num_test_subset, int)
+            and self.hparams.num_test_subset > -1
+            and self.hparams.num_test_subset < len(test_dataset)
+        ):
+            test_dataset = self.get_random_subset(
+                test_dataset,
+                subset_size=self.hparams.num_test_subset,
+                seed=self.hparams.subset_seed,
+            )
+        self.test_dataset = test_dataset
 
     def setup(self, stage: str | None = None) -> None:
-        if self.train_dataset is None:
-            self.train_dataset = self.task.fit_dataset(
-                root=self.root,
-                split="train",
-                download=self.hparams.download,
-            )
-
-        if self.val_dataset is None:
-            val_dataset = self.task.fit_dataset(
-                root=self.root,
-                split="val",
-                download=self.hparams.download,
-            )
-            if (
-                isinstance(self.hparams.num_val_subset, int)
-                and self.hparams.num_val_subset > -1
-                and self.hparams.num_val_subset < len(val_dataset)
-            ):
-                val_dataset = self.get_random_subset(
-                    val_dataset,
-                    subset_size=self.hparams.num_val_subset,
-                    seed=self.hparams.subset_seed,
-                )
-            self.val_dataset = val_dataset
-
-        if self.test_dataset is None:
-            test_dataset = self.task.fit_dataset(
-                root=self.root,
-                split="test",
-                download=self.hparams.download,
-            )
-            if (
-                isinstance(self.hparams.num_test_subset, int)
-                and self.hparams.num_test_subset > -1
-                and self.hparams.num_test_subset < len(test_dataset)
-            ):
-                test_dataset = self.get_random_subset(
-                    test_dataset,
-                    subset_size=self.hparams.num_test_subset,
-                    seed=self.hparams.subset_seed,
-                )
-            self.test_dataset = test_dataset
+        return None
 
     def train_dataloader(self):
         return DataLoader(
@@ -99,7 +94,7 @@ class CSPDataModule(LightningDataModule):
     def test_dataloader(self):
         return DataLoader(
             dataset=self.test_dataset,
-            batch_size=self.hparams.test_batch_size,
+            batch_size=self.hparams.val_batch_size,
             shuffle=False,
             num_workers=self.hparams.num_workers,
             pin_memory=self.hparams.pin_memory,

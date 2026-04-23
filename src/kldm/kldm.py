@@ -4,6 +4,7 @@ from pathlib import Path
 import logging
 import sys
 from typing import Optional
+from typing import Literal
 
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -37,6 +38,7 @@ class ModelKLDM(nn.Module):
         #diffusion_h: Optional[ContinuousVPDiffusion] = None, Deactive when DNG ready
         device: Optional[torch.device] = None,
         eps: float = 1e-3,
+        lattice_parameterization: Literal["eps", "x0"] = "x0",
     ) -> None:
         super().__init__()
         self.device = device or torch.device("cpu")
@@ -60,7 +62,11 @@ class ModelKLDM(nn.Module):
             n_lambdas=512 if self.device.type == "cuda" else 128,
             lambda_num_batches=32 if self.device.type == "cuda" else 8,
         )
-        self.diffusion_l = diffusion_l or ContinuousVPDiffusion(eps=eps)
+        self.diffusion_l = diffusion_l or ContinuousVPDiffusion(
+            eps=eps,
+            parameterization=lattice_parameterization,
+            dim=6,
+        )
         self.eps = eps
         self.task_type: Optional[str] = None
         self._cached_sampling_checkpoint_path: Optional[str] = None
@@ -88,12 +94,12 @@ class ModelKLDM(nn.Module):
 
         index = batch.batch
         t_node = t_graph[index].squeeze(-1)
-        # Diffuse lattice, KLDM Alg. 1
-        l_t, eps_l = self.diffusion_l.forward_sample(
+        # Diffuse lattice using the active parameterization. For facit-style CSP
+        # this is now `x0`, so the network predicts the clean lattice directly.
+        l_t, target_l = self.diffusion_l.training_targets(
             t=t_graph.squeeze(-1),
-            x0=batch.l,
+            x=batch.l,
         )
-        target_l = eps_l
 
         f_t, v_t, epsilon_v, epsilon_r, r_t = self.tdm.forward_sample(
             t=t_node,
@@ -263,7 +269,11 @@ class ModelKLDM(nn.Module):
             "compute_sigma_norm": bool(getattr(self.tdm, "compute_sigma_norm", True)),
         }
         sampling_tdm = TDM(**tdm_kwargs)
-        model = ModelKLDM(device=device, diffusion_v=sampling_tdm).to(device)
+        model = ModelKLDM(
+            device=device,
+            diffusion_v=sampling_tdm,
+            lattice_parameterization="x0",
+        ).to(device)
 
         # Checkpoints may come from runs with different TDM buffer sizes (for example
         # lambda tables on GPU vs CPU). Filter out any mismatched tensors so sampling
@@ -321,7 +331,7 @@ class ModelKLDM(nn.Module):
         t_final: float = 1e-3,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        Algorithm 3 sampling for CSP, KLDM-epsilon version.
+        Algorithm 3 sampling for CSP with facit-style x0 lattice prediction.
 
         Returns:
             f_N, v_N, l_N, a
@@ -345,7 +355,7 @@ class ModelKLDM(nn.Module):
         else:
             v_t = scatter_center(torch.randn_like(batch.pos), index=node_index)
             f_t = sampling_tdm.wrap_displacements(torch.rand_like(batch.pos))
-        l_t = torch.randn_like(batch.l)
+        l_t = sampling_diffusion_l.sample_prior(n=num_graphs)
         a_t = batch.h  # CSP conditioning
 
         if checkpoint_path is None:
@@ -407,12 +417,13 @@ class ModelKLDM(nn.Module):
                         dt=dt, # This is scaled internally.
                     )
 
-                    # KLDM-epsilon lattice branch:
-                    # Algorithm 3 does EM on l using the score corresponding to out_l
-                    l_t = sampling_diffusion_l.reverse_em_step_from_eps(
+                    # Facit-style lattice branch:
+                    # the network predicts x0 for the lattice and the diffusion
+                    # object reconstructs the corresponding score internally.
+                    l_t = sampling_diffusion_l.reverse_step(
                         t=t_graph.squeeze(-1),
                         x_t=l_t,
-                        pred_eps=pred_l,
+                        pred=pred_l,
                         dt=dt,
                     )
 
@@ -440,7 +451,10 @@ def main() -> None:
     )
     batch = next(iter(loader)).to(device)
 
-    model = ModelKLDM(device=device).to(device)
+    model = ModelKLDM(
+        device=device,
+        lattice_parameterization="x0",
+    ).to(device)
 
     pos_t, v_t, l_t, h_t = model.sample_CSP_algorithm3(
         n_steps=1000,
