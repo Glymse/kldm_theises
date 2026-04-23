@@ -50,7 +50,7 @@ def main() -> None:
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     tdm = TrivialisedDiffusionDev(
-        eps=1e-3,
+        eps=1e-6,
         n_lambdas=512 if device.type == "cuda" else 128,
         lambda_num_batches=32 if device.type == "cuda" else 8,
         n_sigmas=2000 if device.type == "cuda" else 512,
@@ -58,6 +58,7 @@ def main() -> None:
     model = ModelKLDM(
         device=device,
         diffusion_v=tdm,
+        lattice_eps=1e-3,
         lattice_parameterization="x0",
     ).to(device)
     datamodule.setup()

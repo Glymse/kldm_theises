@@ -1141,7 +1141,7 @@ def train() -> None:
     print("constructed train/val loaders", flush=True)
 
     tdm = TrivialisedDiffusionDev(
-        eps=1e-3,
+        eps=1e-6,
         n_lambdas=512 if device.type == "cuda" else 128,
         lambda_num_batches=32 if device.type == "cuda" else 8,
         n_sigmas=2000 if device.type == "cuda" else 512,
@@ -1149,6 +1149,7 @@ def train() -> None:
     model = ModelKLDM(
         device=device,
         diffusion_v=tdm,
+        lattice_eps=1e-3,
         lattice_parameterization="x0",
     ).to(device)
     print("precomputing TDM tables on real train batches", flush=True)

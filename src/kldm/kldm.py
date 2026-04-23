@@ -37,11 +37,20 @@ class ModelKLDM(nn.Module):
         diffusion_l: Optional[ContinuousVPDiffusion] = None,
         #diffusion_h: Optional[ContinuousVPDiffusion] = None, Deactive when DNG ready
         device: Optional[torch.device] = None,
-        eps: float = 1e-3,
+        eps: float | None = None,
+        tdm_eps: float = 1e-6,
+        lattice_eps: float = 1e-3,
         lattice_parameterization: Literal["eps", "x0"] = "x0",
     ) -> None:
         super().__init__()
         self.device = device or torch.device("cpu")
+        if eps is not None:
+            # Backward-compatibility for older call sites that passed a single
+            # `eps`. We now keep the TDM floor facit-like and only reuse the
+            # legacy value for the lattice branch.
+            lattice_eps = float(eps)
+        self.tdm_eps = float(tdm_eps)
+        self.lattice_eps = float(lattice_eps)
 
         self.score_network = score_network or CSPVNet(
             hidden_dim=512,
@@ -58,16 +67,16 @@ class ModelKLDM(nn.Module):
         )
 
         self.tdm = diffusion_v or TDM(
-            eps=eps,
+            eps=self.tdm_eps,
             n_lambdas=512 if self.device.type == "cuda" else 128,
             lambda_num_batches=32 if self.device.type == "cuda" else 8,
         )
         self.diffusion_l = diffusion_l or ContinuousVPDiffusion(
-            eps=eps,
+            eps=self.lattice_eps,
             parameterization=lattice_parameterization,
             dim=6,
         )
-        self.eps = eps
+        self.eps = min(self.tdm_eps, self.lattice_eps)
         self.task_type: Optional[str] = None
         self._cached_sampling_checkpoint_path: Optional[str] = None
         self.__dict__["_cached_sampling_model_obj"] = None
@@ -261,7 +270,7 @@ class ModelKLDM(nn.Module):
             n_sigmas = int(getattr(self.tdm, "_sigma_norms", torch.ones(1)).shape[0])
 
         tdm_kwargs = {
-            "eps": float(getattr(self.tdm, "eps", self.eps)),
+            "eps": float(getattr(self.tdm, "eps", self.tdm_eps)),
             "n_lambdas": int(getattr(self.tdm, "n_lambdas", 512 if device.type == "cuda" else 128)),
             "lambda_num_batches": int(getattr(self.tdm, "lambda_num_batches", 32 if device.type == "cuda" else 8)),
             "k_wn_score": int(getattr(self.tdm, "k_wn_score", 13)),

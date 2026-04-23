@@ -258,7 +258,7 @@ def main() -> None:
     )
 
     sampling_tdm = TrivialisedDiffusionDev(
-        eps=1e-3,
+        eps=1e-6,
         n_lambdas=512 if device.type == "cuda" else 128,
         lambda_num_batches=32 if device.type == "cuda" else 8,
         k_wn_score=13,
@@ -268,6 +268,7 @@ def main() -> None:
     model = ModelKLDM(
         device=device,
         diffusion_v=sampling_tdm,
+        lattice_eps=1e-3,
         lattice_parameterization="x0",
     ).to(device)
 
