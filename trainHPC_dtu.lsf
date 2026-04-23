@@ -11,7 +11,9 @@ set -euo pipefail
 #BSUB -o logs/kldm_facit_like_%J.out
 #BSUB -e logs/kldm_facit_like_%J.err
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# On DTU's LSF the submitted script is copied into `.lsbatch`, so
+# `${BASH_SOURCE[0]}` points there at runtime. Prefer the submission cwd.
+REPO_ROOT="${LS_SUBCWD:-${LSB_SUBCWD:-$HOME/kldm_dev/kldm_theises}}"
 cd "$REPO_ROOT"
 
 mkdir -p \
@@ -47,7 +49,7 @@ echo "batch_size=$BATCH_SIZE validate_every=$VALIDATE_EVERY sampling_steps=$SAMP
 nvidia-smi || true
 
 CMD=(
-  uv run --locked --python 3.11 "$ENTRYPOINT"
+  uv run --locked --python 3.11 python "$ENTRYPOINT"
   --batch-size "$BATCH_SIZE"
   --validate-every "$VALIDATE_EVERY"
   --sampling-steps "$SAMPLING_STEPS"
