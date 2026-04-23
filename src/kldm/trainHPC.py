@@ -4,10 +4,12 @@ import argparse
 import csv
 from contextlib import contextmanager
 import errno
+import json
 import os
 from pathlib import Path
 import random
 import re
+import shutil
 import signal
 import sys
 from typing import Any
@@ -17,7 +19,8 @@ if __package__ in {None, ""}:
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import Subset
+from torch_geometric.loader import DataLoader
 
 from kldm.data import CSPTask, resolve_data_root
 # from kldm.diffusionModels.trivialized_diffusion import TrivialisedDiffusion
@@ -25,8 +28,9 @@ from kldm.diffusionModels.TDMdev import TrivialisedDiffusionDev
 from kldm.distribution.uniform import sample_uniform
 from kldm.kldm import ModelKLDM
 from kldm.sample_evaluation.sample_evaluation import (
-    aggregate_csp_reconstruction_metrics,
-    evaluate_csp_reconstruction,
+    CSPMetrics,
+    structures_from_batch,
+    structures_from_tensors,
 )
 
 try:
@@ -38,6 +42,18 @@ try:
     import matplotlib.pyplot as plt
 except ImportError:  # pragma: no cover
     plt = None
+
+try:
+    import ase.io
+    from ase.visualize.plot import plot_atoms
+except ImportError:  # pragma: no cover
+    ase = None
+    plot_atoms = None
+
+try:
+    from pymatgen.io.ase import AseAtomsAdaptor
+except ImportError:  # pragma: no cover
+    AseAtomsAdaptor = None
 
 
 STOP_REQUESTED = False
@@ -183,6 +199,167 @@ def aggregate_epoch_metrics(
     aggregated["loss_l"] = aggregated.get("loss_l", 0.0)
     aggregated["loss"] = lambda_v * aggregated["loss_v"] + lambda_l * aggregated["loss_l"]
     return aggregated
+
+
+def _metric_for_ranking(value: float) -> float:
+    if value != value:  # NaN
+        return float("-inf")
+    return float(value)
+
+
+def _make_atoms_grid(atoms_lst: list[Any]):
+    if plt is None or plot_atoms is None or not atoms_lst:
+        return None
+
+    bs = len(atoms_lst)
+    nrows = ncols = int(np.ceil(np.sqrt(bs)))
+    fig, _ = plt.subplots(nrows=nrows, ncols=ncols, figsize=(ncols * 3, nrows * 3))
+    for i, ax in enumerate(fig.axes):
+        if i >= len(atoms_lst):
+            ax.axis("off")
+            continue
+        plot_atoms(atoms_lst[i], ax)
+        ax.axis("off")
+    return fig
+
+
+def _structures_to_ase_atoms(structures: list[Any]) -> list[Any]:
+    if AseAtomsAdaptor is None:
+        return []
+
+    adaptor = AseAtomsAdaptor()
+    atoms_lst = []
+    for structure in structures:
+        if structure is None:
+            continue
+        try:
+            atoms = adaptor.get_atoms(structure)
+            atoms.wrap()
+            atoms_lst.append(atoms)
+        except Exception:
+            continue
+    return atoms_lst
+
+
+def log_sampled_structures(
+    *,
+    epoch: int,
+    generated_structures: list[Any],
+    gt_structures: list[Any],
+    output_dir: Path,
+    run,
+    num_log_wandb: int = 25,
+) -> None:
+    generated_atoms = _structures_to_ase_atoms(generated_structures)
+    gt_atoms = _structures_to_ase_atoms(gt_structures)
+
+    epoch_dir = output_dir / str(epoch)
+    epoch_dir.mkdir(parents=True, exist_ok=True)
+
+    if generated_atoms and ase is not None:
+        ase.io.write(filename=str(epoch_dir / "samples.xyz"), images=generated_atoms, format="extxyz")
+
+    if run is None or num_log_wandb <= 0:
+        return
+
+    idx = min(len(generated_atoms), num_log_wandb)
+    if idx > 0:
+        fig = _make_atoms_grid(generated_atoms[-idx:])
+        if fig is not None:
+            wandb.log({"epoch": epoch, "val/images_generated": wandb.Image(fig)})
+            plt.close(fig)
+
+    idx_gt = min(len(gt_atoms), num_log_wandb)
+    if idx_gt > 0:
+        fig = _make_atoms_grid(gt_atoms[-idx_gt:])
+        if fig is not None:
+            wandb.log({"epoch": epoch, "val/images_gt": wandb.Image(fig)})
+            plt.close(fig)
+
+
+def update_top_k_checkpoints(
+    *,
+    checkpoints_dir: Path,
+    current_checkpoint_path: Path,
+    epoch: int,
+    metric_value: float,
+    top_k_records: list[dict[str, Any]],
+    save_top_k: int,
+) -> list[dict[str, Any]]:
+    checkpoints_dir.mkdir(parents=True, exist_ok=True)
+    last_path = checkpoints_dir / "last.pt"
+    shutil.copy2(current_checkpoint_path, last_path)
+
+    records = [record for record in top_k_records if int(record["epoch"]) != int(epoch)]
+    records.append(
+        {
+            "epoch": int(epoch),
+            "metric": float(metric_value),
+            "path": str(current_checkpoint_path),
+        }
+    )
+    records.sort(key=lambda item: (_metric_for_ranking(item["metric"]), item["epoch"]), reverse=True)
+    kept = records[: max(0, int(save_top_k))]
+    keep_epochs = {int(record["epoch"]) for record in kept}
+
+    for record in records[max(0, int(save_top_k)) :]:
+        path = Path(record["path"])
+        if path.exists():
+            path.unlink(missing_ok=True)
+
+    summary_path = checkpoints_dir / "top_k.json"
+    export_csv(
+        rows=kept,
+        output_path=checkpoints_dir / "top_k.csv",
+        fieldnames=["epoch", "metric", "path"],
+    )
+    summary_path.write_text(
+        json.dumps(
+            [
+                {
+                    "epoch": int(record["epoch"]),
+                    "metric": float(record["metric"]),
+                    "path": str(record["path"]),
+                }
+                for record in kept
+            ],
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    for path in checkpoints_dir.glob("epoch_*.pt"):
+        match = re.match(r"^epoch_(\d+)\.pt$", path.name)
+        if match is None:
+            continue
+        path_epoch = int(match.group(1))
+        if path_epoch not in keep_epochs:
+            path.unlink(missing_ok=True)
+
+    return kept
+
+
+def load_top_k_records(checkpoints_dir: Path) -> list[dict[str, Any]]:
+    summary_path = checkpoints_dir / "top_k.json"
+    if not summary_path.exists():
+        return []
+    try:
+        payload = json.loads(summary_path.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    records: list[dict[str, Any]] = []
+    for item in payload:
+        try:
+            records.append(
+                {
+                    "epoch": int(item["epoch"]),
+                    "metric": float(item["metric"]),
+                    "path": str(item["path"]),
+                }
+            )
+        except Exception:
+            continue
+    return records
 
 
 class ExponentialMovingAverage:
@@ -621,6 +798,112 @@ def run_sampling_evaluation(
         "rmse": float("nan") if summary["rmse"] is None else float(summary["rmse"]),
     }
 
+
+def run_facit_style_validation_epoch(
+    model: ModelKLDM,
+    loader,
+    device: torch.device,
+    *,
+    lambda_v: float,
+    lambda_l: float,
+    n_steps: int,
+    ema: ExponentialMovingAverage | None = None,
+    current_epoch: int,
+    force_ema_sampling: bool,
+    max_graphs: int | None = None,
+    debug: bool = False,
+) -> tuple[dict[str, float], dict[str, float | int], list[Any], list[Any]]:
+    """
+    Match facitKLDM's validation runner more closely:
+    1. one validation pass only
+    2. compute val loss and sampling on the same batches
+    3. use current model for validation sampling by default
+    """
+    model.eval()
+    batch_metrics: list[tuple[dict[str, float], float, float]] = []
+    csp_metrics = CSPMetrics()
+    num_graphs_seen = 0
+    logged_pred_structures: list[Any] = []
+    logged_target_structures: list[Any] = []
+
+    use_ema_sampling = should_use_ema_for_sampling(
+        ema=ema,
+        current_epoch=current_epoch,
+        force_ema=force_ema_sampling,
+    )
+
+    for batch in loader:
+        batch = batch.to(device)
+        num_graphs = float(batch.num_graphs)
+        num_nodes = float(batch.pos.shape[0])
+        t_graph = sample_graph_times(num_graphs=batch.num_graphs, device=device)
+
+        with torch.no_grad():
+            _, metrics = model.algorithm2_loss(
+                batch=batch,
+                t=t_graph,
+                lambda_v=lambda_v,
+                lambda_l=lambda_l,
+                debug=debug,
+            )
+
+            if use_ema_sampling:
+                assert ema is not None
+                with ema.average_parameters(model):
+                    pos_t, _v_t, l_t, h_t = model.sample_CSP_algorithm3(
+                        n_steps=n_steps,
+                        batch=batch,
+                        checkpoint_path=None,
+                    )
+            else:
+                pos_t, _v_t, l_t, h_t = model.sample_CSP_algorithm3(
+                    n_steps=n_steps,
+                    batch=batch,
+                    checkpoint_path=None,
+                )
+
+        batch_metrics.append(
+            ({key: float(value) for key, value in metrics.items()}, num_nodes, num_graphs)
+        )
+
+        pred_structures = structures_from_tensors(
+            tensors={"h": h_t, "pos": pos_t, "l": l_t},
+            ptr=batch.ptr,
+        )
+        target_structures = structures_from_batch(batch)
+
+        if max_graphs is not None:
+            remaining = max_graphs - num_graphs_seen
+            if remaining <= 0:
+                break
+            pred_structures = pred_structures[:remaining]
+            target_structures = target_structures[:remaining]
+
+        csp_metrics.update(pred_structures, target_structures)
+        logged_pred_structures.extend(pred_structures)
+        logged_target_structures.extend(target_structures)
+        num_graphs_seen += len(pred_structures)
+
+        if max_graphs is not None and num_graphs_seen >= max_graphs:
+            break
+
+    if not batch_metrics:
+        raise RuntimeError("Validation loader is empty; cannot compute epoch metrics.")
+
+    val_metrics = aggregate_epoch_metrics(
+        batch_metrics,
+        lambda_v=lambda_v,
+        lambda_l=lambda_l,
+    )
+    summary = csp_metrics.summarize()
+    sampling_metrics = {
+        "num_samples": int(num_graphs_seen),
+        "valid": float("nan") if summary["valid"] is None else float(summary["valid"]),
+        "match_rate": float("nan") if summary["match_rate"] is None else float(summary["match_rate"]),
+        "rmse": float("nan") if summary["rmse"] is None else float(summary["rmse"]),
+    }
+    return val_metrics, sampling_metrics, logged_pred_structures, logged_target_structures
+
 def should_use_ema_for_sampling(
     ema: ExponentialMovingAverage | None,
     *,
@@ -695,7 +978,7 @@ def parse_args() -> argparse.Namespace:
         "--load_from_checkpoint",
         type=str,
         default=None,
-        help="Optional checkpoint path to continue from, e.g. artifacts/HPC/checkpoints/checkpoint_epoch_100.pt",
+        help="Optional checkpoint path to continue from, e.g. artifacts/HPC/checkpoints/last.pt or epoch_100.pt",
     )
     parser.add_argument(
         "--validate-every",
@@ -760,12 +1043,30 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--sampling-force-ema",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=False,
         help=(
             "Force EMA weights for validation sampling. "
-            "Defaults to true. EMA is still skipped until it has at least one update. "
-            "Disable with --no-sampling-force-ema."
+            "Defaults to false to match facitKLDM validation semantics. "
+            "Enable only for explicit ablations."
         ),
+    )
+    parser.add_argument(
+        "--save-top-k",
+        type=int,
+        default=3,
+        help="Number of best validation checkpoints to keep, matching facit's ModelCheckpoint default.",
+    )
+    parser.add_argument(
+        "--log-sampled-atoms",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Save facit-style sampled structures to samples/<epoch>/samples.xyz after validation.",
+    )
+    parser.add_argument(
+        "--num-log-wandb",
+        type=int,
+        default=25,
+        help="Number of sampled/GT structures to show in W&B image grids, matching facit callback default.",
     )
     parser.add_argument(
         "--dev",
@@ -800,6 +1101,9 @@ def train() -> None:
         "ema_decay": args.ema_decay,
         "ema_start": args.ema_start,
         "sampling_force_ema": args.sampling_force_ema,
+        "save_top_k": args.save_top_k,
+        "log_sampled_atoms": args.log_sampled_atoms,
+        "num_log_wandb": args.num_log_wandb,
         "num_workers": LOADER_NUM_WORKERS,
         "pin_memory": LOADER_PIN_MEMORY,
         "dev": args.dev,
@@ -832,7 +1136,6 @@ def train() -> None:
         shuffle=False,
         num_workers=config["num_workers"],
         pin_memory=config["pin_memory"],
-        collate_fn=val_dataset_full.collate_fn,
     )
 
     print("constructed train/val loaders", flush=True)
@@ -905,6 +1208,7 @@ def train() -> None:
 
     artifacts_dir = resolve_artifacts_root()
     checkpoints_dir = artifacts_dir / "checkpoints"
+    samples_dir = artifacts_dir / "samples"
     history_path = artifacts_dir / "training_history.csv"
     sampling_history_path = artifacts_dir / "sampling_history.csv"
     training_plot_path = artifacts_dir / "training_metrics.png"
@@ -912,6 +1216,7 @@ def train() -> None:
     print(f"using artifacts_dir={artifacts_dir}", flush=True)
 
     history: list[dict[str, Any]] = []
+    top_k_records = load_top_k_records(checkpoints_dir)
     epoch = start_epoch
 
     try:
@@ -1029,25 +1334,7 @@ def train() -> None:
                 flush=True,
             )
 
-            print(
-                f"epoch={epoch:04d} starting validation loss pass",
-                flush=True,
-            )
-            val_metrics = evaluate_loss(
-                model=model,
-                loader=val_loader,
-                device=device,
-                lambda_v=config["lambda_v"],
-                lambda_l=config["lambda_l"],
-                max_graphs=config["val_subset_graphs"],
-                debug=args.dev,
-            )
-            print(
-                f"epoch={epoch:04d} finished validation loss pass",
-                flush=True,
-            )
-
-            checkpoint_path = checkpoints_dir / f"checkpoint_epoch_{epoch}.pt"
+            checkpoint_path = checkpoints_dir / f"epoch_{epoch:03d}.pt"
             print(
                 f"epoch={epoch:04d} exporting checkpoint",
                 flush=True,
@@ -1060,10 +1347,6 @@ def train() -> None:
                 config=config,
                 epoch=epoch,
             )
-            print(
-                f"epoch={epoch:04d} starting sampling evaluation",
-                flush=True,
-            )
             use_ema_sampling = should_use_ema_for_sampling(
                 ema=ema,
                 current_epoch=epoch,
@@ -1071,31 +1354,30 @@ def train() -> None:
             )
             if use_ema_sampling:
                 print(
-                    f"epoch={epoch:04d} sampling with EMA model (facit-style selection)",
+                    f"epoch={epoch:04d} running facit-style validation pass with EMA sampling override",
                     flush=True,
                 )
-                with ema.average_parameters(model):
-                    sampling_metrics = run_sampling_evaluation(
-                        model=model,
-                        loader=val_loader,
-                        device=device,
-                        n_steps=config["sampling_steps"],
-                        max_graphs=config["val_subset_graphs"],
-                    )
             else:
                 print(
-                    f"epoch={epoch:04d} sampling with current model (EMA not updated yet)",
+                    f"epoch={epoch:04d} running facit-style validation pass on current model",
                     flush=True,
                 )
-                sampling_metrics = run_sampling_evaluation(
-                    model=model,
-                    loader=val_loader,
-                    device=device,
-                    n_steps=config["sampling_steps"],
-                    max_graphs=config["val_subset_graphs"],
-                )
+
+            val_metrics, sampling_metrics, logged_pred_structures, logged_target_structures = run_facit_style_validation_epoch(
+                model=model,
+                loader=val_loader,
+                device=device,
+                lambda_v=config["lambda_v"],
+                lambda_l=config["lambda_l"],
+                n_steps=config["sampling_steps"],
+                ema=ema,
+                current_epoch=epoch,
+                force_ema_sampling=config["sampling_force_ema"],
+                max_graphs=config["val_subset_graphs"],
+                debug=args.dev,
+            )
             print(
-                f"epoch={epoch:04d} finished sampling evaluation",
+                f"epoch={epoch:04d} finished facit-style validation pass",
                 flush=True,
             )
 
@@ -1162,6 +1444,22 @@ def train() -> None:
                     }
                 )
             wandb.log(val_log_payload)
+
+            if config["log_sampled_atoms"]:
+                try:
+                    log_sampled_structures(
+                        epoch=epoch,
+                        generated_structures=logged_pred_structures,
+                        gt_structures=logged_target_structures,
+                        output_dir=samples_dir,
+                        run=run,
+                        num_log_wandb=config["num_log_wandb"],
+                    )
+                except Exception as exc:
+                    print(
+                        f"epoch={epoch:04d} warning: sampled structure logging failed: {exc}",
+                        flush=True,
+                    )
 
             try_export_csv(
                 rows=history,
@@ -1241,6 +1539,16 @@ def train() -> None:
                 flush=True,
             )
 
+            if checkpoint_written:
+                top_k_records = update_top_k_checkpoints(
+                    checkpoints_dir=checkpoints_dir,
+                    current_checkpoint_path=checkpoint_path,
+                    epoch=epoch,
+                    metric_value=float(sampling_metrics["match_rate"]),
+                    top_k_records=top_k_records,
+                    save_top_k=config["save_top_k"],
+                )
+
             if run is not None and checkpoint_written:
                 try:
                     print(
@@ -1248,7 +1556,11 @@ def train() -> None:
                         flush=True,
                     )
                     checkpoint_artifact = wandb.Artifact(f"checkpoint_epoch_{epoch}", type="model")
-                    checkpoint_artifact.add_file(str(checkpoint_path))
+                    if checkpoint_path.exists():
+                        checkpoint_artifact.add_file(str(checkpoint_path))
+                    last_checkpoint_path = checkpoints_dir / "last.pt"
+                    if last_checkpoint_path.exists():
+                        checkpoint_artifact.add_file(str(last_checkpoint_path))
                     run.log_artifact(checkpoint_artifact)
                     print(
                         f"epoch={epoch:04d} finished checkpoint artifact",
@@ -1278,16 +1590,7 @@ def train() -> None:
                     )
 
             print(
-                f"epoch={epoch:04d} pruning old checkpoints",
-                flush=True,
-            )
-            prune_old_checkpoints(
-                checkpoints_dir=checkpoints_dir,
-                keep_last=2,
-                current_epoch=epoch,
-            )
-            print(
-                f"epoch={epoch:04d} finished pruning old checkpoints",
+                f"epoch={epoch:04d} updated facit-style checkpoint set",
                 flush=True,
             )
 
@@ -1297,7 +1600,7 @@ def train() -> None:
             )
 
     finally:
-        final_checkpoint_path = checkpoints_dir / f"checkpoint_epoch_{epoch}_final.pt"
+        final_checkpoint_path = checkpoints_dir / f"epoch_{epoch:03d}_final.pt"
         final_checkpoint_written = try_export_model_checkpoint(
             model=model,
             optimizer=optimizer,
@@ -1310,6 +1613,15 @@ def train() -> None:
         final_artifact = wandb.Artifact("csp_hpc_final", type="model")
         if final_checkpoint_written and final_checkpoint_path.exists():
             final_artifact.add_file(str(final_checkpoint_path))
+        last_checkpoint_path = checkpoints_dir / "last.pt"
+        if last_checkpoint_path.exists():
+            final_artifact.add_file(str(last_checkpoint_path))
+        top_k_json_path = checkpoints_dir / "top_k.json"
+        if top_k_json_path.exists():
+            final_artifact.add_file(str(top_k_json_path))
+        top_k_csv_path = checkpoints_dir / "top_k.csv"
+        if top_k_csv_path.exists():
+            final_artifact.add_file(str(top_k_csv_path))
         if history_path.exists():
             final_artifact.add_file(str(history_path))
         if sampling_history_path.exists():
@@ -1318,6 +1630,9 @@ def train() -> None:
             final_artifact.add_file(str(training_plot_path))
         if sampling_plot_path.exists():
             final_artifact.add_file(str(sampling_plot_path))
+        if samples_dir.exists():
+            for sample_file in samples_dir.glob("*/samples.xyz"):
+                final_artifact.add_file(str(sample_file))
         if run is not None:
             run.log_artifact(final_artifact)
             wandb.finish()

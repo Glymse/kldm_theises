@@ -9,6 +9,8 @@ import numpy as np
 import torch
 
 from kldm.data.transform import (
+    ContinuousIntervalAngles,
+    ContinuousIntervalLengths,
     ContinuousIntervalLattice,
     DEFAULT_DATA_ROOT,
     DEFAULT_MP20_LENGTHS_LOC_SCALE_PATH,
@@ -109,6 +111,18 @@ def _default_lattice_transform() -> ContinuousIntervalLattice:
     )
 
 
+def _default_interval_transforms() -> tuple[ContinuousIntervalLengths, ContinuousIntervalAngles]:
+    cache_file = DEFAULT_MP20_LENGTHS_LOC_SCALE_PATH
+    ensure_lengths_loc_scale_cache(
+        cache_file=cache_file,
+        processed_dir=DEFAULT_DATA_ROOT / "mp_20" / "processed" / "train",
+    )
+    return (
+        ContinuousIntervalLengths(lengths_loc_scale=cache_file),
+        ContinuousIntervalAngles(angles_loc_scale=FACIT_ANGLES_LOC_SCALE),
+    )
+
+
 def decode_atom_types(
     a: torch.Tensor | list[int] | list[list[float]],
     species_vocab: Optional[list[int]] = None,
@@ -139,19 +153,25 @@ def decode_lattice(
     n_atoms: int,
     lattice_transform: Optional[ContinuousIntervalLattice] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    lattice_transform = lattice_transform or _default_lattice_transform()
     l_tensor = _to_2d_tensor(l)
 
     if l_tensor.shape[-1] != 6:
         raise ValueError(f"Expected lattice tensor with last dim 6, got shape {tuple(l_tensor.shape)}")
 
-    lengths, angles_rad = lattice_transform.invert_to_lengths_angles(
-        l=l_tensor,
-        num_atoms=n_atoms,
-    )
-    lengths = lengths.squeeze(0)
-    angles_rad = angles_rad.squeeze(0)
-    angles_deg = torch.rad2deg(angles_rad)
+    if lattice_transform is not None:
+        lengths, angles_rad = lattice_transform.invert_to_lengths_angles(
+            l=l_tensor,
+            num_atoms=n_atoms,
+        )
+        lengths = lengths.squeeze(0)
+        angles_rad = angles_rad.squeeze(0)
+        angles_deg = torch.rad2deg(angles_rad)
+        return lengths, angles_deg
+
+    transform_lengths, transform_angles = _default_interval_transforms()
+    li = l_tensor.squeeze(0)
+    lengths = transform_lengths.invert_one(li[:3], n_atoms)
+    angles_deg = transform_angles.invert_one(li[3:])
     return lengths, angles_deg
 
 
@@ -373,7 +393,7 @@ def _compute_rmsd_angstrom(
     if structure is None or relaxed_structure is None or StructureMatcher is None:
         return None
     try:
-        matcher = StructureMatcher(primitive_cell=False, scale=True)
+        matcher = StructureMatcher()
         rmsd = matcher.get_rms_dist(structure, relaxed_structure)
         if rmsd is None:
             return None
@@ -393,8 +413,6 @@ class CSPMetrics:
             stol=stol,
             angle_tol=angle_tol,
             ltol=ltol,
-            primitive_cell=False,
-            scale=True,
         )
         self.valid: list[int] = []
         self.match: list[int] = []
@@ -497,8 +515,6 @@ def evaluate_csp_reconstruction(
         stol=stol,
         angle_tol=angle_tol,
         ltol=ltol,
-        primitive_cell=False,
-        scale=True,
     )
 
     try:

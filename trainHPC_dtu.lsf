@@ -1,0 +1,64 @@
+#!/bin/bash
+set -euo pipefail
+
+#BSUB -J kldm_facit_like
+#BSUB -q gpul40s
+#BSUB -n 4
+#BSUB -R "span[hosts=1]"
+#BSUB -gpu "num=1:mode=exclusive_process"
+#BSUB -R "rusage[mem=8GB]"
+#BSUB -W 24:00
+#BSUB -o logs/kldm_facit_like_%J.out
+#BSUB -e logs/kldm_facit_like_%J.err
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$REPO_ROOT"
+
+mkdir -p \
+  logs \
+  artifacts/HPC/checkpoints \
+  artifacts/HPC/samples
+
+module load python3/3.11.13
+
+export PATH="$HOME/.local/bin:$PATH"
+export PYTHONUNBUFFERED=1
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export CUDA_LAUNCH_BLOCKING=0
+export WANDB__SERVICE_WAIT=300
+export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
+
+if [ -f "$HOME/.wandb_env" ]; then
+  source "$HOME/.wandb_env"
+fi
+
+ENTRYPOINT="${KLDM_ENTRYPOINT:-src/kldm/train_lightning.py}"
+VALIDATE_EVERY="${KLDM_VALIDATE_EVERY:-25}"
+SAMPLING_STEPS="${KLDM_SAMPLING_STEPS:-1000}"
+BATCH_SIZE="${KLDM_BATCH_SIZE:-256}"
+MAX_EPOCHS="${KLDM_MAX_EPOCHS:-}"
+
+date
+hostname
+pwd
+echo "entrypoint=$ENTRYPOINT"
+echo "batch_size=$BATCH_SIZE validate_every=$VALIDATE_EVERY sampling_steps=$SAMPLING_STEPS max_epochs=$MAX_EPOCHS"
+nvidia-smi || true
+
+CMD=(
+  uv run --locked --python 3.11 "$ENTRYPOINT"
+  --batch-size "$BATCH_SIZE"
+  --validate-every "$VALIDATE_EVERY"
+  --sampling-steps "$SAMPLING_STEPS"
+)
+
+if [ -n "$MAX_EPOCHS" ]; then
+  CMD+=(--max-epochs "$MAX_EPOCHS")
+fi
+
+CMD+=("$@")
+
+"${CMD[@]}"
+
+date

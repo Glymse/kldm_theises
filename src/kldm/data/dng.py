@@ -2,16 +2,16 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from torch.utils.data import DataLoader
+from torch_geometric.loader import DataLoader
 
 from .dataset import MP20, resolve_data_root
 from .transform import (
     DEFAULT_ATOMIC_VOCAB,
     DEFAULT_MP20_LENGTHS_LOC_SCALE_PATH,
     ContinuousIntervalLattice,
-    CopyProperty,
     FACIT_ANGLES_LOC_SCALE,
     FullyConnectedGraph,
+    MatterGenToFacitFields,
     OneHot,
     TaskMetadata,
     ensure_lengths_loc_scale_cache,
@@ -34,13 +34,13 @@ class DNGTask:
             processed_dir=data_root / "mp_20" / "processed" / "train",
         )
         return [
+            MatterGenToFacitFields(),
             FullyConnectedGraph(),
             ContinuousIntervalLattice(
                 cache_file=cache_file,
                 standardize=True,
                 angles_loc_scale=FACIT_ANGLES_LOC_SCALE,
             ),
-            CopyProperty("atomic_numbers", "h"),
             OneHot(values=self.species_vocab, key="h"),
             TaskMetadata(task_id=TASK_DNG, diffuse_h=True),
         ]
@@ -68,5 +68,4 @@ class DNGTask:
             batch_size=batch_size,
             shuffle=shuffle,
             num_workers=num_workers,
-            collate_fn=dataset.collate_fn,
         )

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from torch.utils.data import DataLoader
+from torch_geometric.loader import DataLoader
 
 from .dataset import MP20, resolve_data_root
 from .transform import (
@@ -11,11 +11,9 @@ from .transform import (
     FACIT_ANGLES_LOC_SCALE,
     ConcatFeatures,
     ContinuousIntervalAngles,
-    ContinuousIntervalLattice,
     ContinuousIntervalLengths,
-    CopyProperty,
     FullyConnectedGraph,
-    OneHot,
+    MatterGenToFacitFields,
     TaskMetadata,
     ensure_lengths_loc_scale_cache,
 )
@@ -37,17 +35,17 @@ class CSPTask:
             processed_dir=data_root / "mp_20" / "processed" / "train",
         )
         return [
+            MatterGenToFacitFields(),
             FullyConnectedGraph(),
             ContinuousIntervalLengths(
                 out_key="lengths",
-                cache_file=cache_file,
+                lengths_loc_scale=cache_file,
             ),
             ContinuousIntervalAngles(
                 out_key="angles",
                 angles_loc_scale=FACIT_ANGLES_LOC_SCALE,
             ),
             ConcatFeatures(in_keys=["lengths", "angles"], out_key="l"),
-            CopyProperty("atomic_numbers", "h"),
             TaskMetadata(task_id=TASK_CSP, diffuse_h=False),
         ]
 
@@ -76,5 +74,4 @@ class CSPTask:
             shuffle=shuffle,
             num_workers=num_workers,
             pin_memory=pin_memory,
-            collate_fn=dataset.collate_fn,
         )

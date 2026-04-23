@@ -89,6 +89,59 @@ class PlusOneAtomicNumbers(Transform):
         return sample.replace(atomic_numbers=sample.atomic_numbers + 1)
 
 
+@functional_transform("mattergen_to_facit_fields")
+class MatterGenToFacitFields(Transform):
+    """Materialize facit-style raw fields from a MatterGen ``ChemGraph``.
+
+    facit's dataset path starts from ``Data`` objects that already expose:
+    - ``pos``
+    - ``h``
+    - ``lengths``
+    - ``angles``
+
+    The MatterGen cache instead gives us ``cell`` and ``atomic_numbers``.
+    This transform derives the missing lattice parameters once so the later
+    interval transforms can match facit's implementations almost verbatim.
+    """
+
+    def __init__(
+        self,
+        *,
+        cell_key: str = "cell",
+        atomic_numbers_key: str = "atomic_numbers",
+        lengths_key: str = "lengths",
+        angles_key: str = "angles",
+        atom_key: str = "h",
+        angles_in_degrees: bool = True,
+    ) -> None:
+        self.cell_key = cell_key
+        self.atomic_numbers_key = atomic_numbers_key
+        self.lengths_key = lengths_key
+        self.angles_key = angles_key
+        self.atom_key = atom_key
+        self.angles_in_degrees = bool(angles_in_degrees)
+
+    def __call__(self, sample: ChemGraph) -> ChemGraph:
+        if not hasattr(sample, self.cell_key):
+            raise ValueError(f"ChemGraph must have '{self.cell_key}' to derive facit-style lattice fields.")
+        if not hasattr(sample, self.atomic_numbers_key):
+            raise ValueError(
+                f"ChemGraph must have '{self.atomic_numbers_key}' to derive facit-style atom fields."
+            )
+
+        cell_matrix = getattr(sample, self.cell_key).squeeze(0)
+        lengths, angles_rad = _cell_lengths_and_angles(cell_matrix)
+        angles = torch.rad2deg(angles_rad) if self.angles_in_degrees else angles_rad
+
+        return sample.replace(
+            **{
+                self.lengths_key: lengths.view(1, -1),
+                self.angles_key: angles.view(1, -1),
+                self.atom_key: getattr(sample, self.atomic_numbers_key),
+            }
+        )
+
+
 @functional_transform("fully_connected_graph")
 class FullyConnectedGraph(Transform):
     """Create a fully connected graph stored in `edge_node_index`."""
@@ -107,82 +160,92 @@ class FullyConnectedGraph(Transform):
 
 @functional_transform("continuous_interval_lengths")
 class ContinuousIntervalLengths(Transform):
-    """Transform lattice lengths with log, optionally normalized by number of atoms."""
+    """facit-style log-length transform over a precomputed ``lengths`` field."""
 
     def __init__(
         self,
         in_key: str = "lengths",
         out_key: str | None = None,
         normalize_by_num_atoms: bool = False,
+        lengths_loc_scale: dict[int, tuple[list[float], list[float]]] | str | Path | None = None,
         cache_file: str | Path | None = None,
-        quantile: float = 0.025,
     ) -> None:
+        if lengths_loc_scale is not None and cache_file is not None:
+            raise ValueError("Specify only one of 'lengths_loc_scale' or 'cache_file'.")
+        if lengths_loc_scale is None:
+            lengths_loc_scale = cache_file
+        if normalize_by_num_atoms and lengths_loc_scale is not None:
+            raise AssertionError("'normalize_by_num_atoms' and 'lengths_loc_scale' cannot be combined")
+
         self.in_key = in_key
         self.out_key = out_key
         self.normalize_by_num_atoms = normalize_by_num_atoms
-        self.cache_file = Path(cache_file) if cache_file is not None else None
-        self.quantile = quantile
-        self.loc_scale: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
-
-        if self.cache_file and self.cache_file.exists():
-            with self.cache_file.open(encoding="utf-8") as f:
-                loaded = json.load(f)
-            self.loc_scale = {int(k): (torch.tensor(v[0]), torch.tensor(v[1])) for k, v in loaded.items()}
+        self.lengths_loc_scale = self.maybe_read_from_json(lengths_loc_scale)
 
     def __call__(self, sample: ChemGraph) -> ChemGraph:
-        if not hasattr(sample, "cell"):
-            raise ValueError("ChemGraph must have a 'cell' attribute to use ContinuousIntervalLengths transform.")
+        if not hasattr(sample, self.in_key):
+            raise ValueError(f"ChemGraph must have '{self.in_key}' attribute!")
 
-        n_atoms = int(sample.num_atoms)
-        cell_matrix = sample.cell.squeeze(0)
-        lengths, _ = _cell_lengths_and_angles(cell_matrix)
+        lengths = getattr(sample, self.in_key)
+        n_atoms = len(sample.pos)
         if self.normalize_by_num_atoms:
             lengths = lengths / (n_atoms ** (1 / 3))
         log_lengths = torch.log(lengths)
-        if n_atoms in self.loc_scale:
-            loc, scale = self.loc_scale[n_atoms]
-            log_lengths = (log_lengths - loc) / scale
+
+        if self.lengths_loc_scale:
+            loc, scale = self.lengths_loc_scale[n_atoms]
+            log_lengths = (
+                log_lengths
+                - torch.as_tensor(loc, device=log_lengths.device, dtype=log_lengths.dtype)
+            ) / torch.as_tensor(scale, device=log_lengths.device, dtype=log_lengths.dtype)
 
         key = self.out_key if self.out_key is not None else self.in_key
-        return sample.replace(**{key: log_lengths.view(1, -1)})
+        return sample.replace(**{key: log_lengths})
 
     def compute_loc_scale(self, samples: list[ChemGraph]) -> None:
         lengths_by_n = defaultdict(list)
 
         for sample in samples:
-            n_atoms = int(sample.num_atoms)
-            cell_matrix = sample.cell.squeeze(0)
-            lengths, _ = _cell_lengths_and_angles(cell_matrix)
+            if not hasattr(sample, self.in_key):
+                raise ValueError(f"ChemGraph must have '{self.in_key}' attribute!")
+            n_atoms = len(sample.pos)
+            lengths = getattr(sample, self.in_key)
             if self.normalize_by_num_atoms:
                 lengths = lengths / (n_atoms ** (1 / 3))
             lengths_by_n[n_atoms].append(torch.log(lengths))
 
+        self.lengths_loc_scale = {}
         for n_atoms, values in lengths_by_n.items():
             values_stack = torch.stack(values)
-            q = int(values_stack.shape[0] * self.quantile)
-            values_sorted, _ = torch.sort(values_stack, dim=0)
-            values_trimmed = values_sorted[q:-q] if q > 0 else values_sorted
-            self.loc_scale[n_atoms] = (values_trimmed.mean(dim=0), values_trimmed.std(dim=0))
-
-        if self.cache_file:
-            payload = {n: [loc.tolist(), scale.tolist()] for n, (loc, scale) in self.loc_scale.items()}
-            with self.cache_file.open("w", encoding="utf-8") as f:
-                json.dump(payload, f, indent=2)
+            self.lengths_loc_scale[n_atoms] = (values_stack.mean(dim=0), values_stack.std(dim=0))
 
     def invert_one(self, log_lengths: Tensor, n_atoms: int) -> Tensor:
-        lengths = log_lengths.clone()
-        if n_atoms in self.loc_scale:
-            loc, scale = self.loc_scale[n_atoms]
-            lengths = lengths * scale + loc
-        lengths = torch.exp(lengths)
+        if self.lengths_loc_scale:
+            loc, scale = self.lengths_loc_scale[n_atoms]
+            log_lengths = (
+                log_lengths
+                * torch.as_tensor(scale, device=log_lengths.device, dtype=log_lengths.dtype)
+                + torch.as_tensor(loc, device=log_lengths.device, dtype=log_lengths.dtype)
+            )
+        lengths = torch.exp(log_lengths)
         if self.normalize_by_num_atoms:
             lengths = lengths * (n_atoms ** (1 / 3))
         return lengths
 
+    @staticmethod
+    def maybe_read_from_json(
+        lengths_loc_scale: dict[int, tuple[list[float], list[float]]] | str | Path | None,
+    ) -> dict[int, tuple[list[float], list[float]]] | None:
+        if isinstance(lengths_loc_scale, (str, Path)):
+            with Path(lengths_loc_scale).open(encoding="utf-8") as handle:
+                raw = json.load(handle)
+            return {int(k): raw[k] for k in raw}
+        return lengths_loc_scale
+
 
 @functional_transform("continuous_interval_angles")
 class ContinuousIntervalAngles(Transform):
-    """Transform lattice angles with tan(angle - pi/2), matching facit."""
+    """facit-style angle transform over a precomputed ``angles`` field."""
 
     def __init__(
         self,
@@ -193,23 +256,14 @@ class ContinuousIntervalAngles(Transform):
     ) -> None:
         self.in_key = in_key
         self.out_key = out_key
-        self.is_deg = bool(is_deg)
-        self.angles_loc_scale = None if angles_loc_scale is None else (
-            float(angles_loc_scale[0]),
-            float(angles_loc_scale[1]),
-        )
+        self.is_deg = is_deg
+        self.angles_loc_scale = angles_loc_scale
 
     def __call__(self, sample: ChemGraph) -> ChemGraph:
         if hasattr(sample, self.in_key):
             value = getattr(sample, self.in_key)
-        elif hasattr(sample, "cell"):
-            _, angles_rad = _cell_lengths_and_angles(sample.cell.squeeze(0))
-            value = torch.rad2deg(angles_rad) if self.is_deg else angles_rad
         else:
-            raise ValueError(
-                "ChemGraph must have either an 'angles' attribute or a 'cell' "
-                "attribute to use ContinuousIntervalAngles transform."
-            )
+            raise ValueError(f"ChemGraph must have '{self.in_key}' attribute!")
 
         if self.is_deg:
             value = torch.deg2rad(value)
@@ -217,16 +271,16 @@ class ContinuousIntervalAngles(Transform):
         angle_features = torch.tan(value - torch.pi / 2.0)
         if self.angles_loc_scale is not None:
             loc, scale = self.angles_loc_scale
-            angle_features = (angle_features - loc) / max(scale, torch.finfo(angle_features.dtype).eps)
+            angle_features = (angle_features - loc) / scale
 
         key = self.out_key if self.out_key is not None else self.in_key
-        return sample.replace(**{key: angle_features.view(1, -1)})
+        return sample.replace(**{key: angle_features})
 
     def invert_one(self, tan_angles: Tensor) -> Tensor:
         angles = tan_angles.clone()
         if self.angles_loc_scale is not None:
             loc, scale = self.angles_loc_scale
-            angles = angles * max(scale, torch.finfo(angles.dtype).eps) + loc
+            angles = angles * scale + loc
         angles = torch.atan(angles) + (torch.pi / 2.0)
         if self.is_deg:
             angles = torch.rad2deg(angles)
