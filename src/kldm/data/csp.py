@@ -7,7 +7,9 @@ from torch.utils.data import DataLoader
 from .dataset import MP20, resolve_data_root
 from .transform import (
     DEFAULT_ATOMIC_VOCAB,
-    ContinuousIntervalLattice,
+    ConcatFeatures,
+    ContinuousIntervalAngles,
+    ContinuousIntervalLengths,
     CopyProperty,
     FullyConnectedGraph,
     OneHot,
@@ -26,10 +28,9 @@ class CSPTask:
     def _make_transforms(self, root: str | Path | None = None) -> list:
         return [
             FullyConnectedGraph(),
-            ContinuousIntervalLattice(
-                standardize=False,
-                angles_loc_scale=None,
-            ),
+            ContinuousIntervalLengths(),
+            ContinuousIntervalAngles(),
+            ConcatFeatures(["lengths", "angles"], "l"),
             CopyProperty("atomic_numbers", "h"),
             TaskMetadata(task_id=TASK_CSP, diffuse_h=False),
         ]

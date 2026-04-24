@@ -36,7 +36,7 @@ class ModelKLDM(nn.Module):
         diffusion_l: Optional[ContinuousVPDiffusion] = None,
         #diffusion_h: Optional[ContinuousVPDiffusion] = None, Deactive when DNG ready
         device: Optional[torch.device] = None,
-        eps: float = 1e-3,
+        eps: float = 1e-6,
     ) -> None:
         super().__init__()
         self.device = device or torch.device("cpu")

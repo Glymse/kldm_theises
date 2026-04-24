@@ -144,7 +144,7 @@ class ContinuousIntervalLengths(Transform):
             log_lengths = (log_lengths - loc) / scale
 
         key = self.out_key if self.out_key is not None else self.in_key
-        return sample.replace(**{key: log_lengths})
+        return sample.replace(**{key: log_lengths.view(1, 3)})
 
     def compute_loc_scale(self, samples: list[ChemGraph]) -> None:
         lengths_by_n = defaultdict(list)
@@ -178,6 +178,51 @@ class ContinuousIntervalLengths(Transform):
         if self.normalize_by_num_atoms:
             lengths = lengths * (n_atoms ** (1 / 3))
         return lengths
+
+
+@functional_transform("continuous_interval_angles")
+class ContinuousIntervalAngles(Transform):
+    """Transform lattice angles with the facit-style tan(angle - pi/2) chart."""
+
+    def __init__(
+        self,
+        in_key: str = "angles",
+        out_key: str | None = None,
+        is_deg: bool = False,
+        angles_loc_scale: tuple[float, float] | None = None,
+    ) -> None:
+        self.in_key = in_key
+        self.out_key = out_key
+        self.is_deg = bool(is_deg)
+        self.angles_loc_scale = angles_loc_scale
+
+    def __call__(self, sample: ChemGraph) -> ChemGraph:
+        if not hasattr(sample, "cell"):
+            raise ValueError("ChemGraph must have a 'cell' attribute to use ContinuousIntervalAngles transform.")
+
+        cell_matrix = sample.cell.squeeze(0)
+        _, angles = _cell_lengths_and_angles(cell_matrix)
+        if self.is_deg:
+            angles = torch.deg2rad(angles)
+
+        transformed = torch.tan(angles - torch.pi / 2.0)
+        if self.angles_loc_scale is not None:
+            loc, scale = self.angles_loc_scale
+            transformed = (transformed - loc) / max(scale, 1e-8)
+
+        key = self.out_key if self.out_key is not None else self.in_key
+        return sample.replace(**{key: transformed.view(1, 3)})
+
+    def invert_one(self, tan_angles: Tensor) -> Tensor:
+        angles = tan_angles.clone()
+        if self.angles_loc_scale is not None:
+            loc, scale = self.angles_loc_scale
+            angles = angles * max(scale, 1e-8) + loc
+
+        angles = torch.atan(angles) + torch.pi / 2.0
+        if self.is_deg:
+            angles = torch.rad2deg(angles)
+        return angles
 
 
 @functional_transform("continuous_interval_lattice")

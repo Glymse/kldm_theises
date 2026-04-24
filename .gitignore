@@ -9,6 +9,7 @@ møde.txt
 manual_test/
 
 src/torsional
+src/TDM
 
 # other local dev info
 .vscode/

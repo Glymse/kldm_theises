@@ -27,7 +27,7 @@ class TrivialisedDiffusionDev(nn.Module):
 
     def __init__(
         self,
-        eps: float = 1e-5,
+        eps: float = 1e-6,
         n_lambdas: int = 256,
         lambda_num_batches: int = 16,
         k_wn_score: int = 13,

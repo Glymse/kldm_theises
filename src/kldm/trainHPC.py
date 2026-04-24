@@ -7,6 +7,7 @@ import errno
 import os
 from pathlib import Path
 import re
+import shutil
 import signal
 import sys
 from typing import Any
@@ -627,23 +628,56 @@ def should_use_ema_for_sampling(
 
 def prune_old_checkpoints(
     checkpoints_dir: Path,
-    keep_last: int = 2,
-    current_epoch: int | None = None,
+    keep_epochs: set[int],
 ) -> None:
     epoch_pattern = re.compile(r"^checkpoint_epoch_(\d+)$")
-    checkpoint_paths = []
     for path in checkpoints_dir.glob("checkpoint_epoch_*.pt"):
         match = epoch_pattern.match(path.stem)
         if match is None:
             continue
         epoch = int(match.group(1))
-        if current_epoch is not None and epoch > current_epoch:
+        if epoch not in keep_epochs:
+            path.unlink(missing_ok=True)
+
+
+def top_k_checkpoint_epochs(
+    rows: list[dict[str, Any]],
+    *,
+    metric_key: str,
+    keep_top_k: int,
+) -> list[int]:
+    scored: list[tuple[float, int]] = []
+    for row in rows:
+        metric = row.get(metric_key, float("nan"))
+        if metric != metric:
             continue
-        checkpoint_paths.append((epoch, path))
-    checkpoint_paths.sort(key=lambda item: item[0])
-    while len(checkpoint_paths) > keep_last:
-        checkpoint_paths[0][1].unlink(missing_ok=True)
-        checkpoint_paths.pop(0)
+        scored.append((float(metric), int(row["epoch"])))
+    scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    return [epoch for _, epoch in scored[:keep_top_k]]
+
+
+def update_checkpoint_aliases(
+    *,
+    checkpoints_dir: Path,
+    current_checkpoint_path: Path,
+    history: list[dict[str, Any]],
+    metric_key: str = "match_rate",
+    keep_top_k: int = 3,
+) -> tuple[int | None, list[int]]:
+    checkpoints_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(current_checkpoint_path, checkpoints_dir / "last.pt")
+
+    top_epochs = top_k_checkpoint_epochs(
+        history,
+        metric_key=metric_key,
+        keep_top_k=keep_top_k,
+    )
+    best_epoch = top_epochs[0] if top_epochs else None
+    if best_epoch is not None:
+        best_path = checkpoints_dir / f"checkpoint_epoch_{best_epoch}.pt"
+        if best_path.exists():
+            shutil.copy2(best_path, checkpoints_dir / "best.pt")
+    return best_epoch, top_epochs
 
 
 def maybe_resume(
@@ -749,11 +783,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--sampling-force-ema",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=False,
         help=(
             "Force EMA weights for validation sampling. "
-            "Defaults to true. EMA is still skipped until it has at least one update. "
-            "Disable with --no-sampling-force-ema."
+            "Defaults to false. EMA is still selected automatically after it has updates, "
+            "matching facitKLDM. Enable with --sampling-force-ema."
         ),
     )
     parser.add_argument(
@@ -824,7 +858,7 @@ def train() -> None:
     print("constructed train/val loaders", flush=True)
 
     tdm = TrivialisedDiffusionDev(
-        eps=1e-3,
+        eps=1e-6,
         n_lambdas=512 if device.type == "cuda" else 128,
         lambda_num_batches=32 if device.type == "cuda" else 8,
         n_sigmas=2000 if device.type == "cuda" else 512,
@@ -1015,43 +1049,6 @@ def train() -> None:
                 flush=True,
             )
 
-            print(
-                f"epoch={epoch:04d} starting validation loss pass",
-                flush=True,
-            )
-            val_metrics = evaluate_loss(
-                model=model,
-                loader=val_loader,
-                device=device,
-                lambda_v=config["lambda_v"],
-                lambda_l=config["lambda_l"],
-                max_graphs=config["val_subset_graphs"],
-                debug=args.dev,
-            )
-            print(
-                f"epoch={epoch:04d} finished validation loss pass",
-                flush=True,
-            )
-
-            checkpoint_path = checkpoints_dir / f"checkpoint_epoch_{epoch}.pt"
-            print(
-                f"epoch={epoch:04d} exporting checkpoint",
-                flush=True,
-            )
-            checkpoint_written = try_export_model_checkpoint(
-                model=model,
-                optimizer=optimizer,
-                ema=ema,
-                output_path=checkpoint_path,
-                config=config,
-                epoch=epoch,
-            )
-            sampling_checkpoint_path = checkpoint_path if checkpoint_written else None
-
-            print(
-                f"epoch={epoch:04d} starting sampling evaluation",
-                flush=True,
-            )
             use_ema_sampling = should_use_ema_for_sampling(
                 ema=ema,
                 current_epoch=epoch,
@@ -1059,31 +1056,63 @@ def train() -> None:
             )
             if use_ema_sampling:
                 print(
-                    f"epoch={epoch:04d} sampling with EMA model (facit-style selection)",
+                    f"epoch={epoch:04d} validation + sampling with EMA model",
                     flush=True,
                 )
-                if sampling_checkpoint_path is not None:
+                with ema.average_parameters(model):
+                    print(
+                        f"epoch={epoch:04d} starting validation loss pass",
+                        flush=True,
+                    )
+                    val_metrics = evaluate_loss(
+                        model=model,
+                        loader=val_loader,
+                        device=device,
+                        lambda_v=config["lambda_v"],
+                        lambda_l=config["lambda_l"],
+                        max_graphs=config["val_subset_graphs"],
+                        debug=args.dev,
+                    )
+                    print(
+                        f"epoch={epoch:04d} finished validation loss pass",
+                        flush=True,
+                    )
+                    print(
+                        f"epoch={epoch:04d} starting sampling evaluation",
+                        flush=True,
+                    )
                     sampling_metrics = run_sampling_evaluation(
                         model=model,
                         loader=val_loader,
                         device=device,
                         n_steps=config["sampling_steps"],
                         max_graphs=config["val_subset_graphs"],
-                        checkpoint_path=sampling_checkpoint_path,
-                    )
-                else:
-                    with ema.average_parameters(model):
-                        sampling_metrics = run_sampling_evaluation(
-                            model=model,
-                            loader=val_loader,
-                            device=device,
-                            n_steps=config["sampling_steps"],
-                            max_graphs=config["val_subset_graphs"],
-                            checkpoint_path=None,
-                        )
+                        checkpoint_path=None,
+                )
             else:
                 print(
-                    f"epoch={epoch:04d} sampling with current model (EMA not updated yet)",
+                    f"epoch={epoch:04d} validation + sampling with current model",
+                    flush=True,
+                )
+                print(
+                    f"epoch={epoch:04d} starting validation loss pass",
+                    flush=True,
+                )
+                val_metrics = evaluate_loss(
+                    model=model,
+                    loader=val_loader,
+                    device=device,
+                    lambda_v=config["lambda_v"],
+                    lambda_l=config["lambda_l"],
+                    max_graphs=config["val_subset_graphs"],
+                    debug=args.dev,
+                )
+                print(
+                    f"epoch={epoch:04d} finished validation loss pass",
+                    flush=True,
+                )
+                print(
+                    f"epoch={epoch:04d} starting sampling evaluation",
                     flush=True,
                 )
                 sampling_metrics = run_sampling_evaluation(
@@ -1092,7 +1121,7 @@ def train() -> None:
                     device=device,
                     n_steps=config["sampling_steps"],
                     max_graphs=config["val_subset_graphs"],
-                    checkpoint_path=sampling_checkpoint_path,
+                    checkpoint_path=None,
                 )
             print(
                 f"epoch={epoch:04d} finished sampling evaluation",
@@ -1132,6 +1161,36 @@ def train() -> None:
                 f"mean_rmse={sampling_metrics['rmse']:.6f}"
             )
 
+            checkpoint_path = checkpoints_dir / f"checkpoint_epoch_{epoch}.pt"
+            print(
+                f"epoch={epoch:04d} exporting checkpoint",
+                flush=True,
+            )
+            checkpoint_written = try_export_model_checkpoint(
+                model=model,
+                optimizer=optimizer,
+                ema=ema,
+                output_path=checkpoint_path,
+                config=config,
+                epoch=epoch,
+            )
+            best_epoch = None
+            top_epochs: list[int] = []
+            if checkpoint_written:
+                best_epoch, top_epochs = update_checkpoint_aliases(
+                    checkpoints_dir=checkpoints_dir,
+                    current_checkpoint_path=checkpoint_path,
+                    history=history,
+                    metric_key="match_rate",
+                    keep_top_k=3,
+                )
+                if best_epoch is not None:
+                    print(
+                        f"epoch={epoch:04d} best_checkpoint_epoch={best_epoch:04d} "
+                        f"top_k_epochs={top_epochs}",
+                        flush=True,
+                    )
+
             val_log_payload = {
                 "epoch": epoch,
                 "val/loss_weighted": val_metrics["loss"],
@@ -1141,6 +1200,8 @@ def train() -> None:
                 "val/match_rate": sampling_metrics["match_rate"],
                 "val/rmse": sampling_metrics["rmse"],
             }
+            if best_epoch is not None:
+                val_log_payload["val/best_checkpoint_epoch"] = best_epoch
             if args.dev:
                 val_log_payload.update(
                     {
@@ -1281,11 +1342,11 @@ def train() -> None:
                 f"epoch={epoch:04d} pruning old checkpoints",
                 flush=True,
             )
-            prune_old_checkpoints(
-                checkpoints_dir=checkpoints_dir,
-                keep_last=2,
-                current_epoch=epoch,
-            )
+            if top_epochs:
+                prune_old_checkpoints(
+                    checkpoints_dir=checkpoints_dir,
+                    keep_epochs=set(top_epochs),
+                )
             print(
                 f"epoch={epoch:04d} finished pruning old checkpoints",
                 flush=True,

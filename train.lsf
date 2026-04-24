@@ -1,0 +1,84 @@
+#!/bin/bash
+set -euo pipefail
+
+#BSUB -J kldm_train
+#BSUB -q gpuv100
+#BSUB -n 4
+#BSUB -R "span[hosts=1]"
+#BSUB -gpu "num=1:mode=exclusive_process"
+#BSUB -R "rusage[mem=8GB]"
+#BSUB -W 24:00
+#BSUB -o logs/train_%J.out
+#BSUB -e logs/train_%J.err
+
+REPO_ROOT="${LS_SUBCWD:-${LSB_SUBCWD:-$(pwd)}}"
+cd "$REPO_ROOT"
+
+mkdir -p \
+  logs \
+  artifacts/HPC \
+  artifacts/HPC/checkpoints
+
+module load python3/3.11.13
+
+export PATH="$HOME/.local/bin:$PATH"
+export PYTHONUNBUFFERED=1
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export CUDA_LAUNCH_BLOCKING=0
+export WANDB__SERVICE_WAIT=300
+export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
+
+if [ -f "$HOME/.wandb_env" ]; then
+  source "$HOME/.wandb_env"
+fi
+
+ENTRYPOINT="${KLDM_ENTRYPOINT:-src/kldm/trainHPC.py}"
+VALIDATE_EVERY="${KLDM_VALIDATE_EVERY:-100}"
+SAMPLING_STEPS="${KLDM_SAMPLING_STEPS:-1000}"
+BATCH_SIZE="${KLDM_BATCH_SIZE:-256}"
+MAX_EPOCHS="${KLDM_MAX_EPOCHS:-}"
+LOAD_FROM_CHECKPOINT="${KLDM_LOAD_FROM_CHECKPOINT:-}"
+DEV_MODE="${KLDM_DEV:-0}"
+SAMPLING_FORCE_EMA="${KLDM_SAMPLING_FORCE_EMA:-}"
+
+date
+hostname
+pwd
+echo "entrypoint=$ENTRYPOINT"
+echo "batch_size=$BATCH_SIZE validate_every=$VALIDATE_EVERY sampling_steps=$SAMPLING_STEPS max_epochs=$MAX_EPOCHS"
+echo "load_from_checkpoint=${LOAD_FROM_CHECKPOINT:-<none>} dev=$DEV_MODE sampling_force_ema=${SAMPLING_FORCE_EMA:-<default>}"
+nvidia-smi || true
+
+CMD=(
+  uv run --locked --python 3.11 python "$ENTRYPOINT"
+  --batch-size "$BATCH_SIZE"
+  --validate-every "$VALIDATE_EVERY"
+  --sampling-steps "$SAMPLING_STEPS"
+)
+
+if [ -n "$MAX_EPOCHS" ]; then
+  CMD+=(--max-epochs "$MAX_EPOCHS")
+fi
+
+if [ -n "$LOAD_FROM_CHECKPOINT" ]; then
+  CMD+=(--load_from_checkpoint "$LOAD_FROM_CHECKPOINT")
+fi
+
+if [ "$DEV_MODE" = "1" ] || [ "$DEV_MODE" = "true" ]; then
+  CMD+=(--dev)
+fi
+
+if [ -n "$SAMPLING_FORCE_EMA" ]; then
+  if [ "$SAMPLING_FORCE_EMA" = "1" ] || [ "$SAMPLING_FORCE_EMA" = "true" ]; then
+    CMD+=(--sampling-force-ema)
+  else
+    CMD+=(--no-sampling-force-ema)
+  fi
+fi
+
+printf 'command:'
+printf ' %q' "${CMD[@]}"
+printf '\n'
+
+"${CMD[@]}"
