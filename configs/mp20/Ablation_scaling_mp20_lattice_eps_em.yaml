@@ -1,5 +1,5 @@
 experiment_name: Ablation_scaling_mp20_lattice_eps_em
-sampler_config: ../samplers/euler_exponential.yaml
+sampler_config: ../samplers/euler_maruyama.yaml
 
 dataset:
   task: csp

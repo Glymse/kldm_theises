@@ -1,5 +1,5 @@
 experiment_name: mp20_lattice_x0_em
-sampler_config: ../samplers/euler_exponential.yaml
+sampler_config: ../samplers/euler_maruyama.yaml
 
 dataset:
   task: csp
