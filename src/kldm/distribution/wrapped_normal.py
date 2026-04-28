@@ -1,116 +1,52 @@
-import os
+from __future__ import annotations
 
 import torch
 
 
-#Based on the formula in Directional Statistics page 69 and the KLDM appendix.
-#We might need mikkel or francois to verify this solution.
-
 def d_log_wrapped_normal(
-    r: torch.Tensor,
-    mu: torch.Tensor,
-    sigma: torch.Tensor,
-    K: int = 13,
-    T: float = 1.0,
+    r_t: torch.Tensor,
+    mu_r_t: torch.Tensor,
+    sigma_r_t: torch.Tensor,
+    K: int = 3,
     eps: float = 1e-8,
 ) -> torch.Tensor:
-    while sigma.ndim < r.ndim:
-        sigma = sigma.unsqueeze(-1)
-    while mu.ndim < r.ndim:
-        mu = mu.unsqueeze(-1)
+    """
+    Wrapped-normal score with respect to the mean on the unit interval.
 
-    k = torch.arange(-K, K + 1, device=r.device, dtype=r.dtype)
-    diff = r.unsqueeze(-1) - mu.unsqueeze(-1) + T * k
-    sigma2 = sigma.unsqueeze(-1).pow(2).clamp_min(eps)
+    We work in the unit-period chart, so the wrapped normal is written as
 
-    log_terms = -0.5 * diff.pow(2) / sigma2
-    log_weights = log_terms - torch.logsumexp(log_terms, dim=-1, keepdim=True)
-    weights = torch.exp(log_weights)
+        WN_K(r_t | mu_r_t, sigma_r_t^2)
+            = Σ_{k=-K}^{K}
+              exp(-(r_t + k - mu_r_t)^2 / (2 sigma_r_t^2)).
 
-    grad_mu = (weights * diff / sigma2).sum(dim=-1)
-    return grad_mu
+    The score used by TDM is the derivative with respect to the mean:
+
+        s_K(r_t; mu_r_t, sigma_r_t)
+            = ∇_{mu_r_t} log WN_K(r_t | mu_r_t, sigma_r_t^2)
+
+            = [Σ_k ((r_t + k - mu_r_t) / sigma_r_t^2) exp(...)]
+              / [Σ_k exp(...)].
 
 
-def sigma_norm(
-    sigma: torch.Tensor,
-    T: float = 1.0,
-    K: int = 9,
-    sn: int = 20000,
-    sigma_chunk_size: int = 128,
-    sample_chunk_size: int = 2048,
-    eps: float = 1e-8,
-) -> torch.Tensor:
-    debug = os.environ.get("KLDM_SIGMA_NORM_DEBUG", "").lower() in {"1", "true", "yes", "on"}
-    sigma = sigma.reshape(-1)
-    if sigma_chunk_size <= 0 or sample_chunk_size <= 0:
-        raise ValueError("sigma_chunk_size and sample_chunk_size must be positive.")
+    """
+    k = torch.arange(-K, K + 1, device=r_t.device, dtype=r_t.dtype)
 
-    result = torch.empty_like(sigma)
+    # Each wrapped image corresponds to shifting the unit-period coordinate by
+    # an integer k in the covering space.
+    r_plus_k_minus_mu = r_t.unsqueeze(-1) + k - mu_r_t.unsqueeze(-1)
 
-    if debug:
-        print(
-            "sigma_norm_debug "
-            f"sigmas={sigma.numel()} sn={sn} K={K} "
-            f"sigma_chunk_size={sigma_chunk_size} sample_chunk_size={sample_chunk_size} "
-            f"dtype={sigma.dtype} device={sigma.device}",
-            flush=True,
-        )
+    sigma2_r_t = sigma_r_t.square().clamp_min(eps)
 
-    with torch.no_grad():
-        for sigma_start in range(0, sigma.numel(), sigma_chunk_size):
-            sigma_end = min(sigma_start + sigma_chunk_size, sigma.numel())
-            sigma_chunk = sigma[sigma_start:sigma_end].clamp_min(eps)
-            accum = torch.zeros_like(sigma_chunk)
-            seen = 0
+    # Unnormalized wrapped-normal series terms. The Gaussian prefactor is the
+    # same for every k and cancels in the final ratio.
+    exp_term = torch.exp(
+        -(r_plus_k_minus_mu.square()) / (2.0 * sigma2_r_t.unsqueeze(-1))
+    )
 
-            if debug:
-                diff_elements = sample_chunk_size * sigma_chunk.numel() * (2 * K + 1)
-                diff_mb = diff_elements * sigma.element_size() / (1024 ** 2)
-                print(
-                    "sigma_norm_debug "
-                    f"chunk={sigma_start}:{sigma_end} "
-                    f"chunk_sigmas={sigma_chunk.numel()} "
-                    f"estimated_diff_tensor_mb={diff_mb:.1f}",
-                    flush=True,
-                )
+    numerator = torch.sum(
+        (r_plus_k_minus_mu / sigma2_r_t.unsqueeze(-1)) * exp_term,
+        dim=-1,
+    )
+    denominator = torch.sum(exp_term, dim=-1).clamp_min(eps)
 
-            while seen < sn:
-                current_samples = min(sample_chunk_size, sn - seen)
-                sigmas = sigma_chunk.unsqueeze(0).expand(current_samples, -1)
-                x_sample = sigmas * torch.randn_like(sigmas)
-                x_sample = torch.remainder(x_sample + 0.5 * T, T) - 0.5 * T
-                normal_ = d_log_wrapped_normal(
-                    r=x_sample,
-                    mu=torch.zeros_like(x_sample),
-                    sigma=sigmas,
-                    K=K,
-                    T=T,
-                    eps=eps,
-                )
-                accum += (normal_ ** 2).sum(dim=0)
-                seen += current_samples
-
-                if debug and (seen == current_samples or seen == sn or seen % max(sample_chunk_size * 4, 1) == 0):
-                    print(
-                        "sigma_norm_debug "
-                        f"chunk={sigma_start}:{sigma_end} "
-                        f"progress={seen}/{sn}",
-                        flush=True,
-                    )
-
-            result[sigma_start:sigma_end] = accum / float(sn)
-
-            if debug:
-                print(
-                    "sigma_norm_debug "
-                    f"chunk={sigma_start}:{sigma_end} done",
-                    flush=True,
-                )
-
-    if debug:
-        print("sigma_norm_debug complete", flush=True)
-
-    return result
-
-#∇μ​logWN    not   ∇𝑟log⁡W.
-#HUSK DETTE I RAPPORT
+    return numerator / denominator

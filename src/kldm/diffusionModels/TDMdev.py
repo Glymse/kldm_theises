@@ -3,7 +3,6 @@ from __future__ import annotations
 import math
 from pathlib import Path
 import sys
-import time
 
 import torch
 from torch import nn
@@ -11,7 +10,8 @@ from torch import nn
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from kldm.distribution.wrapped_normal import d_log_wrapped_normal, sigma_norm
+from kldm.distribution.sigma_norm import WrappedNormalSigmaNorm
+from kldm.distribution.wrapped_normal import d_log_wrapped_normal
 from kldm.scoreNetwork.utils import scatter_center
 
 
@@ -28,55 +28,26 @@ class TrivialisedDiffusionDev(nn.Module):
     def __init__(
         self,
         eps: float = 1e-6,
-        n_lambdas: int = 256,
-        lambda_num_batches: int = 16,
         k_wn_score: int = 13,
         n_sigmas: int = 2000,
         compute_sigma_norm: bool = True,
+        velocity_scale: float | None = None,
     ) -> None:
         super().__init__()
         self.eps = float(eps)
         self.time_scaling_T = 2.0
         self.scale_pos = 1.0
-        self.vel_scale = 1.0 / (2.0 * math.pi)
+        self.vel_scale = float(1.0 / (2.0 * math.pi) if velocity_scale is None else velocity_scale)
         self.k_wn_score = int(k_wn_score)
-        self.n_lambdas = int(n_lambdas)
-        self.lambda_num_batches = int(lambda_num_batches)
         self.compute_sigma_norm = bool(compute_sigma_norm)
         self.simplified_parameterization = True
-        self.use_lambda_weighting = False
-
-        self.register_buffer("_lambda_t01_grid", torch.linspace(1e-4, 1.0, self.n_lambdas))
-        self.register_buffer("_lambda_v_table", torch.ones(self.n_lambdas))
 
         if self.compute_sigma_norm:
             sigma_grid_t = torch.linspace(0.0, self.time_scaling_T, int(n_sigmas))
             sigma_values = self.wrapped_gaussian_sigma_r_t(sigma_grid_t)
-            sigma_precompute_start = time.perf_counter()
-            print(
-                "TDMdev sigma_norm precompute start "
-                f"n_sigmas={n_sigmas} k_wn_score={self.k_wn_score} "
-                f"scale_pos={self.scale_pos:.6f} vel_scale={self.vel_scale:.6f}",
-                flush=True,
-            )
-            sigma_norm_values = sigma_norm(
-                sigma=sigma_values,
-                T=self.scale_pos,
-                K=self.k_wn_score,
-                eps=self.eps,
-            )
-            print(
-                "TDMdev sigma_norm precompute done "
-                f"seconds={time.perf_counter() - sigma_precompute_start:.1f}",
-                flush=True,
-            )
+            sigma_norm_values = WrappedNormalSigmaNorm(K=self.k_wn_score, eps=self.eps)(sigma_values)
         else:
             sigma_norm_values = torch.ones(int(n_sigmas), dtype=torch.get_default_dtype())
-            print(
-                "TDMdev sigma_norm precompute skipped "
-                f"n_sigmas={n_sigmas} compute_sigma_norm={self.compute_sigma_norm}",
-                flush=True,
-            )
         self.register_buffer("_sigma_norms", sigma_norm_values)
 
     @staticmethod
@@ -116,23 +87,6 @@ class TrivialisedDiffusionDev(nn.Module):
         base_var = 2.0 * t + 8.0 / (1.0 + torch.exp(t)) - 4.0
         return self.vel_scale * torch.sqrt(torch.clamp(base_var, min=self.eps))
 
-    def lambda_v(self, t01: torch.Tensor) -> torch.Tensor:
-        return torch.ones_like(t01, dtype=self._lambda_v_table.dtype, device=t01.device)
-
-    @torch.no_grad()
-    def precompute_lambda_v_table_from_loader(
-        self,
-        loader,
-        device: torch.device | None = None,
-        num_batches: int | None = None,
-        clamp_min: float = 0.2,
-        clamp_max: float = 5.0,
-        smooth: bool = True,
-    ) -> torch.Tensor:
-        del loader, device, num_batches, clamp_min, clamp_max, smooth
-        self._lambda_v_table.fill_(1.0)
-        return self._lambda_v_table
-
     def _sigma_norm_t(self, t: torch.Tensor) -> torch.Tensor:
         # Match facitKLDM's nearest-neighbor table lookup as closely as possible
         # while still clamping safely at the endpoints.
@@ -144,13 +98,6 @@ class TrivialisedDiffusionDev(nn.Module):
         eps = torch.randn_like(ref)
         eps = scatter_center(eps, index=index)
         return self.vel_scale * eps
-
-    @torch.no_grad()
-    def sample_prior(self, index: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        num_nodes = len(index)
-        pos_frac = self.wrap_displacements(torch.rand((num_nodes, 3), device=index.device))
-        v_frac = self.sample_velocity_epsilon(pos_frac, index=index)
-        return pos_frac, v_frac
 
     def forward_sample(
         self,
@@ -190,7 +137,7 @@ class TrivialisedDiffusionDev(nn.Module):
 
 
 
-        #f_t = scatter_center(f_t, index=index)
+        f_t = scatter_center(f_t, index=index)
 
 
 
@@ -213,11 +160,10 @@ class TrivialisedDiffusionDev(nn.Module):
 
         prefactor_t = self._match_dims(self._prefactor_t(t), r_t)
         target_pos_t = prefactor_t * d_log_wrapped_normal(
-            r=r_t,
-            mu=mu_r_t,
-            sigma=sigma_r_t,
+            r_t=r_t,
+            mu_r_t=mu_r_t,
+            sigma_r_t=sigma_r_t,
             K=self.k_wn_score,
-            T=self.scale_pos,
             eps=self.eps,
         )
         target_pos_t = scatter_center(target_pos_t, index=index)
@@ -281,6 +227,77 @@ class TrivialisedDiffusionDev(nn.Module):
         f_prev = self._wrap_internal(f_t - dt_t * v_prev)
 
         return f_prev, v_prev
+
+    @torch.no_grad()
+    def reverse_step_predictor(
+        self,
+        t: torch.Tensor,
+        f_t: torch.Tensor,
+        v_t: torch.Tensor,
+        pred_v: torch.Tensor,
+        dt: float,
+        index: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        t_internal = self.time_scaling_T * t
+        dt_internal = torch.as_tensor(self.time_scaling_T * dt, device=v_t.device, dtype=v_t.dtype)
+        t_prev = (t_internal - dt_internal).clamp_min(self.eps)
+
+        score_v = self.construct_velocity_score(
+            t=t,
+            v_t=v_t,
+            pred_v=pred_v,
+        )
+
+        r = self.gaussian_velocity_mean_coeff(t_prev) / self.gaussian_velocity_mean_coeff(t_internal)
+        sigma_curr = self.gaussian_velocity_sigma(t_internal)
+        sigma_prev = self.gaussian_velocity_sigma(t_prev)
+        r = self._match_dims(r, v_t)
+        sigma_curr = self._match_dims(sigma_curr, v_t)
+        sigma_prev = self._match_dims(sigma_prev, v_t)
+        score_coeff = (r * sigma_curr - sigma_prev) * sigma_curr
+
+        v_prev = r * v_t + score_coeff * score_v
+        f_prev = self._wrap_internal(f_t - dt_internal * v_prev)
+        return f_prev, v_prev
+
+    @torch.no_grad()
+    def reverse_step_corrector(
+        self,
+        t: torch.Tensor,
+        f_t: torch.Tensor,
+        v_t: torch.Tensor,
+        pred_v: torch.Tensor,
+        dt: float,
+        index: torch.Tensor,
+        tau: float = 0.25,
+        correct_pos: bool = True,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        dt_internal = torch.as_tensor(self.time_scaling_T * dt, device=v_t.device, dtype=v_t.dtype)
+        score_v = self.construct_velocity_score(
+            t=t,
+            v_t=v_t,
+            pred_v=pred_v,
+        )
+
+        denominator = torch.zeros(
+            (int(index.max().item()) + 1, 1),
+            device=v_t.device,
+            dtype=v_t.dtype,
+        )
+        denominator = denominator.index_add(0, index, score_v.square().mean(dim=-1, keepdim=True))
+        counts = torch.zeros_like(denominator).index_add(
+            0,
+            index,
+            torch.ones((score_v.shape[0], 1), device=v_t.device, dtype=v_t.dtype),
+        )
+        denominator = (denominator / counts.clamp_min(1.0)).clamp_min(self.eps)
+        delta = torch.as_tensor(tau, device=v_t.device, dtype=v_t.dtype) / denominator[index]
+
+        noise_v = self.sample_velocity_epsilon(v_t, index=index)
+        v_prev = v_t + delta * score_v + torch.sqrt(2.0 * delta) * noise_v
+        if correct_pos:
+            f_t = self._wrap_internal(f_t - dt_internal * v_prev)
+        return f_t, v_prev
 
     @staticmethod
     def _match_dims(coeff: torch.Tensor, x: torch.Tensor) -> torch.Tensor:

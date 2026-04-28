@@ -95,7 +95,6 @@ def _to_2d_tensor(x: torch.Tensor | list[float] | list[list[float]]) -> torch.Te
 def _default_lattice_transform() -> ContinuousIntervalLattice:
     return ContinuousIntervalLattice(
         standardize=False,
-        angles_loc_scale=None,
     )
 
 
@@ -244,7 +243,10 @@ def structures_from_batch(
     species_vocab: Optional[list[int]] = None,
     lattice_transform: Optional[ContinuousIntervalLattice] = None,
 ) -> list[Structure | None]:
-    tensors = {"h": batch.h, "pos": batch.pos, "l": batch.l}
+    atom_features = getattr(batch, "atomic_numbers", None)
+    if atom_features is None:
+        atom_features = batch.h
+    tensors = {"h": atom_features, "pos": batch.pos, "l": batch.l}
     return structures_from_tensors(
         tensors=tensors,
         ptr=batch.ptr,

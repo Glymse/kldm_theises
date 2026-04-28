@@ -2,12 +2,9 @@ from __future__ import annotations
 
 import argparse
 import csv
-from contextlib import contextmanager
 import errno
 import os
 from pathlib import Path
-import re
-import shutil
 import signal
 import sys
 from typing import Any
@@ -18,15 +15,10 @@ if __package__ in {None, ""}:
 import torch
 from torch.utils.data import DataLoader, Subset
 
-from kldm.data import CSPTask, resolve_data_root
-# from kldm.diffusionModels.trivialized_diffusion import TrivialisedDiffusion
-from kldm.diffusionModels.TDMdev import TrivialisedDiffusionDev
-from kldm.distribution.uniform import sample_uniform
-from kldm.kldm import ModelKLDM
-from kldm.sample_evaluation.sample_evaluation import (
-    aggregate_csp_reconstruction_metrics,
-    evaluate_csp_reconstruction,
-)
+from kldm.utils.device import get_default_device, should_pin_memory
+from kldm.utils.ema import ExponentialMovingAverage
+from kldm.utils.model_loader import load_checkpoint, save_checkpoint
+from kldm.utils.time import sample_times
 
 try:
     import wandb
@@ -43,17 +35,12 @@ STOP_REQUESTED = False
 TIME_LOWER_BOUND = 1e-3
 VAL_SUBSET_SEED = 123
 LOADER_NUM_WORKERS = 1
-LOADER_PIN_MEMORY = True
-
 NODE_AVERAGED_METRICS = {
     "loss_v",
-    "raw_loss_v",
     "target_v_abs_mean",
     "target_v_norm_mean",
     "pred_v_abs_mean",
     "pred_v_norm_mean",
-    "lambda_v_mean",
-    "lambda_v_effective",
     "v_t_abs_mean",
     "f_t_abs_mean",
     "r_t_abs_mean",
@@ -95,14 +82,6 @@ def should_stop(run) -> bool:
     return False
 
 
-def sample_graph_times(num_graphs: int, device: torch.device) -> torch.Tensor:
-    return sample_uniform(
-        lb=TIME_LOWER_BOUND,
-        size=(num_graphs, 1),
-        device=device,
-    )
-
-
 def make_fixed_subset(dataset, subset_size: int, seed: int):
     if subset_size <= 0 or subset_size >= len(dataset):
         return dataset
@@ -113,9 +92,6 @@ def make_fixed_subset(dataset, subset_size: int, seed: int):
 
 def aggregate_epoch_metrics(
     batch_metrics: list[tuple[dict[str, float], float, float]],
-    *,
-    lambda_v: float,
-    lambda_l: float,
 ) -> dict[str, float]:
     if not batch_metrics:
         raise RuntimeError("Cannot aggregate empty metric list.")
@@ -124,9 +100,6 @@ def aggregate_epoch_metrics(
     totals_graph: dict[str, float] = {}
     totals_batch: dict[str, float] = {}
     totals_other_graph: dict[str, float] = {}
-    min_metrics: dict[str, float] = {}
-    max_metrics: dict[str, float] = {}
-
     total_nodes = 0.0
     total_graphs = 0.0
     total_batches = 0.0
@@ -143,10 +116,6 @@ def aggregate_epoch_metrics(
                 totals_node[key] = totals_node.get(key, 0.0) + float(value) * num_nodes
             elif key in GRAPH_AVERAGED_METRICS:
                 totals_graph[key] = totals_graph.get(key, 0.0) + float(value) * num_graphs
-            elif key == "lambda_v_min":
-                min_metrics[key] = float(value) if key not in min_metrics else min(min_metrics[key], float(value))
-            elif key == "lambda_v_max":
-                max_metrics[key] = float(value) if key not in max_metrics else max(max_metrics[key], float(value))
             elif key in BATCH_AVERAGED_METRICS:
                 totals_batch[key] = totals_batch.get(key, 0.0) + float(value)
             else:
@@ -165,84 +134,11 @@ def aggregate_epoch_metrics(
         for key, total in totals_batch.items():
             aggregated[key] = total / total_batches
 
-    aggregated.update(min_metrics)
-    aggregated.update(max_metrics)
-
     aggregated["loss_v"] = aggregated.get("loss_v", 0.0)
     aggregated["loss_l"] = aggregated.get("loss_l", 0.0)
-    aggregated["loss"] = lambda_v * aggregated["loss_v"] + lambda_l * aggregated["loss_l"]
+    aggregated["loss"] = aggregated["loss_v"] + aggregated["loss_l"]
     return aggregated
 
-
-class ExponentialMovingAverage:
-    def __init__(
-        self,
-        model: ModelKLDM,
-        decay: float = 0.999,
-        start_epoch: int = 500,
-    ) -> None:
-        self.decay = float(decay)
-        self.start_epoch = int(start_epoch)
-        self.num_updates = 0
-        self.shadow = {
-            name: param.detach().clone()
-            for name, param in model.named_parameters()
-            if param.requires_grad
-        }
-        self.backup: dict[str, torch.Tensor] = {}
-
-    def update(self, model: ModelKLDM, current_epoch: int) -> None:
-        if current_epoch <= self.start_epoch:
-            return
-        self.num_updates += 1
-        for name, param in model.named_parameters():
-            if not param.requires_grad:
-                continue
-            self.shadow[name].mul_(self.decay).add_(param.detach(), alpha=1.0 - self.decay)
-
-    def state_dict(self) -> dict[str, Any]:
-        return {
-            "decay": self.decay,
-            "start_epoch": self.start_epoch,
-            "num_updates": self.num_updates,
-            "shadow": {name: tensor.clone() for name, tensor in self.shadow.items()},
-        }
-
-    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
-        self.decay = float(state_dict.get("decay", self.decay))
-        self.start_epoch = int(state_dict.get("start_epoch", state_dict.get("start_step", self.start_epoch)))
-        self.num_updates = int(state_dict.get("num_updates", 0))
-        self.shadow = {
-            name: tensor.clone()
-            for name, tensor in state_dict.get("shadow", {}).items()
-        }
-
-    def ema_model_state_dict(self, model: ModelKLDM) -> dict[str, torch.Tensor]:
-        ema_state = clean_model_state_dict(model)
-        for name, tensor in self.shadow.items():
-            if name in ema_state:
-                ema_state[name] = tensor.clone()
-        return ema_state
-
-    @contextmanager
-    def average_parameters(self, model: ModelKLDM):
-        if not self.shadow:
-            yield
-            return
-
-        self.backup = {}
-        try:
-            for name, param in model.named_parameters():
-                if not param.requires_grad or name not in self.shadow:
-                    continue
-                self.backup[name] = param.detach().clone()
-                param.data.copy_(self.shadow[name].to(device=param.device, dtype=param.dtype))
-            yield
-        finally:
-            for name, param in model.named_parameters():
-                if name in self.backup:
-                    param.data.copy_(self.backup[name].to(device=param.device, dtype=param.dtype))
-            self.backup = {}
 
 #####
 #####
@@ -253,20 +149,19 @@ def validation_step(
     model: ModelKLDM,
     batch,
     device: torch.device,
-    lambda_l: float,
     debug: bool = False,
 ) -> dict[str, float]:
     model.eval()
     batch = batch.to(device)
 
-    t_graph = sample_graph_times(num_graphs=batch.num_graphs, device=device)
+    # Pick one shared noise time per material: t ~ Uniform(eps, 1).
+    # KLDM later expands this to lattice-level and atom/node-level views.
+    t_graph = sample_times(batch, lower_bound=TIME_LOWER_BOUND)
 
     with torch.no_grad():
         loss, metrics = model.algorithm2_loss(
             batch=batch,
             t=t_graph,
-            lambda_v=1.0,
-            lambda_l=lambda_l,
             debug=debug,
         )
 
@@ -283,8 +178,6 @@ def train_epoch(
     ema: ExponentialMovingAverage,
     device: torch.device,
     epoch: int,
-    lambda_v: float,
-    lambda_l: float,
     debug: bool = False,
 ) -> dict[str, float]:
     model.train()
@@ -297,14 +190,14 @@ def train_epoch(
         batch = batch.to(device)
         num_graphs = float(batch.num_graphs)
         num_nodes = float(batch.pos.shape[0])
-        t_graph = sample_graph_times(num_graphs=batch.num_graphs, device=device)
+        # Pick one shared noise time per material: t ~ Uniform(eps, 1).
+        # This is the noise level used by Algorithm 1 for the whole crystal state.
+        t_graph = sample_times(batch, lower_bound=TIME_LOWER_BOUND)
 
         optimizer.zero_grad()
         loss, metrics = model.algorithm2_loss(
             batch=batch,
             t=t_graph,
-            lambda_v=lambda_v,
-            lambda_l=lambda_l,
             debug=debug,
         )
         loss.backward()
@@ -341,19 +234,13 @@ def train_epoch(
 
     if not batch_metrics:
         raise RuntimeError("Training loader is empty or interrupted before any batch was processed.")
-    return aggregate_epoch_metrics(
-        batch_metrics,
-        lambda_v=lambda_v,
-        lambda_l=lambda_l,
-    )
+    return aggregate_epoch_metrics(batch_metrics)
 
 
 def evaluate_loss(
     model: ModelKLDM,
     loader,
     device: torch.device,
-    lambda_v: float,
-    lambda_l: float,
     max_graphs: int | None = None,
     debug: bool = False,
 ) -> dict[str, float]:
@@ -365,7 +252,6 @@ def evaluate_loss(
             model=model,
             batch=batch,
             device=device,
-            lambda_l=lambda_l,
             debug=debug,
         )
         num_graphs = float(batch.num_graphs)
@@ -377,20 +263,7 @@ def evaluate_loss(
 
     if not batch_metrics:
         raise RuntimeError("Validation loader is empty; cannot compute epoch metrics.")
-    return aggregate_epoch_metrics(
-        batch_metrics,
-        lambda_v=lambda_v,
-        lambda_l=lambda_l,
-    )
-
-
-def clean_model_state_dict(model: ModelKLDM) -> dict[str, torch.Tensor]:
-    return {
-        key: value
-        for key, value in model.state_dict().items()
-        if not key.startswith("_cached_sampling_model")
-        and not key.endswith("._lambda_v_table")
-    }
+    return aggregate_epoch_metrics(batch_metrics)
 
 
 def is_no_space_error(exc: BaseException) -> bool:
@@ -420,17 +293,14 @@ def export_model_checkpoint(
     config: dict[str, Any],
     epoch: int,
 ) -> None:
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(
-        {
-            "epoch": epoch,
-            "model_state_dict": clean_model_state_dict(model),
-            "ema_model_state_dict": None if ema is None else ema.ema_model_state_dict(model),
-            "ema_state_dict": None if ema is None else ema.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-            "config": config,
-        },
-        output_path,
+    save_checkpoint(
+        model=model,
+        optimizer=optimizer,
+        ema=ema,
+        output_path=output_path,
+        config=config,
+        epoch=epoch,
+        metrics={},
     )
 
 
@@ -493,10 +363,10 @@ def maybe_plot_training_metrics(rows: list[dict[str, Any]], output_path: Path) -
 
     fig, axes = plt.subplots(3, 1, figsize=(11, 13), sharex=True)
 
-    axes[0].plot(epochs, [row["train_loss_weighted"] for row in rows], marker="o", label="Train loss_weighted")
-    axes[0].plot(epochs, [row["val_loss_weighted"] for row in rows], marker="o", label="Val loss_weighted")
+    axes[0].plot(epochs, [row["train_loss"] for row in rows], marker="o", label="Train loss")
+    axes[0].plot(epochs, [row["val_loss"] for row in rows], marker="o", label="Val loss")
     axes[0].set_ylabel("Loss")
-    axes[0].set_title("Weighted loss")
+    axes[0].set_title("Total loss")
     axes[0].grid(True, alpha=0.3)
     axes[0].legend()
 
@@ -547,7 +417,7 @@ def maybe_plot_sampling_metrics(rows: list[dict[str, Any]], output_path: Path) -
     axes[1].grid(True, alpha=0.3)
     axes[1].legend()
 
-    axes[2].plot(epochs, [row["val_loss_weighted"] for row in rows], marker="o", label="val/loss_weighted")
+    axes[2].plot(epochs, [row["val_loss"] for row in rows], marker="o", label="val/loss")
     axes[2].plot(epochs, [row["val_loss_v"] for row in rows], marker="o", label="val/loss_v")
     axes[2].plot(epochs, [row["val_loss_l"] for row in rows], marker="o", label="val/loss_l")
     axes[2].set_ylabel("Loss")
@@ -565,8 +435,12 @@ def run_sampling_evaluation(
     device: torch.device,
     n_steps: int,
     max_graphs: int | None = None,
-    checkpoint_path: str | Path | None = None,
 ) -> dict[str, float | int]:
+    from kldm.sample_evaluation.sample_evaluation import (
+        aggregate_csp_reconstruction_metrics,
+        evaluate_csp_reconstruction,
+    )
+
     reconstruction_results = []
     num_graphs_seen = 0
 
@@ -579,7 +453,6 @@ def run_sampling_evaluation(
             pos_t, v_t, l_t, h_t = model.sample_CSP_algorithm3(
                 n_steps=n_steps,
                 batch=batch,
-                checkpoint_path=None if checkpoint_path is None else str(checkpoint_path),
             )
 
         ptr = batch.ptr.tolist()
@@ -590,7 +463,7 @@ def run_sampling_evaluation(
                 pred_a=h_t[start:end],
                 target_f=batch.pos[start:end],
                 target_l=batch.l[graph_idx],
-                target_a=batch.h[start:end],
+                target_a=batch.atomic_numbers[start:end],
             )
             reconstruction_results.append(result)
             num_graphs_seen += 1
@@ -619,65 +492,9 @@ def should_use_ema_for_sampling(
 ) -> bool:
     if ema is None:
         return False
-    # Keep sampling on live model until EMA has received at least one update.
     if ema.num_updates <= 0:
         return False
-    # Once EMA is active, match facit-style model selection.
-    return bool(force_ema or current_epoch > ema.start_epoch)
-
-
-def prune_old_checkpoints(
-    checkpoints_dir: Path,
-    keep_epochs: set[int],
-) -> None:
-    epoch_pattern = re.compile(r"^checkpoint_epoch_(\d+)$")
-    for path in checkpoints_dir.glob("checkpoint_epoch_*.pt"):
-        match = epoch_pattern.match(path.stem)
-        if match is None:
-            continue
-        epoch = int(match.group(1))
-        if epoch not in keep_epochs:
-            path.unlink(missing_ok=True)
-
-
-def top_k_checkpoint_epochs(
-    rows: list[dict[str, Any]],
-    *,
-    metric_key: str,
-    keep_top_k: int,
-) -> list[int]:
-    scored: list[tuple[float, int]] = []
-    for row in rows:
-        metric = row.get(metric_key, float("nan"))
-        if metric != metric:
-            continue
-        scored.append((float(metric), int(row["epoch"])))
-    scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
-    return [epoch for _, epoch in scored[:keep_top_k]]
-
-
-def update_checkpoint_aliases(
-    *,
-    checkpoints_dir: Path,
-    current_checkpoint_path: Path,
-    history: list[dict[str, Any]],
-    metric_key: str = "match_rate",
-    keep_top_k: int = 3,
-) -> tuple[int | None, list[int]]:
-    checkpoints_dir.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(current_checkpoint_path, checkpoints_dir / "last.pt")
-
-    top_epochs = top_k_checkpoint_epochs(
-        history,
-        metric_key=metric_key,
-        keep_top_k=keep_top_k,
-    )
-    best_epoch = top_epochs[0] if top_epochs else None
-    if best_epoch is not None:
-        best_path = checkpoints_dir / f"checkpoint_epoch_{best_epoch}.pt"
-        if best_path.exists():
-            shutil.copy2(best_path, checkpoints_dir / "best.pt")
-    return best_epoch, top_epochs
+    return bool(force_ema)
 
 
 def maybe_resume(
@@ -690,17 +507,14 @@ def maybe_resume(
     if checkpoint_path is None:
         return 0, {}
 
-    checkpoint = torch.load(checkpoint_path, map_location=device)
-    cleaned_state_dict = {
-        key: value
-        for key, value in checkpoint["model_state_dict"].items()
-        if not key.startswith("_cached_sampling_model")
-        and not key.endswith("._lambda_v_table")
-    }
-    model.load_state_dict(cleaned_state_dict, strict=False)
-    optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-    if ema is not None and checkpoint.get("ema_state_dict") is not None:
-        ema.load_state_dict(checkpoint["ema_state_dict"])
+    checkpoint = load_checkpoint(
+        checkpoint_path=checkpoint_path,
+        model=model,
+        optimizer=optimizer,
+        ema=ema,
+        device=device,
+        prefer_ema_weights=False,
+    )
     start_epoch = int(checkpoint.get("epoch", 0))
     checkpoint_config = checkpoint.get("config", {})
 
@@ -751,6 +565,12 @@ def parse_args() -> argparse.Namespace:
         help="Training and loss-validation batch size.",
     )
     parser.add_argument(
+        "--subset",
+        type=float,
+        default=1.0,
+        help="Fraction of the training split to use, e.g. 0.05 for 5%% of train data.",
+    )
+    parser.add_argument(
         "--lr",
         type=float,
         default=1e-3,
@@ -786,8 +606,8 @@ def parse_args() -> argparse.Namespace:
         default=False,
         help=(
             "Force EMA weights for validation sampling. "
-            "Defaults to false. EMA is still selected automatically after it has updates, "
-            "matching facitKLDM. Enable with --sampling-force-ema."
+            "Defaults to false, so validation and sampling stay on the live model unless "
+            "you explicitly enable EMA."
         ),
     )
     parser.add_argument(
@@ -799,18 +619,23 @@ def parse_args() -> argparse.Namespace:
 
 
 def train() -> None:
+    from kldm.data import CSPTask, resolve_data_root
+    from kldm.kldm import ModelKLDM
+
     args = parse_args()
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if not (0.0 < args.subset <= 1.0):
+        raise ValueError("--subset must be in the interval (0, 1].")
+
+    device = get_default_device()
     root = resolve_data_root()
     print(f"starting trainHPC root={root} device={device.type}", flush=True)
 
     config = {
         "task": "CSP",
         "batch_size": args.batch_size,
+        "subset": args.subset,
         "lr": args.lr,
         "weight_decay": args.weight_decay,
-        "lambda_v": 1.0,
-        "lambda_l": 1.0,
         "validate_every": args.validate_every,
         "loss_every": args.loss_every,
         "sampling_samples": args.sampling_samples,
@@ -823,20 +648,45 @@ def train() -> None:
         "ema_start": args.ema_start,
         "sampling_force_ema": args.sampling_force_ema,
         "num_workers": LOADER_NUM_WORKERS,
-        "pin_memory": LOADER_PIN_MEMORY,
+        "pin_memory": should_pin_memory(device),
         "dev": args.dev,
+        "score_network": {
+            "hidden_dim": 512,
+            "time_dim": 256,
+            "num_layers": 6,
+            "num_freqs": 128,
+            "ln": True,
+            "h_dim": 100,
+            "smooth": False,
+            "pred_v": True,
+            "pred_l": True,
+            "pred_h": False,
+            "zero_cog": True,
+        },
     }
 
-    train_loader = CSPTask().dataloader(
+    csp_task = CSPTask()
+    train_dataset_full = csp_task.fit_dataset(
         root=root,
         split="train",
+        download=True,
+    )
+    train_subset_size = max(1, int(len(train_dataset_full) * config["subset"]))
+    train_dataset = make_fixed_subset(
+        train_dataset_full,
+        subset_size=train_subset_size,
+        seed=VAL_SUBSET_SEED,
+    )
+    train_loader = DataLoader(
+        train_dataset,
         batch_size=config["batch_size"],
         shuffle=True,
         num_workers=config["num_workers"],
         pin_memory=config["pin_memory"],
-        download=True,
+        collate_fn=train_dataset_full.collate_fn,
     )
-    val_dataset_full = CSPTask().fit_dataset(
+
+    val_dataset_full = csp_task.fit_dataset(
         root=root,
         split="val",
         download=True,
@@ -857,23 +707,17 @@ def train() -> None:
 
     print("constructed train/val loaders", flush=True)
 
-    tdm = TrivialisedDiffusionDev(
-        eps=1e-6,
-        n_lambdas=512 if device.type == "cuda" else 128,
-        lambda_num_batches=32 if device.type == "cuda" else 8,
-        n_sigmas=2000 if device.type == "cuda" else 512,
-    )
-    model = ModelKLDM(device=device, diffusion_v=tdm).to(device)
-    print("precomputing TDM tables on real train batches", flush=True)
-    model.tdm.precompute_lambda_v_table_from_loader(
-        train_loader,
+    model = ModelKLDM(
         device=device,
-    )
+        eps=1e-6,
+        tdm_n_sigmas=2000 if device.type == "cuda" else 512,
+        score_network_kwargs=config["score_network"],
+    ).to(device)
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=config["lr"],
         amsgrad=True,
-        foreach=True,
+        foreach=device.type == "cuda",
         weight_decay=config["weight_decay"],
     )
     ema = ExponentialMovingAverage(
@@ -881,18 +725,6 @@ def train() -> None:
         decay=config["ema_decay"],
         start_epoch=config["ema_start"],
     )
-    lambda_table = getattr(model.tdm, "_lambda_v_table", None)
-    if args.dev and isinstance(lambda_table, torch.Tensor):
-        print(
-            "lambda_v_table_stats "
-            f"min={float(lambda_table.min()):.6f} "
-            f"mean={float(lambda_table.mean()):.6f} "
-            f"max={float(lambda_table.max()):.6f} "
-            f"p25={float(torch.quantile(lambda_table, 0.25)):.6f} "
-            f"p50={float(torch.quantile(lambda_table, 0.50)):.6f} "
-            f"p75={float(torch.quantile(lambda_table, 0.75)):.6f}",
-            flush=True,
-        )
     print(f"constructed model and optimizer tdm={type(model.tdm).__name__}", flush=True)
 
     start_epoch, resume_config = maybe_resume(
@@ -952,17 +784,15 @@ def train() -> None:
                 ema=ema,
                 device=device,
                 epoch=epoch,
-                lambda_v=config["lambda_v"],
-                lambda_l=config["lambda_l"],
                 debug=args.dev,
             )
 
             row = {
                 "epoch": epoch,
-                "train_loss_weighted": train_metrics["loss"],
+                "train_loss": train_metrics["loss"],
                 "train_loss_v": train_metrics["loss_v"],
                 "train_loss_l": train_metrics["loss_l"],
-                "val_loss_weighted": float("nan"),
+                "val_loss": float("nan"),
                 "val_loss_v": float("nan"),
                 "val_loss_l": float("nan"),
                 "valid": float("nan"),
@@ -974,17 +804,16 @@ def train() -> None:
             if args.dev:
                 print(
                     f"epoch={epoch:04d} "
-                    f"train_loss_weighted={train_metrics['loss']:.6f} "
-                    f"(v={train_metrics['loss_v']:.6f}, raw_v={train_metrics['raw_loss_v']:.6f}, l={train_metrics['loss_l']:.6f}) "
+                    f"train_loss={train_metrics['loss']:.6f} "
+                    f"(v={train_metrics['loss_v']:.6f}, l={train_metrics['loss_l']:.6f}) "
                     f"target_v_abs={train_metrics['target_v_abs_mean']:.6f} "
                     f"pred_v_abs={train_metrics['pred_v_abs_mean']:.6f} "
-                    f"lambda=[{train_metrics['lambda_v_min']:.3f},{train_metrics['lambda_v_mean']:.3f},{train_metrics['lambda_v_max']:.3f}] "
                     f"grad=[total={train_metrics['grad_norm']:.3f},v={train_metrics['out_v_grad_norm']:.3f},l={train_metrics['out_l_grad_norm']:.3f}]"
                 )
             else:
                 print(
                     f"epoch={epoch:04d} "
-                    f"train_loss_weighted={train_metrics['loss']:.6f} "
+                    f"train_loss={train_metrics['loss']:.6f} "
                     f"(loss_v={train_metrics['loss_v']:.6f}, loss_l={train_metrics['loss_l']:.6f})"
                 )
 
@@ -992,22 +821,17 @@ def train() -> None:
 
             train_log_payload = {
                 "epoch": epoch,
-                "train/loss_weighted": train_metrics["loss"],
+                "train/loss": train_metrics["loss"],
                 "train/loss_v": train_metrics["loss_v"],
                 "train/loss_l": train_metrics["loss_l"],
             }
             if args.dev:
                 train_log_payload.update(
                     {
-                        "train/raw_loss_v": train_metrics["raw_loss_v"],
                         "train/target_v_abs_mean": train_metrics["target_v_abs_mean"],
                         "train/target_v_norm_mean": train_metrics["target_v_norm_mean"],
                         "train/pred_v_abs_mean": train_metrics["pred_v_abs_mean"],
                         "train/pred_v_norm_mean": train_metrics["pred_v_norm_mean"],
-                        "train/lambda_v_mean": train_metrics["lambda_v_mean"],
-                        "train/lambda_v_min": train_metrics["lambda_v_min"],
-                        "train/lambda_v_max": train_metrics["lambda_v_max"],
-                        "train/lambda_v_effective": train_metrics["lambda_v_effective"],
                         "train/v_t_abs_mean": train_metrics["v_t_abs_mean"],
                         "train/f_t_abs_mean": train_metrics["f_t_abs_mean"],
                         "train/r_t_abs_mean": train_metrics["r_t_abs_mean"],
@@ -1026,10 +850,10 @@ def train() -> None:
                 output_path=history_path,
                 fieldnames=[
                     "epoch",
-                    "train_loss_weighted",
+                    "train_loss",
                     "train_loss_v",
                     "train_loss_l",
-                    "val_loss_weighted",
+                    "val_loss",
                     "val_loss_v",
                     "val_loss_l",
                     "valid",
@@ -1068,8 +892,6 @@ def train() -> None:
                         model=model,
                         loader=val_loader,
                         device=device,
-                        lambda_v=config["lambda_v"],
-                        lambda_l=config["lambda_l"],
                         max_graphs=config["val_subset_graphs"],
                         debug=args.dev,
                     )
@@ -1087,8 +909,7 @@ def train() -> None:
                         device=device,
                         n_steps=config["sampling_steps"],
                         max_graphs=config["val_subset_graphs"],
-                        checkpoint_path=None,
-                )
+                    )
             else:
                 print(
                     f"epoch={epoch:04d} validation + sampling with current model",
@@ -1102,8 +923,6 @@ def train() -> None:
                     model=model,
                     loader=val_loader,
                     device=device,
-                    lambda_v=config["lambda_v"],
-                    lambda_l=config["lambda_l"],
                     max_graphs=config["val_subset_graphs"],
                     debug=args.dev,
                 )
@@ -1121,14 +940,13 @@ def train() -> None:
                     device=device,
                     n_steps=config["sampling_steps"],
                     max_graphs=config["val_subset_graphs"],
-                    checkpoint_path=None,
                 )
             print(
                 f"epoch={epoch:04d} finished sampling evaluation",
                 flush=True,
             )
 
-            row["val_loss_weighted"] = val_metrics["loss"]
+            row["val_loss"] = val_metrics["loss"]
             row["val_loss_v"] = val_metrics["loss_v"]
             row["val_loss_l"] = val_metrics["loss_l"]
             row["valid"] = sampling_metrics["valid"]
@@ -1138,8 +956,8 @@ def train() -> None:
             if args.dev:
                 print(
                     f"validation_epoch={epoch:04d} "
-                    f"val_loss_weighted={val_metrics['loss']:.6f} "
-                    f"(loss_v={val_metrics['loss_v']:.6f}, raw_v={val_metrics['raw_loss_v']:.6f}, loss_l={val_metrics['loss_l']:.6f}) "
+                    f"val_loss={val_metrics['loss']:.6f} "
+                    f"(loss_v={val_metrics['loss_v']:.6f}, loss_l={val_metrics['loss_l']:.6f}) "
                     f"valid={sampling_metrics['valid']:.4f} "
                     f"match_rate={sampling_metrics['match_rate']:.4f} "
                     f"rmse={sampling_metrics['rmse']:.6f}"
@@ -1147,7 +965,7 @@ def train() -> None:
             else:
                 print(
                     f"validation_epoch={epoch:04d} "
-                    f"val_loss_weighted={val_metrics['loss']:.6f} "
+                    f"val_loss={val_metrics['loss']:.6f} "
                     f"(loss_v={val_metrics['loss_v']:.6f}, loss_l={val_metrics['loss_l']:.6f}) "
                     f"valid={sampling_metrics['valid']:.4f} "
                     f"match_rate={sampling_metrics['match_rate']:.4f} "
@@ -1161,7 +979,7 @@ def train() -> None:
                 f"mean_rmse={sampling_metrics['rmse']:.6f}"
             )
 
-            checkpoint_path = checkpoints_dir / f"checkpoint_epoch_{epoch}.pt"
+            checkpoint_path = checkpoints_dir / "last.pt"
             print(
                 f"epoch={epoch:04d} exporting checkpoint",
                 flush=True,
@@ -1174,46 +992,26 @@ def train() -> None:
                 config=config,
                 epoch=epoch,
             )
-            best_epoch = None
-            top_epochs: list[int] = []
             if checkpoint_written:
-                best_epoch, top_epochs = update_checkpoint_aliases(
-                    checkpoints_dir=checkpoints_dir,
-                    current_checkpoint_path=checkpoint_path,
-                    history=history,
-                    metric_key="match_rate",
-                    keep_top_k=3,
-                )
-                if best_epoch is not None:
-                    print(
-                        f"epoch={epoch:04d} best_checkpoint_epoch={best_epoch:04d} "
-                        f"top_k_epochs={top_epochs}",
-                        flush=True,
-                    )
+                for candidate in checkpoints_dir.glob("checkpoint_epoch_*.pt"):
+                    candidate.unlink(missing_ok=True)
 
             val_log_payload = {
                 "epoch": epoch,
-                "val/loss_weighted": val_metrics["loss"],
+                "val/loss": val_metrics["loss"],
                 "val/loss_v": val_metrics["loss_v"],
                 "val/loss_l": val_metrics["loss_l"],
                 "val/valid": sampling_metrics["valid"],
                 "val/match_rate": sampling_metrics["match_rate"],
                 "val/rmse": sampling_metrics["rmse"],
             }
-            if best_epoch is not None:
-                val_log_payload["val/best_checkpoint_epoch"] = best_epoch
             if args.dev:
                 val_log_payload.update(
                     {
-                        "val/raw_loss_v": val_metrics["raw_loss_v"],
                         "val/target_v_abs_mean": val_metrics["target_v_abs_mean"],
                         "val/target_v_norm_mean": val_metrics["target_v_norm_mean"],
                         "val/pred_v_abs_mean": val_metrics["pred_v_abs_mean"],
                         "val/pred_v_norm_mean": val_metrics["pred_v_norm_mean"],
-                        "val/lambda_v_mean": val_metrics["lambda_v_mean"],
-                        "val/lambda_v_min": val_metrics["lambda_v_min"],
-                        "val/lambda_v_max": val_metrics["lambda_v_max"],
-                        "val/lambda_v_effective": val_metrics["lambda_v_effective"],
                         "val/v_t_abs_mean": val_metrics["v_t_abs_mean"],
                         "val/f_t_abs_mean": val_metrics["f_t_abs_mean"],
                         "val/r_t_abs_mean": val_metrics["r_t_abs_mean"],
@@ -1229,10 +1027,10 @@ def train() -> None:
                 output_path=history_path,
                 fieldnames=[
                     "epoch",
-                    "train_loss_weighted",
+                    "train_loss",
                     "train_loss_v",
                     "train_loss_l",
-                    "val_loss_weighted",
+                    "val_loss",
                     "val_loss_v",
                     "val_loss_l",
                     "valid",
@@ -1244,7 +1042,7 @@ def train() -> None:
                 rows=[
                     {
                         "epoch": row["epoch"],
-                        "val_loss_weighted": row["val_loss_weighted"],
+                        "val_loss": row["val_loss"],
                         "val_loss_v": row["val_loss_v"],
                         "val_loss_l": row["val_loss_l"],
                         "valid": row["valid"],
@@ -1257,7 +1055,7 @@ def train() -> None:
                 output_path=sampling_history_path,
                 fieldnames=[
                     "epoch",
-                    "val_loss_weighted",
+                    "val_loss",
                     "val_loss_v",
                     "val_loss_l",
                     "valid",
@@ -1305,29 +1103,10 @@ def train() -> None:
             if run is not None and checkpoint_written:
                 try:
                     print(
-                        f"epoch={epoch:04d} logging checkpoint artifact",
+                        f"epoch={epoch:04d} saving last checkpoint to wandb",
                         flush=True,
                     )
-                    checkpoint_artifact = wandb.Artifact(f"checkpoint_epoch_{epoch}", type="model")
-                    checkpoint_artifact.add_file(str(checkpoint_path))
-                    run.log_artifact(checkpoint_artifact)
-                    print(
-                        f"epoch={epoch:04d} finished checkpoint artifact",
-                        flush=True,
-                    )
-
-                    if sampling_history_path.exists():
-                        print(
-                            f"epoch={epoch:04d} saving sampling history to wandb",
-                            flush=True,
-                        )
-                        wandb.save(str(sampling_history_path))
-                    if sampling_plot_path.exists():
-                        print(
-                            f"epoch={epoch:04d} saving sampling plot to wandb",
-                            flush=True,
-                        )
-                        wandb.save(str(sampling_plot_path))
+                    wandb.save(str(checkpoint_path), policy="now")
                     print(
                         f"epoch={epoch:04d} finished wandb sync for validation",
                         flush=True,
@@ -1339,26 +1118,12 @@ def train() -> None:
                     )
 
             print(
-                f"epoch={epoch:04d} pruning old checkpoints",
-                flush=True,
-            )
-            if top_epochs:
-                prune_old_checkpoints(
-                    checkpoints_dir=checkpoints_dir,
-                    keep_epochs=set(top_epochs),
-                )
-            print(
-                f"epoch={epoch:04d} finished pruning old checkpoints",
-                flush=True,
-            )
-
-            print(
                 f"epoch={epoch:04d} validation block complete",
                 flush=True,
             )
 
     finally:
-        final_checkpoint_path = checkpoints_dir / f"checkpoint_epoch_{epoch}_final.pt"
+        final_checkpoint_path = checkpoints_dir / "final.pt"
         final_checkpoint_written = try_export_model_checkpoint(
             model=model,
             optimizer=optimizer,
@@ -1368,19 +1133,9 @@ def train() -> None:
             epoch=epoch,
         )
 
-        final_artifact = wandb.Artifact("csp_hpc_final", type="model")
-        if final_checkpoint_written and final_checkpoint_path.exists():
-            final_artifact.add_file(str(final_checkpoint_path))
-        if history_path.exists():
-            final_artifact.add_file(str(history_path))
-        if sampling_history_path.exists():
-            final_artifact.add_file(str(sampling_history_path))
-        if training_plot_path.exists():
-            final_artifact.add_file(str(training_plot_path))
-        if sampling_plot_path.exists():
-            final_artifact.add_file(str(sampling_plot_path))
         if run is not None:
-            run.log_artifact(final_artifact)
+            if final_checkpoint_written and final_checkpoint_path.exists():
+                wandb.save(str(final_checkpoint_path), policy="now")
             wandb.finish()
 
 

@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-#BSUB -J kldm_train
+#BSUB -J kldm_mp20_eps_em
 #BSUB -q gpuv100
 #BSUB -n 4
 #BSUB -R "span[hosts=1]"
@@ -17,7 +17,8 @@ cd "$REPO_ROOT"
 mkdir -p \
   logs \
   artifacts/HPC \
-  artifacts/HPC/checkpoints
+  artifacts/HPC/checkpoints \
+  artifacts/HPC/checkpoints/experiments
 
 module load python3/3.11.13
 
@@ -33,49 +34,20 @@ if [ -f "$HOME/.wandb_env" ]; then
   source "$HOME/.wandb_env"
 fi
 
-ENTRYPOINT="${KLDM_ENTRYPOINT:-src/kldm/trainHPC.py}"
-VALIDATE_EVERY="${KLDM_VALIDATE_EVERY:-100}"
-SAMPLING_STEPS="${KLDM_SAMPLING_STEPS:-1000}"
-BATCH_SIZE="${KLDM_BATCH_SIZE:-256}"
-MAX_EPOCHS="${KLDM_MAX_EPOCHS:-}"
-LOAD_FROM_CHECKPOINT="${KLDM_LOAD_FROM_CHECKPOINT:-}"
-DEV_MODE="${KLDM_DEV:-0}"
-SAMPLING_FORCE_EMA="${KLDM_SAMPLING_FORCE_EMA:-}"
+ENTRYPOINT="${KLDM_ENTRYPOINT:-src/kldm/run_experiment.py}"
+CONFIG_PATH="${KLDM_CONFIG:-configs/mp20/mp20_lattice_eps_em.yaml}"
 
 date
 hostname
 pwd
 echo "entrypoint=$ENTRYPOINT"
-echo "batch_size=$BATCH_SIZE validate_every=$VALIDATE_EVERY sampling_steps=$SAMPLING_STEPS max_epochs=$MAX_EPOCHS"
-echo "load_from_checkpoint=${LOAD_FROM_CHECKPOINT:-<none>} dev=$DEV_MODE sampling_force_ema=${SAMPLING_FORCE_EMA:-<default>}"
+echo "config=$CONFIG_PATH"
 nvidia-smi || true
 
 CMD=(
   uv run --locked --python 3.11 python "$ENTRYPOINT"
-  --batch-size "$BATCH_SIZE"
-  --validate-every "$VALIDATE_EVERY"
-  --sampling-steps "$SAMPLING_STEPS"
+  --config "$CONFIG_PATH"
 )
-
-if [ -n "$MAX_EPOCHS" ]; then
-  CMD+=(--max-epochs "$MAX_EPOCHS")
-fi
-
-if [ -n "$LOAD_FROM_CHECKPOINT" ]; then
-  CMD+=(--load_from_checkpoint "$LOAD_FROM_CHECKPOINT")
-fi
-
-if [ "$DEV_MODE" = "1" ] || [ "$DEV_MODE" = "true" ]; then
-  CMD+=(--dev)
-fi
-
-if [ -n "$SAMPLING_FORCE_EMA" ]; then
-  if [ "$SAMPLING_FORCE_EMA" = "1" ] || [ "$SAMPLING_FORCE_EMA" = "true" ]; then
-    CMD+=(--sampling-force-ema)
-  else
-    CMD+=(--no-sampling-force-ema)
-  fi
-fi
 
 printf 'command:'
 printf ' %q' "${CMD[@]}"
