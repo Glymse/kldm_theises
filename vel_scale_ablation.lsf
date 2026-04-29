@@ -1,0 +1,56 @@
+#!/bin/bash
+set -euo pipefail
+
+#BSUB -J kldm_vel_scale
+#BSUB -q gpuv100
+#BSUB -n 2
+#BSUB -R "span[hosts=1]"
+#BSUB -gpu "num=1:mode=exclusive_process"
+#BSUB -R "rusage[mem=4GB]"
+#BSUB -W 08:00
+#BSUB -o logs/vel_scale_ablation_%J.out
+#BSUB -e logs/vel_scale_ablation_%J.err
+
+REPO_ROOT="${LS_SUBCWD:-${LSB_SUBCWD:-$(pwd)}}"
+cd "$REPO_ROOT"
+
+mkdir -p \
+  logs \
+  artifacts/HPC \
+  artifacts/HPC/checkpoints \
+  artifacts/HPC/checkpoints/experiments
+
+module load python3/3.11.13
+
+export PATH="$HOME/.local/bin:$PATH"
+export PYTHONUNBUFFERED=1
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export CUDA_LAUNCH_BLOCKING=0
+export WANDB__SERVICE_WAIT=300
+export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
+
+if [ -f "$HOME/.wandb_env" ]; then
+  source "$HOME/.wandb_env"
+fi
+
+ENTRYPOINT="${KLDM_ENTRYPOINT:-src/kldm/run_experiment.py}"
+CONFIG_PATH="${KLDM_CONFIG:-configs/mp20/VelScaleAblation_1pi.yaml}"
+
+date
+hostname
+pwd
+echo "entrypoint=$ENTRYPOINT"
+echo "config=$CONFIG_PATH"
+nvidia-smi || true
+
+CMD=(
+  uv run --locked --python 3.11 python "$ENTRYPOINT"
+  --config "$CONFIG_PATH"
+)
+
+printf 'command:'
+printf ' %q' "${CMD[@]}"
+printf '\n'
+
+"${CMD[@]}"

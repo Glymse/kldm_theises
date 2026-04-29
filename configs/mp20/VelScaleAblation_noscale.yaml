@@ -15,7 +15,6 @@ model:
   tdm_k_wn_score: 13
   tdm_n_sigmas: 2000
   tdm_compute_sigma_norm: true
-  # Baseline file for the no-scaling ablation point.
   tdm_velocity_scale: 1.0
   score_network:
     hidden_dim: 512
