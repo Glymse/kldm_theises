@@ -375,7 +375,7 @@ def main() -> None:
     checkpoint_cfg = dict(config.get("checkpoint", {}) or {})
 
     train_every_epochs = int(logging_cfg.get("train_every_epochs", 1))
-    validate_every_epochs = int(validation_cfg.get("every_n_epochs", 25))
+    validate_every_epochs = int(validation_cfg.get("every_n_epochs", 100))
     if train_every_epochs <= 0 or validate_every_epochs <= 0:
         raise ValueError("Logging and validation intervals must be positive integers.")
 

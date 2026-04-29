@@ -91,12 +91,21 @@ def _plain_model_state(state_dict: dict[str, torch.Tensor]) -> dict[str, torch.T
 
 
 def _ema_weights(checkpoint: dict[str, Any]) -> dict[str, torch.Tensor] | None:
-    if checkpoint.get("ema_model_state_dict") is not None:
+    ema_state = checkpoint.get("ema_state_dict")
+    if checkpoint.get("ema_model_state_dict") is not None and not isinstance(ema_state, dict):
         return dict(checkpoint["ema_model_state_dict"])
 
-    ema_state = checkpoint.get("ema_state_dict")
     if not isinstance(ema_state, dict):
         return None
+
+    num_updates = ema_state.get("ema_model.n_averaged", ema_state.get("num_updates", 0))
+    if isinstance(num_updates, torch.Tensor):
+        num_updates = int(num_updates.item())
+    if int(num_updates) <= 0:
+        return None
+
+    if checkpoint.get("ema_model_state_dict") is not None:
+        return dict(checkpoint["ema_model_state_dict"])
 
     if "shadow" in ema_state:
         return dict(ema_state["shadow"])

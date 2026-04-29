@@ -45,7 +45,7 @@ logging:
   wandb_checkpoints: true
 
 validation:
-  every_n_epochs: 25
+  every_n_epochs: 100
   ema_val: false
   subset_size: 1024
   subset_seed: 123
