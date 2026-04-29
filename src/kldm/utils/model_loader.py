@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 import torch
 
@@ -156,7 +156,7 @@ def save_checkpoint(
     output_path: Path,
     config: dict[str, Any],
     epoch: int,
-    metrics: dict[str, float],
+    metrics: Mapping[str, float | int | None],
 ) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(

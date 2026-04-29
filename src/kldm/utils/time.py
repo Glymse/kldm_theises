@@ -220,21 +220,21 @@ def iter_sampling_times(
     grid: torch.Tensor,
 ) -> Iterator[SamplingTimes]:
     """
-    Yield time views for each reverse step.
 
-    For a grid:
+    KLDM sampling starts at a noisy time close to 1 and moves toward a cleaner
+    time close to 0. We therefore build a decreasing time grid
 
-        [t0, t1, t2, ..., tK]
+        grid[0] > grid[1] > ... > grid[K]
 
-    this yields:
+    At each step we define
+        t      = current noisier time
+        t_next = next slightly cleaner time
+        dt     = t - t_next > 0
 
-        t0 -> t1
-        t1 -> t2
-        ...
-        t{K-1} -> tK
+    So dt is stored as a positive backward step size. We simply keep the same
+    reverse trajectory but store its magnitude as a positive number, then write
+    the update formulas with that convention.
 
-    Each yielded object contains both the current time views and the next time
-    views, so Algorithm 4 can evaluate the network at both levels.
     """
     # Iterate over neighboring pairs in the decreasing grid:
     # grid[0] -> grid[1], grid[1] -> grid[2], ...

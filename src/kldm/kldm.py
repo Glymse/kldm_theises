@@ -21,6 +21,7 @@ from kldm.utils.time import BatchTimes, iter_sampling_times, make_times, samplin
 class ModelKLDM(nn.Module):
     """
     KLDM model
+
     """
 
     def __init__(
@@ -85,10 +86,11 @@ class ModelKLDM(nn.Module):
         f_t, v_t, epsilon_v, epsilon_r, r_t = self.tdm.sample_noisy_state(
             t=times.nodes,
             f0=batch.pos,
-            index=index,
+            index=index, # the reason we give the index is because, it has if a batch has 2 crystals with 3 and 2 atoms then index = [0, 0, 0, 1, 1]
+                         # THis is used to zero-center velocity noise per graph
         )
 
-        target_v = self.tdm.build_velocity_target(
+        target_v = self.tdm.build_simplified_training_velocity_score(
             t=times.nodes,
             r_t=r_t,
             v_t=v_t,
@@ -193,11 +195,12 @@ class ModelKLDM(nn.Module):
         )
 
         with torch.no_grad():
+            """
+            Dt is a positive “backward step size”. hence why the sampler uses
+            different sign than the appendix algorithms.
+            """
             for times in iter_sampling_times(batch=state["batch"], grid=state["sampling_time_grid"]):
-                # Iterate over one transition in the decreasing sampling grid:
-                # current noisy time t -> next slightly cleaner time t_next.
-                # times.now gives graph/lattice/node views at the current time.
-                # Appendix H: evaluate the score network on the current noisy state.
+
                 preds_curr = state["score_network"](
                     t=times.now.graph,
                     pos=state["f_t"],
@@ -210,7 +213,7 @@ class ModelKLDM(nn.Module):
 
                 # Build the full KLDM velocity score from the predicted
                 # simplified wrapped-normal term.
-                score_v = state["sampling_tdm"].build_reverse_velocity_score(
+                score_v = state["sampling_tdm"].reconstruct_full_reverse_velocity_score(
                     t=times.now.nodes,
                     v_t=state["v_t"],
                     pred_v=preds_curr["v"],
@@ -260,7 +263,7 @@ class ModelKLDM(nn.Module):
         Important:
             - TDM internally uses velocity_scale = 1 / (2*pi)
             - therefore TDM predictor/corrector must use
-              build_reverse_velocity_score(...)
+              reconstruct_full_reverse_velocity_score(...)
             - corrector Langevin noise must use sample_velocity_noise(...)
             - our time grid uses dt = t_n - t_{n+1} > 0 while integrating
               backward, so the predictor position update needs the sign change

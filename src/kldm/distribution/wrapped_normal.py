@@ -1,4 +1,5 @@
 from __future__ import annotations
+from torch._tensor import Tensor
 
 import torch
 
@@ -29,24 +30,27 @@ def d_log_wrapped_normal(
 
 
     """
-    k = torch.arange(-K, K + 1, device=r_t.device, dtype=r_t.dtype)
 
-    # Each wrapped image corresponds to shifting the unit-period coordinate by
-    # an integer k in the covering space.
+    #integer shifts for the wrapped normal, k in {-K, ..., K}.
+    k: Tensor = torch.arange(-K, K + 1, device=r_t.device, dtype=r_t.dtype)
+
+    #r_t - mu_r + k
     r_plus_k_minus_mu = r_t.unsqueeze(-1) + k - mu_r_t.unsqueeze(-1)
 
+    #(sigma_r_t)^2
     sigma2_r_t = sigma_r_t.square().clamp_min(eps)
 
-    # Unnormalized wrapped-normal series terms. The Gaussian prefactor is the
-    # same for every k and cancels in the final ratio.
+    #exp( - (r_t - mu_r + k) / (2(sigma_r_t)^2)  )
     exp_term = torch.exp(
         -(r_plus_k_minus_mu.square()) / (2.0 * sigma2_r_t.unsqueeze(-1))
     )
 
+    #Truncated wrapped-normal sums over integer shifts k = -K, ..., K.
     numerator = torch.sum(
         (r_plus_k_minus_mu / sigma2_r_t.unsqueeze(-1)) * exp_term,
         dim=-1,
     )
     denominator = torch.sum(exp_term, dim=-1).clamp_min(eps)
 
+    # Numerical direvative with respect to the mean: ∂/∂mu log WN_K.
     return numerator / denominator

@@ -17,28 +17,35 @@ from kldm.scoreNetwork.utils import scatter_center
 
 class TrivialisedDiffusion(nn.Module):
     """
+    TDM helper for the KLDM position/velocity branch.
 
-        The code follows three simple steps.
+    This module handles three different pieces of the pipeline.
 
-        Forward:
-        1. sample v_t
-        2. sample r_t
-        3. compute f_t = wrap(f_0 + r_t)
+    Forward process:
+        1. sample a noisy velocity `v_t`
+        2. sample a wrapped displacement `r_t`
+        3. move the clean fractional coordinates to `f_t = wrap(f_0 + r_t)`
 
-        Training:
-        1. compute the wrapped-normal score target
-        2. normalize it with sigma_norm
-        3. train the network to predict this target
+    Training target:
+        1. compute the wrapped-normal part of the KLDM velocity score
+        2. remove the known derivative constant
+        3. normalize that simplified target with `sigma_norm`
+        4. train the network to predict this simplified quantity
 
-        Sampling:
-        1. reconstruct the full velocity score
-        2. update v_t with the reverse exponential step
-        3. update f_t using the new velocity
+    Reverse sampling:
+        1. take the network prediction of the simplified target
+        2. undo the `sigma_norm` normalization
+        3. restore the missing KLDM prefactor
+        4. add the analytic Gaussian velocity score term
+        5. use the reconstructed full score inside the sampler update
 
+    So the key split is:
+        - training predicts a simplified wrapped-normal score target
+        - sampling reconstructs the full reverse velocity score from it
 
-        Convention:
-        time input is in [0, 1], internally mapped to [0, 2].
-        """
+    Convention:
+        external model time is in [0, 1], while TDM internally uses [0, 2].
+    """
 
     def __init__(
         self,
@@ -242,7 +249,7 @@ class TrivialisedDiffusion(nn.Module):
 
         return f_t, v_t, epsilon_v, epsilon_r, r_t
 
-    def build_velocity_target(
+    def build_simplified_training_velocity_score(
         self,
         t: torch.Tensor,
         r_t: torch.Tensor,
@@ -250,7 +257,7 @@ class TrivialisedDiffusion(nn.Module):
         index: torch.Tensor,
     ) -> torch.Tensor:
         """
-        Build the training target for the velocity head.
+        Build the simplified training target for the velocity head.
 
         The reverse sampler needs the full KLDM velocity score, which has two
         pieces:
@@ -266,7 +273,7 @@ class TrivialisedDiffusion(nn.Module):
             - sigma_norm normalization keeps the target scale more stable across t
 
         The missing factors are restored later in
-        `build_reverse_velocity_score(...)` before reverse sampling.
+        `reconstruct_full_reverse_velocity_score(...)` before reverse sampling.
         """
         t = self.T * t
 
@@ -283,7 +290,7 @@ class TrivialisedDiffusion(nn.Module):
         #
         # We strip off the leading factor here so the network predicts the
         # simplified term only. That factor is restored in
-        # build_reverse_velocity_score(...).
+        # reconstruct_full_reverse_velocity_score(...).
         wrapped_normal_score = d_log_wrapped_normal(
             r_t=r_t,
             mu_r_t=mu_r,
@@ -314,12 +321,29 @@ class TrivialisedDiffusion(nn.Module):
     # Reverse-score helpers
     # -------------------------------------------------------------------------
 
-    def build_reverse_velocity_score(
+    def reconstruct_full_reverse_velocity_score(
         self,
         t: torch.Tensor,
         v_t: torch.Tensor,
         pred_v: torch.Tensor,
     ) -> torch.Tensor:
+        """
+        Reconstruct the full reverse velocity score used during sampling.
+
+        During training, the network predicts only the simplified wrapped-normal
+        score target from `build_simplified_training_velocity_score(...)`.
+
+        For reverse sampling, KLDM needs the full velocity score:
+
+            full score
+                = wrapped-normal contribution
+                + analytic Gaussian velocity contribution
+
+        So this function:
+            1. undoes the sigma_norm normalization
+            2. restores the KLDM prefactor on the wrapped-normal term
+            3. adds the closed-form Gaussian velocity score
+        """
 
         t = self.T * t
 
@@ -450,7 +474,7 @@ class TrivialisedDiffusion(nn.Module):
         dt_internal = torch.as_tensor(self.T * dt, device=v_t.device, dtype=v_t.dtype)
         t_next = (t_now - dt_internal).clamp_min(self.eps)
 
-        out_v = self.build_reverse_velocity_score(t=t, v_t=v_t, pred_v=pred_v)
+        out_v = self.reconstruct_full_reverse_velocity_score(t=t, v_t=v_t, pred_v=pred_v)
 
         # Closed-form Gaussian reverse coefficients for the velocity marginal.
         # This matches the appendix line:
@@ -506,7 +530,7 @@ class TrivialisedDiffusion(nn.Module):
         noise must be sampled in that same chart as well.
         """
         dt_internal = torch.as_tensor(self.T * dt, device=v_t.device, dtype=v_t.dtype)
-        out_v = self.build_reverse_velocity_score(t=t, v_t=v_t, pred_v=pred_v)
+        out_v = self.reconstruct_full_reverse_velocity_score(t=t, v_t=v_t, pred_v=pred_v)
 
         num_graphs = int(index.max().item()) + 1
 

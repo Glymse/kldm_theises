@@ -18,7 +18,7 @@ dataset:
 model:
   eps: 1.0e-6
   lattice_parameterization: eps
-  tdm_k_wn_score: 13
+  tdm_k_wn_score: 3
   tdm_n_sigmas: 2000
   tdm_compute_sigma_norm: false
   tdm_velocity_scale: 0.15915494309189535
@@ -40,4 +40,4 @@ sampling_eval:
   batch_size: 20
   num_targets: 20
   subset_seed: 123
-  samples_per_target: 10
+  samples_per_target: 20

@@ -11,7 +11,7 @@ if __package__ in {None, ""}:
 import torch
 from torch.utils.data import DataLoader, Subset
 
-from kldm.run_experiment import load_experiment_config, resolve_config_path
+from kldm.run_experiment import load_experiment_config
 
 try:
     import wandb
@@ -22,17 +22,9 @@ from kldm.utils.device import get_default_device, should_pin_memory
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Evaluate a KLDM checkpoint with @1 and @20 sampling metrics.")
-    parser.add_argument(
-        "--config",
-        required=True,
-        help="Exact path to the experiment YAML file.",
-    )
-    parser.add_argument(
-        "--checkpoint",
-        required=True,
-        help="Exact path to the checkpoint to evaluate.",
-    )
+    parser = argparse.ArgumentParser(description="Evaluate a KLDM checkpoint with sampling metrics.")
+    parser.add_argument("--config", required=True, help="Path to the experiment YAML file.")
+    parser.add_argument("--checkpoint", required=True, help="Path to the checkpoint to evaluate.")
     return parser.parse_args()
 
 
@@ -175,9 +167,10 @@ def main() -> None:
     args = parse_args()
     from kldm.utils.model_loader import build_model, load_checkpoint
 
-    config_path = resolve_config_path(args.config)
-    checkpoint_path = resolve_config_path(args.checkpoint)
-    config = load_experiment_config(config_path)
+    config_path, config = load_experiment_config(args.config)
+    checkpoint_path = Path(args.checkpoint).expanduser().resolve()
+    if not checkpoint_path.exists():
+        raise FileNotFoundError(f"Path not found: {checkpoint_path}")
 
     experiment_name = str(config.get("experiment_name") or config_path.stem)
     sampler_cfg = dict(config["sampler"])
