@@ -10,7 +10,6 @@ from .wrapped_normal import d_log_wrapped_normal
 
 ### RIGHT NOW IT IS USING MONTE CARLO ESTIMATION
 ### HOWEVER WE WILL LATEr BE IMPLEMENTING THE INTEGRAL VERSIONS OF THIS
-### AS WE CAN FIND THE ANALYTIC SOLUTION.
 
 def chunk_ranges(total_size: int, chunk_size: int) -> Iterator[tuple[int, int]]:
     """Yield [start, end) chunks."""

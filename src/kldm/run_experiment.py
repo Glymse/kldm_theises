@@ -6,6 +6,7 @@ from datetime import datetime
 import signal
 from pathlib import Path
 import sys
+import tempfile
 from typing import Any, Mapping
 
 if __package__ in {None, ""}:
@@ -28,6 +29,8 @@ WORKSPACE_ROOT = Path(__file__).resolve().parents[2]
 CHECKPOINTS_ROOT = WORKSPACE_ROOT / "artifacts" / "HPC" / "checkpoints" / "experiments"
 TIME_LOWER_BOUND = 1e-3
 STOP_REQUESTED = False
+TRAIN_SPLIT = "train"
+VAL_SPLIT = "val"
 
 
 def _request_stop(_signum=None, _frame=None) -> None:
@@ -47,12 +50,13 @@ def parse_args() -> argparse.Namespace:
 
 def load_experiment_config(config_path: str | Path) -> tuple[Path, dict[str, Any]]:
     # Load the main config once, then inline the sampler config so the rest of
-    # the runner can always read from config["sampler"].
+    # the runner can always read from config["sampler"] when a training config
+    # points to a separate sampler file.
     config_path = Path(config_path).expanduser().resolve()
     with config_path.open("r", encoding="utf-8") as handle:
         config = yaml.safe_load(handle) or {}
 
-    if "sampler" not in config:
+    if "sampler" not in config and "sampler_config" in config:
         with (config_path.parent / str(config["sampler_config"])).expanduser().resolve().open("r", encoding="utf-8") as handle:
             config["sampler"] = yaml.safe_load(handle) or {}
 
@@ -169,8 +173,8 @@ class ExperimentRunner:
         self.ema = components.ema
 
         self.start_epoch = 0
-        self.last_validation_checkpoint_path: Path | None = None
         self.run = None
+        self._last_validation_artifact = None
 
         # Optional resume path for continuing training from a saved checkpoint.
         resume_from = self.checkpoint_cfg["resume_from"]
@@ -201,10 +205,11 @@ class ExperimentRunner:
         num_workers = int(dataset_cfg["num_workers"])
         pin_memory = bool(dataset_cfg["pin_memory"])
 
-        # Training uses the full train split.
+        # Keep training/validation splits fixed so experiment metrics are always
+        # comparable across runs.
         train_loader = task.dataloader(
             root=root,
-            split="train",
+            split=TRAIN_SPLIT,
             batch_size=batch_size,
             shuffle=True,
             num_workers=num_workers,
@@ -212,8 +217,9 @@ class ExperimentRunner:
             download=True,
         )
 
-        # Validation can optionally use a fixed smaller subset for faster checks.
-        val_dataset_full = task.fit_dataset(root=root, split="val", download=True)
+        # Validation always uses the validation split, optionally with a fixed
+        # subset for faster checks.
+        val_dataset_full = task.fit_dataset(root=root, split=VAL_SPLIT, download=True)
         val_dataset = make_fixed_subset(
             val_dataset_full,
             subset_size=self.validation_cfg["subset_size"],
@@ -359,7 +365,15 @@ class ExperimentRunner:
             "num_samples": summary.get("num_samples"),
         }
 
-    def save_checkpoint(self, epoch: int, metrics: Mapping[str, float | int | None], filename: str, keep_paths: list[Path] | None = None) -> Path:
+    def save_checkpoint(
+        self,
+        epoch: int,
+        metrics: Mapping[str, float | int | None],
+        filename: str,
+        keep_paths: list[Path] | None = None,
+        *,
+        upload_to_wandb: bool = False,
+    ) -> Path:
         path = save_named_checkpoint(
             model=self.model,
             optimizer=self.optimizer,
@@ -372,10 +386,55 @@ class ExperimentRunner:
             keep_paths=keep_paths,
         )
 
-        if bool(self.logging_cfg["wandb_checkpoints"]):
+        if upload_to_wandb and bool(self.logging_cfg["wandb_checkpoints"]):
             save_wandb_checkpoint(path)
 
         return path
+
+    def save_validation_checkpoint_to_wandb(
+        self,
+        epoch: int,
+        metrics: Mapping[str, float | int | None],
+    ) -> None:
+        from kldm.utils.model_loader import save_checkpoint
+
+        if not bool(self.logging_cfg["wandb_checkpoints"]):
+            return
+
+        with tempfile.TemporaryDirectory(prefix="kldm_val_ckpt_") as temp_dir_name:
+            path = Path(temp_dir_name) / f"epoch_{epoch}.pt"
+            save_checkpoint(
+                model=self.model,
+                optimizer=self.optimizer,
+                ema=self.ema,
+                output_path=path,
+                config=self.config,
+                epoch=epoch,
+                metrics=metrics,
+            )
+            artifact = wandb.Artifact(f"{self.experiment_name}_validation", type="model")
+            artifact.add_file(str(path), name=path.name)
+            logged_artifact = self.run.log_artifact(
+                artifact,
+                aliases=["latest-validation"],
+            )
+            logged_artifact.wait()
+
+            previous_artifact = self._last_validation_artifact
+            self._last_validation_artifact = logged_artifact
+
+            if previous_artifact is not None:
+                try:
+                    previous_artifact.delete(delete_aliases=True)
+                    print(
+                        f"checkpoint_deleted=wandb previous_validation epoch={epoch}",
+                        flush=True,
+                    )
+                except Exception as exc:
+                    print(
+                        f"checkpoint_delete_warning=wandb previous_validation error={exc}",
+                        flush=True,
+                    )
 
     def validate_epoch(self, epoch: int) -> None:
         # Validation can optionally swap in EMA weights, depending on the config.
@@ -415,7 +474,7 @@ class ExperimentRunner:
             step=epoch,
         )
 
-        self.last_validation_checkpoint_path = self.save_checkpoint(epoch, merged_metrics, f"epoch_{epoch}.pt")
+        self.save_validation_checkpoint_to_wandb(epoch, merged_metrics)
 
         print(
             f"validation_epoch={epoch:04d} val_loss_weighted={merged_metrics['loss_weighted']:.6f} "
@@ -425,7 +484,8 @@ class ExperimentRunner:
             f"rmse={format_metric(merged_metrics['rmse'], '.6f')}",
             flush=True,
         )
-        print(f"checkpoint_saved={self.last_validation_checkpoint_path}", flush=True)
+        if bool(self.logging_cfg["wandb_checkpoints"]):
+            print(f"checkpoint_uploaded=wandb epoch={epoch}", flush=True)
 
     def run_training_loop(self) -> None:
         # Start one wandb run for the whole experiment.
@@ -437,6 +497,7 @@ class ExperimentRunner:
 
         print(f"run_experiment config={self.config_path}", flush=True)
         print(f"device={self.device.type} experiment={self.experiment_name}", flush=True)
+        print(f"data_splits train={TRAIN_SPLIT} val={VAL_SPLIT}", flush=True)
         print(f"sampler={self.sampler_cfg}", flush=True)
 
         epoch = self.start_epoch + 1
@@ -468,12 +529,15 @@ class ExperimentRunner:
         except KeyboardInterrupt:
             print("run_experiment interrupted", flush=True)
         finally:
-            # Always save a final checkpoint before closing the run.
+            final_epoch = max(epoch - 1, self.start_epoch)
+            final_filename = f"final_epoch_{final_epoch}.pt"
+
+            # Save exactly one local checkpoint for the experiment: the final model.
             self.save_checkpoint(
-                max(epoch - 1, self.start_epoch),
-                {"final_epoch": float(max(epoch - 1, self.start_epoch))},
-                "final.pt",
-                keep_paths=[self.last_validation_checkpoint_path] if self.last_validation_checkpoint_path is not None else None,
+                final_epoch,
+                {"final_epoch": float(final_epoch)},
+                final_filename,
+                upload_to_wandb=False,
             )
             wandb.finish()
 

@@ -1,0 +1,44 @@
+experiment_name: mp20_lattice_eps_em_eval_1850_50steps
+
+sampling:
+  checkpoint_path: artifacts/HPC/checkpoints/checkpoint_epoch_1850.pt
+  method: em
+  n_steps: 400
+  t_start: 1.0
+  t_final: 1e-3
+  n_samples: 30
+
+dataset:
+  task: csp
+  name: mp20
+  root: null
+  batch_size: 16
+  num_workers: 0
+  pin_memory: false
+
+model:
+  eps: 1.0e-6
+  lattice_parameterization: eps
+  tdm_k_wn_score: 3
+  tdm_n_sigmas: 2000
+  tdm_compute_sigma_norm: false
+  tdm_velocity_scale: 0.15915494309189535
+  score_network:
+    hidden_dim: 512
+    time_dim: 256
+    num_layers: 6
+    num_freqs: 128
+    ln: true
+    h_dim: 100
+    smooth: false
+    pred_v: true
+    pred_l: true
+    pred_h: false
+    zero_cog: true
+
+sampling_eval:
+  evaluation: false
+  split: test
+  batch_size: 8
+  num_targets: 20
+  subset_seed: 123
