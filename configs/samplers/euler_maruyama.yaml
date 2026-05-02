@@ -1,0 +1,4 @@
+method: em
+n_steps: 1000
+t_start: 1.0
+t_final: 1.0e-3

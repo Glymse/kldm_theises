@@ -248,9 +248,9 @@ class TrivialisedDiffusion(nn.Module):
 
 
         wrapped_gaussian_target = d_log_wrapped_normal(
-            r=r_t,
-            mu=wrapped_gaussian_mu_r_t,
-            sigma=wrapped_gaussian_sigma_r_t,
+            r_t=r_t,
+            mu_r_t=wrapped_gaussian_mu_r_t,
+            sigma_r_t=wrapped_gaussian_sigma_r_t,
         )
 
 

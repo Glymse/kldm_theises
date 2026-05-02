@@ -40,6 +40,10 @@ dependencies = [
   "mattersim>=1.1.2",
 ]
 
+[project.scripts]
+run_experiment = "kldm.run_experiment:main"
+run_sampling = "kldm.run_sampling:main"
+
 [dependency-groups]
 dev = [
   "ipykernel>=7.1.0",
