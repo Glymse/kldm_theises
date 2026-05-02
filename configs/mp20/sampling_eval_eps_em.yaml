@@ -37,8 +37,8 @@ model:
     zero_cog: true
 
 sampling_eval:
-  evaluation: false
+  evaluation: true
   split: test
   batch_size: 8
-  num_targets: 5
+  num_targets: 150
   subset_seed: 123
