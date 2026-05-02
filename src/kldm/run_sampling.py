@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+import random
 import sys
 import tempfile
 from typing import Any
@@ -11,6 +12,7 @@ if __package__ in {None, ""}:
 
 import torch
 from torch.utils.data import DataLoader
+import numpy as np
 
 from kldm.run_experiment import format_metric, load_experiment_config, make_fixed_subset
 from kldm.sample_evaluation import prepare_visualization_pair
@@ -38,6 +40,31 @@ def _best_of_k(results):
     return next((result for result in results if result.valid), results[0])
 
 
+def _matching_rate_at_n(details_lst: list[dict[str, list[int]]]) -> float | None:
+    if not details_lst:
+        return None
+    matches = np.array([detail["match"] for detail in details_lst], dtype=float)
+    return float(np.mean(np.sum(matches, axis=0) > 0))
+
+
+def _rmse_at_n(details_lst: list[dict[str, list[int] | list[float]]]) -> float | None:
+    if not details_lst:
+        return None
+
+    rmse_per_target = [[] for _ in range(len(details_lst[0]["match"]))]
+    for detail in details_lst:
+        rmse_idx = 0
+        for target_idx, matched in enumerate(detail["match"]):
+            if matched:
+                rmse_per_target[target_idx].append(float(detail["rmse"][rmse_idx]))
+                rmse_idx += 1
+
+    min_rmse = [min(values) for values in rmse_per_target if values]
+    if not min_rmse:
+        return None
+    return float(np.mean(min_rmse))
+
+
 class SamplingRunner:
     def __init__(self, config_path: str | Path) -> None:
         from kldm.utils.model_loader import build_model, load_checkpoint
@@ -49,7 +76,7 @@ class SamplingRunner:
         self.experiment_name = str(self.config["experiment_name"])
         self.sampling_cfg = dict(self.config["sampling"])
         self.sampling_eval_cfg = dict(self.config["sampling_eval"])
-        self.checkpoint_path = Path(self.sampling_cfg["checkpoint_path"]).expanduser().resolve()
+        self.checkpoint_path = self._resolve_checkpoint_path(self.sampling_cfg["checkpoint_path"])
         self.evaluation = bool(self.sampling_eval_cfg["evaluation"])
         self.eval_samples_per_target = 20
         self.sample_count = int(self.sampling_cfg["n_samples"])
@@ -65,6 +92,28 @@ class SamplingRunner:
             device=self.device,
             prefer_ema_weights=True,
         )
+
+    def _resolve_checkpoint_path(self, checkpoint_path: str | Path) -> Path:
+        candidate = Path(checkpoint_path).expanduser()
+        if not candidate.is_absolute():
+            candidate = (self.config_path.parent / candidate).expanduser()
+        candidate = candidate.resolve()
+
+        if candidate.exists():
+            return candidate
+
+        checkpoint_dir = candidate.parent
+        if checkpoint_dir.exists():
+            fallback = sorted(checkpoint_dir.glob("*.pt"))
+            if fallback:
+                chosen = fallback[-1].resolve()
+                print(
+                    f"checkpoint_missing={candidate} fallback_latest={chosen}",
+                    flush=True,
+                )
+                return chosen
+
+        return candidate
 
     @staticmethod
     def _material_name(index: int, result) -> str:
@@ -167,11 +216,18 @@ class SamplingRunner:
 
         return sample_fn(**sample_kwargs)
 
-    def collect_sample_results(self, samples_per_target: int) -> list[list[Any]]:
+    def collect_sample_results(self, samples_per_target: int, *, seed: int | None = None) -> list[list[Any]]:
         from kldm.sample_evaluation.sample_evaluation import evaluate_csp_reconstruction
 
         self.model.eval()
         collected = []
+
+        if seed is not None:
+            random.seed(seed)
+            np.random.seed(seed)
+            torch.manual_seed(seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(seed)
 
         for batch in self.loader:
             batch = batch.to(self.device)
@@ -202,19 +258,59 @@ class SamplingRunner:
     def evaluate_sampling(self) -> dict[str, Any]:
         from kldm.sample_evaluation.sample_evaluation import aggregate_csp_reconstruction_metrics
 
-        per_graph_results = self.collect_sample_results(self.eval_samples_per_target)
-        at_1_results = [graph_results[0] for graph_results in per_graph_results]
-        at_k_results = [_best_of_k(graph_results) for graph_results in per_graph_results]
+        per_seed_results = []
+        details = []
+
+        for seed in range(self.eval_samples_per_target):
+            per_graph_results = self.collect_sample_results(1, seed=seed)
+            at_1_results = [graph_results[0] for graph_results in per_graph_results]
+            summary = aggregate_csp_reconstruction_metrics(at_1_results)
+            per_seed_results.append(
+                {
+                    "seed": seed,
+                    "summary": summary,
+                    "results": at_1_results,
+                }
+            )
+            details.append(
+                {
+                    "match": [int(result.match) for result in at_1_results],
+                    "rmse": [float(result.rmse) for result in at_1_results if result.rmse is not None],
+                }
+            )
+
+        valid_values = [seed_result["summary"]["valid"] for seed_result in per_seed_results if seed_result["summary"]["valid"] is not None]
+        match_values = [seed_result["summary"]["match_rate"] for seed_result in per_seed_results if seed_result["summary"]["match_rate"] is not None]
+        rmse_values = [seed_result["summary"]["rmse"] for seed_result in per_seed_results if seed_result["summary"]["rmse"] is not None]
+
+        first_results = per_seed_results[0]["results"] if per_seed_results else []
+        best_results = []
+        if per_seed_results:
+            num_targets = len(per_seed_results[0]["results"])
+            for target_idx in range(num_targets):
+                target_results = [seed_result["results"][target_idx] for seed_result in per_seed_results]
+                best_results.append(_best_of_k(target_results))
 
         return {
-            "at_1_summary": aggregate_csp_reconstruction_metrics(at_1_results),
-            "at_k_summary": aggregate_csp_reconstruction_metrics(at_k_results),
-            "at_1_results": at_1_results,
-            "at_k_results": at_k_results,
-            "at_1_rmses": [result.rmse for result in at_1_results if result.rmse is not None],
-            "at_k_rmses": [result.rmse for result in at_k_results if result.rmse is not None],
-            "at_1_matches": [int(result.match) for result in at_1_results],
-            "at_k_matches": [int(result.match) for result in at_k_results],
+            "at_1_summary": {
+                "valid_mean": None if not valid_values else float(np.mean(valid_values)),
+                "valid_std": None if not valid_values else float(np.std(valid_values)),
+                "match_rate_mean": None if not match_values else float(np.mean(match_values)),
+                "match_rate_std": None if not match_values else float(np.std(match_values)),
+                "rmse_mean": None if not rmse_values else float(np.mean(rmse_values)),
+                "rmse_std": None if not rmse_values else float(np.std(rmse_values)),
+            },
+            "at_k_summary": {
+                "match_rate": _matching_rate_at_n(details),
+                "rmse": _rmse_at_n(details),
+            },
+            "at_1_results": first_results,
+            "at_k_results": best_results,
+            "at_1_rmses": rmse_values,
+            "at_k_rmses": [result.rmse for result in best_results if result.rmse is not None],
+            "at_1_matches": details[0]["match"] if details else [],
+            "at_k_matches": [int(result.match) for result in best_results],
+            "details": details,
         }
 
     def log_eval_structures(self, summary: dict[str, Any], temp_dir: Path) -> None:
@@ -352,11 +448,13 @@ class SamplingRunner:
                 at_k = summary["at_k_summary"]
 
                 log_data = {
-                    "@1/valid": at_1["valid"],
-                    "@1/match_rate": at_1["match_rate"],
-                    "@1/rmse": at_1["rmse"],
+                    "@1/valid_mean": at_1["valid_mean"],
+                    "@1/valid_std": at_1["valid_std"],
+                    "@1/match_rate_mean": at_1["match_rate_mean"],
+                    "@1/match_rate_std": at_1["match_rate_std"],
+                    "@1/rmse_mean": at_1["rmse_mean"],
+                    "@1/rmse_std": at_1["rmse_std"],
                     "@1/match_hist": wandb.Histogram(summary["at_1_matches"]),
-                    "@20/valid": at_k["valid"],
                     "@20/match_rate": at_k["match_rate"],
                     "@20/rmse": at_k["rmse"],
                     "@20/match_hist": wandb.Histogram(summary["at_k_matches"]),
@@ -370,14 +468,16 @@ class SamplingRunner:
                 wandb.log(log_data)
 
                 print(
-                    f"@1 valid={format_metric(at_1['valid'], '.4f')} "
-                    f"match_rate={format_metric(at_1['match_rate'], '.4f')} "
-                    f"rmse={format_metric(at_1['rmse'], '.6f')}",
+                    f"@1 valid_mean={format_metric(at_1['valid_mean'], '.4f')} "
+                    f"valid_std={format_metric(at_1['valid_std'], '.4f')} "
+                    f"match_rate_mean={format_metric(at_1['match_rate_mean'], '.4f')} "
+                    f"match_rate_std={format_metric(at_1['match_rate_std'], '.4f')} "
+                    f"rmse_mean={format_metric(at_1['rmse_mean'], '.6f')} "
+                    f"rmse_std={format_metric(at_1['rmse_std'], '.6f')}",
                     flush=True,
                 )
                 print(
-                    f"@20 valid={format_metric(at_k['valid'], '.4f')} "
-                    f"match_rate={format_metric(at_k['match_rate'], '.4f')} "
+                    f"@20 match_rate={format_metric(at_k['match_rate'], '.4f')} "
                     f"rmse={format_metric(at_k['rmse'], '.6f')}",
                     flush=True,
                 )
