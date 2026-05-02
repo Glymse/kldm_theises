@@ -33,21 +33,18 @@ if [ -f "$HOME/.wandb_env" ]; then
 fi
 
 ENTRYPOINT="${KLDM_ENTRYPOINT:-src/kldm/run_sampling.py}"
-CONFIG_PATH="${KLDM_CONFIG:-configs/mp20/tmp_eval_checkpoint_1850_em_50.yaml}"
-CHECKPOINT_PATH="${KLDM_CHECKPOINT:-artifacts/HPC/checkpoints/checkpoint_epoch_1850.pt}"
+CONFIG_PATH="${KLDM_CONFIG:-configs/mp20/sampling_eval_eps_em.yaml}"
 
 date
 hostname
 pwd
 echo "entrypoint=$ENTRYPOINT"
 echo "config=$CONFIG_PATH"
-echo "checkpoint=$CHECKPOINT_PATH"
 nvidia-smi || true
 
 CMD=(
   uv run --locked --python 3.11 python "$ENTRYPOINT"
   --config "$CONFIG_PATH"
-  --checkpoint "$CHECKPOINT_PATH"
 )
 
 printf 'command:'
