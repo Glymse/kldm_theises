@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -10,13 +9,7 @@ from kldm.kldm import ModelKLDM
 from kldm.utils.ema import EMA
 
 
-@dataclass
-class TrainingComponents:
-    model: ModelKLDM
-    optimizer: torch.optim.Optimizer
-    ema: EMA | None
-
-
+#Read the config files.
 def _section(config: dict[str, Any], name: str) -> dict[str, Any]:
     value = config.get(name, {}) or {}
     if not isinstance(value, dict):
@@ -69,53 +62,26 @@ def build_ema(model: ModelKLDM, config: dict[str, Any]) -> EMA | None:
     )
 
 
-def build_training_components(config: dict[str, Any], device: torch.device) -> TrainingComponents:
+def build_training_components(
+    config: dict[str, Any],
+    device: torch.device,
+) -> tuple[ModelKLDM, torch.optim.Optimizer, EMA | None]:
     model = build_model(config=config, device=device)
-    return TrainingComponents(
-        model=model,
-        optimizer=build_optimizer(model=model, config=config),
-        ema=build_ema(model=model, config=config),
+    return (
+        model,
+        build_optimizer(model=model, config=config),
+        build_ema(model=model, config=config),
     )
 
 
-def _plain_model_state(state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-    cleaned: dict[str, torch.Tensor] = {}
-    for key, value in state_dict.items():
-        if key.startswith("ema_model.module."):
-            key = key.removeprefix("ema_model.module.")
-        elif key.startswith("module."):
-            key = key.removeprefix("module.")
-        if not key.startswith("_cached_sampling_model"):
-            cleaned[key] = value
-    return cleaned
-
-
-def _ema_weights(checkpoint: dict[str, Any]) -> dict[str, torch.Tensor] | None:
-    ema_state = checkpoint.get("ema_state_dict")
-    if checkpoint.get("ema_model_state_dict") is not None and not isinstance(ema_state, dict):
-        return dict(checkpoint["ema_model_state_dict"])
-
-    if not isinstance(ema_state, dict):
+def _ema_model_state(ema_state: dict[str, torch.Tensor] | None) -> dict[str, torch.Tensor] | None:
+    if ema_state is None:
         return None
-
-    num_updates = ema_state.get("ema_model.n_averaged", ema_state.get("num_updates", 0))
-    if isinstance(num_updates, torch.Tensor):
-        num_updates = int(num_updates.item())
-    if int(num_updates) <= 0:
-        return None
-
-    if checkpoint.get("ema_model_state_dict") is not None:
-        return dict(checkpoint["ema_model_state_dict"])
-
-    if "shadow" in ema_state:
-        return dict(ema_state["shadow"])
-
-    weights = {
+    return {
         key.removeprefix("ema_model.module."): value
         for key, value in ema_state.items()
         if key.startswith("ema_model.module.")
-    }
-    return weights or None
+    } or None
 
 
 def load_checkpoint(
@@ -131,19 +97,14 @@ def load_checkpoint(
 
     model_state = checkpoint["model_state_dict"]
     if prefer_ema_weights:
-        model_state = _ema_weights(checkpoint) or model_state
-    model.load_state_dict(_plain_model_state(model_state), strict=False)
+        model_state = _ema_model_state(checkpoint.get("ema_state_dict")) or model_state
+    model.load_state_dict(model_state, strict=False)
 
     if optimizer is not None and checkpoint.get("optimizer_state_dict") is not None:
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
 
     if ema is not None and checkpoint.get("ema_state_dict") is not None:
-        ema_state = checkpoint["ema_state_dict"]
-        if isinstance(ema_state, dict) and "shadow" in ema_state:
-            ema.ema_model.module.load_state_dict(_plain_model_state(ema_state["shadow"]), strict=False)
-            ema.ema_model.n_averaged.fill_(int(ema_state.get("num_updates", 0)))
-        else:
-            ema.load_state_dict(ema_state, strict=False)
+        ema.load_state_dict(checkpoint["ema_state_dict"], strict=False)
 
     return checkpoint
 

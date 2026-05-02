@@ -90,14 +90,12 @@ class SamplingRunner:
     def _render_structure_pair(
         self,
         *,
-        predicted,
-        target,
+        predicted_vis,
+        target_vis,
         png_path: Path,
     ) -> None:
         from ase.visualize.plot import plot_atoms
         import matplotlib.pyplot as plt
-
-        predicted_vis, target_vis = prepare_visualization_pair(predicted, target)
 
         predicted_atoms = self._prepare_ase_atoms(predicted_vis)
         target_atoms = self._prepare_ase_atoms(target_vis)
@@ -235,8 +233,8 @@ class SamplingRunner:
             predicted_vis.to(fmt="cif", filename=str(pred_cif_path))
             target_vis.to(fmt="cif", filename=str(target_cif_path))
             self._render_structure_pair(
-                predicted=predicted,
-                target=target,
+                predicted_vis=predicted_vis,
+                target_vis=target_vis,
                 png_path=png_path,
             )
 
@@ -276,8 +274,8 @@ class SamplingRunner:
             predicted_vis.to(fmt="cif", filename=str(pred_cif_path))
             target_vis.to(fmt="cif", filename=str(target_cif_path))
             self._render_structure_pair(
-                predicted=result.predicted_structure,
-                target=result.target_structure,
+                predicted_vis=predicted_vis,
+                target_vis=target_vis,
                 png_path=png_path,
             )
 

@@ -1,3 +1,7 @@
+# We use ruff
+# To format our code!!!
+# Remember to write this in paper if relevant.
+
 from __future__ import annotations
 
 import sys

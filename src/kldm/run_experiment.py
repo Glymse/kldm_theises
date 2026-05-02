@@ -96,11 +96,8 @@ def format_metric(value: float | int | None, fmt: str) -> str:
 
 
 def checkpoint_dir(config: dict[str, Any], experiment_name: str) -> Path:
-    checkpoint_cfg = dict(config["checkpoint"])
-    root = checkpoint_cfg["dir"]
-    if root is None:
-        return CHECKPOINTS_ROOT / experiment_name
-    return Path(str(root)).expanduser()
+    del config
+    return CHECKPOINTS_ROOT / experiment_name
 
 
 def save_named_checkpoint(
@@ -167,10 +164,10 @@ class ExperimentRunner:
         self.device = get_default_device()
         self.train_loader, self.val_loader, self.lattice_transform = self.create_loaders()
 
-        components = build_training_components(config=self.config, device=self.device)
-        self.model = components.model
-        self.optimizer = components.optimizer
-        self.ema = components.ema
+        self.model, self.optimizer, self.ema = build_training_components(
+            config=self.config,
+            device=self.device,
+        )
 
         self.start_epoch = 0
         self.run = None
@@ -489,10 +486,19 @@ class ExperimentRunner:
 
     def run_training_loop(self) -> None:
         # Start one wandb run for the whole experiment.
+        wandb_resume_id = self.checkpoint_cfg.get("wandb_resume_id")
+        init_kwargs = {
+            "project": self.experiment_name,
+            "config": self.config | {"start_epoch": self.start_epoch},
+        }
+        if wandb_resume_id:
+            init_kwargs["id"] = str(wandb_resume_id)
+            init_kwargs["resume"] = "must"
+        else:
+            init_kwargs["name"] = build_run_name()
+
         self.run = wandb.init(
-            project=self.experiment_name,
-            name=build_run_name(),
-            config=self.config | {"start_epoch": self.start_epoch},
+            **init_kwargs,
         )
 
         print(f"run_experiment config={self.config_path}", flush=True)
@@ -530,7 +536,7 @@ class ExperimentRunner:
             print("run_experiment interrupted", flush=True)
         finally:
             final_epoch = max(epoch - 1, self.start_epoch)
-            final_filename = f"final_epoch_{final_epoch}.pt"
+            final_filename = f"{self.experiment_name}_epoch_{final_epoch}.pt"
 
             # Save exactly one local checkpoint for the experiment: the final model.
             self.save_checkpoint(

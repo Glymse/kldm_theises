@@ -5,7 +5,7 @@ dataset:
   task: csp
   name: mp20
   root: null
-  batch_size: 256
+  batch_size: 8 #256
   num_workers: 1
   pin_memory: true
 
@@ -52,8 +52,8 @@ validation:
   sampling_max_graphs: 1024
 
 checkpoint:
-  dir: null
-  resume_from: null
+  resume_from: null #../../artifacts/HPC/checkpoints/experiments/mp20_lattice_eps_em/mp20_lattice_eps_em_final.pt
+  wandb_resume_id: null #utrhzdr8  # Set to an old W&B run id, e.g. w41cll5b, to continue logging on the same run graph.
 
 sampling_eval:
   split: test

@@ -1,0 +1,57 @@
+#!/bin/bash
+set -euo pipefail
+
+#BSUB -J kldm_mp20_eps_em_sample
+#BSUB -q gpuv100
+#BSUB -n 4
+#BSUB -R "span[hosts=1]"
+#BSUB -gpu "num=1:mode=exclusive_process"
+#BSUB -R "rusage[mem=8GB]"
+#BSUB -W 24:00
+#BSUB -o logs/sample_%J.out
+#BSUB -e logs/sample_%J.err
+
+REPO_ROOT="${LS_SUBCWD:-${LSB_SUBCWD:-$(pwd)}}"
+cd "$REPO_ROOT"
+
+mkdir -p \
+  logs \
+  artifacts/HPC
+
+module load python3/3.11.13
+
+export PATH="$HOME/.local/bin:$PATH"
+export PYTHONUNBUFFERED=1
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export CUDA_LAUNCH_BLOCKING=0
+export WANDB__SERVICE_WAIT=300
+export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
+
+if [ -f "$HOME/.wandb_env" ]; then
+  source "$HOME/.wandb_env"
+fi
+
+ENTRYPOINT="${KLDM_ENTRYPOINT:-src/kldm/run_sampling.py}"
+CONFIG_PATH="${KLDM_CONFIG:-configs/mp20/tmp_eval_checkpoint_1850_em_50.yaml}"
+CHECKPOINT_PATH="${KLDM_CHECKPOINT:-artifacts/HPC/checkpoints/checkpoint_epoch_1850.pt}"
+
+date
+hostname
+pwd
+echo "entrypoint=$ENTRYPOINT"
+echo "config=$CONFIG_PATH"
+echo "checkpoint=$CHECKPOINT_PATH"
+nvidia-smi || true
+
+CMD=(
+  uv run --locked --python 3.11 python "$ENTRYPOINT"
+  --config "$CONFIG_PATH"
+  --checkpoint "$CHECKPOINT_PATH"
+)
+
+printf 'command:'
+printf ' %q' "${CMD[@]}"
+printf '\n'
+
+"${CMD[@]}"

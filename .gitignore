@@ -5,6 +5,10 @@ src/facitKLDM
 wandb
 artifacts/*
 møde.txt
+
+/workspace/src/kldm/trainHPC.py
+/workspace/src/kldm/diffusionModels/TDMdev.py
+/workspace/src/kldm/diffusionModels/trivialized_diffusion.py
 # test cache
 manual_test/
 

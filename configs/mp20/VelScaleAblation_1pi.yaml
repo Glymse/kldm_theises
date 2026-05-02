@@ -5,7 +5,7 @@ dataset:
   task: csp
   name: mp20
   root: null
-  batch_size: 256
+  batch_size: 8
   num_workers: 1
   pin_memory: true
 
@@ -52,8 +52,8 @@ validation:
   sampling_max_graphs: 1024
 
 checkpoint:
-  dir: null
   resume_from: null
+  wandb_resume_id: null # Set to an old W&B run id, e.g. w41cll5b, to continue logging on the same run graph.
 
 sampling_eval:
   split: test

@@ -53,8 +53,8 @@ validation:
   sampling_max_graphs: 1024
 
 checkpoint:
-  dir: null
   resume_from: null
+  wandb_resume_id: null # Set to an old W&B run id, e.g. w41cll5b, to continue logging on the same run graph.
 
 sampling_eval:
   split: test

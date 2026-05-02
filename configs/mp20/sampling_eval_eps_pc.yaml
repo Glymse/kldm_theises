@@ -1,12 +1,12 @@
-experiment_name: mp20_lattice_eps_pc_eval_1850_50steps
+experiment_name: mp20_lattice_eps_pc_eval
 
 sampling:
-  checkpoint_path: artifacts/HPC/checkpoints/checkpoint_epoch_1850.pt
+  checkpoint_path: artifacts/HPC/checkpoints/mp20_lattice_eps_em_epoch_3200.pt
   method: pc
-  n_steps: 300
+  n_steps: 500
   t_start: 1.0
   t_final: 1e-3
-  n_samples: 5
+  n_samples: 3
   tau: 0.15
   n_correction_steps: 1
 
@@ -42,5 +42,5 @@ sampling_eval:
   evaluation: false
   split: test
   batch_size: 8
-  num_targets: 20
+  num_targets: 5
   subset_seed: 123
