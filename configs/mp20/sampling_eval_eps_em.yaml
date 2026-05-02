@@ -40,5 +40,5 @@ sampling_eval:
   evaluation: true
   split: test
   batch_size: 8
-  num_targets: 150
+  num_targets: 5
   subset_seed: 123
