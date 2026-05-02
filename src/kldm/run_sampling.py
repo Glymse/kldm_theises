@@ -229,9 +229,22 @@ class SamplingRunner:
             if torch.cuda.is_available():
                 torch.cuda.manual_seed_all(seed)
 
-        for batch in self.loader:
+        if self.evaluation:
+            print(
+                f"eval_seed={seed} sampling_pass_start samples_per_target={samples_per_target}",
+                flush=True,
+            )
+
+        total_batches = len(self.loader)
+        for batch_idx, batch in enumerate(self.loader, start=1):
             batch = batch.to(self.device)
             per_graph_results = [[] for _ in range(batch.num_graphs)]
+
+            if self.evaluation:
+                print(
+                    f"eval_seed={seed} batch={batch_idx}/{total_batches} graphs_in_batch={batch.num_graphs}",
+                    flush=True,
+                )
 
             for _ in range(samples_per_target):
                 with torch.no_grad():
@@ -253,6 +266,12 @@ class SamplingRunner:
 
             collected.extend(per_graph_results)
 
+        if self.evaluation:
+            print(
+                f"eval_seed={seed} sampling_pass_done targets={len(collected)}",
+                flush=True,
+            )
+
         return collected
 
     def evaluate_sampling(self) -> dict[str, Any]:
@@ -262,9 +281,20 @@ class SamplingRunner:
         details = []
 
         for seed in range(self.eval_samples_per_target):
+            print(
+                f"evaluation_progress seed={seed + 1}/{self.eval_samples_per_target}",
+                flush=True,
+            )
             per_graph_results = self.collect_sample_results(1, seed=seed)
             at_1_results = [graph_results[0] for graph_results in per_graph_results]
             summary = aggregate_csp_reconstruction_metrics(at_1_results)
+            print(
+                f"evaluation_seed_summary seed={seed} "
+                f"valid={format_metric(summary['valid'], '.4f')} "
+                f"match_rate={format_metric(summary['match_rate'], '.4f')} "
+                f"rmse={format_metric(summary['rmse'], '.6f')}",
+                flush=True,
+            )
             per_seed_results.append(
                 {
                     "seed": seed,
