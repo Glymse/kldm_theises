@@ -32,7 +32,7 @@ class ModelKLDM(nn.Module):
         self,
         device: torch.device | None = None,
         eps: float = 1e-6,
-        tdm_k_wn_score: int = 3,
+        wrapped_normal_K: int = 3,
         tdm_n_sigmas: int | None = None,
         tdm_compute_sigma_norm: bool = True,
         tdm_velocity_scale: float | None = None,
@@ -49,7 +49,7 @@ class ModelKLDM(nn.Module):
 
         self.tdm = TDM(
             eps=eps,
-            k_wn_score=tdm_k_wn_score,
+            wrapped_normal_K=wrapped_normal_K,
             n_sigmas=(2000 if self.device.type == "cuda" else 512) if tdm_n_sigmas is None else int(tdm_n_sigmas),
             compute_sigma_norm=tdm_compute_sigma_norm,
             velocity_scale=tdm_velocity_scale,

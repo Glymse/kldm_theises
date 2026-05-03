@@ -19,7 +19,7 @@ dataset:
 model:
   eps: 1.0e-6
   lattice_parameterization: eps
-  tdm_k_wn_score: 3
+  wrapped_normal_K: 3
   tdm_n_sigmas: 2000
   tdm_compute_sigma_norm: false
   tdm_velocity_scale: 0.15915494309189535
