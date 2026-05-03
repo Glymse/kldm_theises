@@ -35,12 +35,14 @@ if [ -f "$HOME/.wandb_env" ]; then
 fi
 
 ENTRYPOINT="${KLDM_ENTRYPOINT:-src/kldm/run_experiment.py}"
-CONFIG_PATH="${KLDM_CONFIG:-configs/mp20/mp20_lattice_eps_em.yaml}"
+CONFIG_NAME="${KLDM_CONFIG_NAME:-mp20_lattice_eps_em}"
+CONFIG_PATH="${KLDM_CONFIG:-configs/mp20/${CONFIG_NAME}.yaml}"
 
 date
 hostname
 pwd
 echo "entrypoint=$ENTRYPOINT"
+echo "config_name=$CONFIG_NAME"
 echo "config=$CONFIG_PATH"
 nvidia-smi || true
 
