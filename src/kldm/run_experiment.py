@@ -117,6 +117,8 @@ def save_named_checkpoint(
     output_dir = checkpoint_dir(config=config, experiment_name=experiment_name)
     output_dir.mkdir(parents=True, exist_ok=True)
     output_path = output_dir / filename
+    if output_path.exists():
+        output_path.unlink()
     save_checkpoint(
         model=model,
         optimizer=optimizer,
