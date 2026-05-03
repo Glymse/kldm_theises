@@ -1,7 +1,10 @@
 #!/bin/bash
 set -euo pipefail
 
-#BSUB -J kldm_mp20_eps_em
+# Default job name matches the default config name below.
+# Override per run with e.g.:
+#   KLDM_CONFIG_NAME=mp20_lattice_x0_pc bsub -J mp20_lattice_x0_pc < train.lsf
+#BSUB -J mp20_lattice_eps_em
 #BSUB -q gpuv100
 #BSUB -n 4
 #BSUB -R "span[hosts=1]"
