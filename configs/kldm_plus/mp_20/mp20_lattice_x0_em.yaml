@@ -1,4 +1,4 @@
-experiment_name: kldm_plus_mp20_lattice_x0_em
+experiment_name: plus_mp20_lattice_x0_em
 sampler_config: ../../samplers/euler_maruyama.yaml
 
 dataset:

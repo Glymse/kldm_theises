@@ -87,6 +87,25 @@ else
   ENTRYPOINT="$KLDM_ENTRYPOINT"
 fi
 
+case "$CONFIG_PATH" in
+  configs/kldm_plus/*)
+    if [ "$ENTRYPOINT" != "src/kldmPlus/run_experiment.py" ]; then
+      echo "error: KLDM+ config requires KLDM+ entrypoint." >&2
+      echo "config=$CONFIG_PATH" >&2
+      echo "entrypoint=$ENTRYPOINT" >&2
+      exit 1
+    fi
+    ;;
+  configs/mp20/*)
+    if [ "$ENTRYPOINT" != "src/kldm/run_experiment.py" ]; then
+      echo "error: base KLDM config requires base KLDM entrypoint." >&2
+      echo "config=$CONFIG_PATH" >&2
+      echo "entrypoint=$ENTRYPOINT" >&2
+      exit 1
+    fi
+    ;;
+esac
+
 date
 hostname
 pwd

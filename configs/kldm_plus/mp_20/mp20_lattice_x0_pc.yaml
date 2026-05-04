@@ -1,4 +1,4 @@
-experiment_name: kldm_plus_mp20_lattice_x0_pc
+experiment_name: plus_mp20_lattice_x0_pc
 sampler_config: ../../samplers/predictor_corrector.yaml
 
 dataset:
