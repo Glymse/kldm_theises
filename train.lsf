@@ -34,6 +34,31 @@ export CUDA_LAUNCH_BLOCKING=0
 export WANDB__SERVICE_WAIT=300
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
 
+export TMPDIR="${TMPDIR:-/tmp/$USER/${LSB_JOBID:-kldm_train}}"
+mkdir -p "$TMPDIR"
+
+# Keep caches and staging files off $HOME. W&B still needs local temp files,
+# but putting them on node-local scratch prevents home-directory buildup.
+export XDG_CACHE_HOME="$TMPDIR/.cache"
+export XDG_DATA_HOME="$TMPDIR/.local/share"
+export UV_CACHE_DIR="$TMPDIR/uv_cache"
+export WANDB_CACHE_DIR="$TMPDIR/wandb_cache"
+export WANDB_DATA_DIR="$TMPDIR/wandb_data"
+export WANDB_ARTIFACT_DIR="$TMPDIR/wandb_artifacts"
+export WANDB_DIR="$TMPDIR/wandb_runs"
+
+cleanup_job_cache() {
+  rm -rf \
+    "$UV_CACHE_DIR" \
+    "$WANDB_CACHE_DIR" \
+    "$WANDB_DATA_DIR" \
+    "$WANDB_ARTIFACT_DIR" \
+    "$WANDB_DIR" \
+    "$XDG_CACHE_HOME" \
+    "$XDG_DATA_HOME"
+}
+trap cleanup_job_cache EXIT
+
 if [ -f "$HOME/.wandb_env" ]; then
   source "$HOME/.wandb_env"
 fi
@@ -55,6 +80,7 @@ pwd
 echo "entrypoint=$ENTRYPOINT"
 echo "config_name=$CONFIG_NAME"
 echo "config=$CONFIG_PATH"
+echo "tmpdir=$TMPDIR"
 echo "config_preview:"
 grep -E '^(experiment_name:|sampler_config:|  lattice_parameterization:|  wrapped_normal_K:|  tdm_velocity_scale:|  batch_size:)' "$CONFIG_PATH" || true
 nvidia-smi || true
