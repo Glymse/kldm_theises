@@ -50,7 +50,7 @@ class TrivialisedDiffusion(nn.Module):
     def __init__(
         self,
         eps: float = 1e-6,
-        k_wn_score: int = 13,
+        wrapped_normal_K: int = 3,
         n_sigmas: int = 2000,
         compute_sigma_norm: bool = True,
         velocity_scale: float | None = None,
@@ -60,12 +60,12 @@ class TrivialisedDiffusion(nn.Module):
         self.eps = float(eps)
         self.T = 2.0
         self.vel_scale = float(1.0 / (2.0 * math.pi) if velocity_scale is None else velocity_scale)
-        self.k_wn_score = int(k_wn_score)
+        self.wrapped_normal_K = int(wrapped_normal_K)
         self.compute_sigma_norm = bool(compute_sigma_norm)
 
         if self.compute_sigma_norm:
             sigma_grid = self.wrapped_gaussian_sigma_r_t(torch.linspace(0.0, self.T, int(n_sigmas)))
-            sigma_norm_values = WrappedNormalSigmaNorm(K=self.k_wn_score, eps=self.eps)(sigma_grid)
+            sigma_norm_values = WrappedNormalSigmaNorm(K=self.wrapped_normal_K, eps=self.eps)(sigma_grid)
         else:
             sigma_norm_values = torch.ones(int(n_sigmas), dtype=torch.get_default_dtype())
 
@@ -295,7 +295,7 @@ class TrivialisedDiffusion(nn.Module):
             r_t=r_t,
             mu_r_t=mu_r,
             sigma_r_t=sigma_r,
-            K=self.k_wn_score,
+            K=self.wrapped_normal_K,
             eps=self.eps,
         )
         target = self.match_dims((1.0 - torch.exp(-t)) / (1.0 + torch.exp(-t)), r_t) * wrapped_normal_score

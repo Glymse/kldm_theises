@@ -3,7 +3,7 @@ experiment_name: mp20_lattice_eps_pc_eval
 sampling:
   checkpoint_path: ~/kldm_baseline/kldm_theises/artifacts/HPC/checkpoints/experiments/mp20_lattice_eps_em/epoch_3600.pt
   method: pc
-  n_steps: 1000
+  n_steps: 300
   t_start: 1.0
   t_final: 1e-3
   n_samples: 100
@@ -21,7 +21,7 @@ dataset:
 model:
   eps: 1.0e-6
   lattice_parameterization: eps
-  tdm_k_wn_score: 3
+  wrapped_normal_K: 3
   tdm_n_sigmas: 2000
   tdm_compute_sigma_norm: false
   tdm_velocity_scale: 0.15915494309189535
@@ -42,5 +42,5 @@ sampling_eval:
   evaluation: true
   split: test
   batch_size: 8
-  num_targets: -1
+  num_targets: 7236
   subset_seed: 123

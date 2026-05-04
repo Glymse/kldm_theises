@@ -30,7 +30,7 @@ def build_model(config: dict[str, Any], device: torch.device) -> ModelKLDM:
     return ModelKLDM(
         device=device,
         eps=float(cfg.get("eps", 1e-6)),
-        tdm_k_wn_score=int(cfg.get("tdm_k_wn_score", 13)),
+        wrapped_normal_K=int(cfg.get("wrapped_normal_K", 13)),
         tdm_n_sigmas=int(n_sigmas),
         tdm_compute_sigma_norm=bool(cfg.get("tdm_compute_sigma_norm", True)),
         tdm_velocity_scale=cfg.get("tdm_velocity_scale"),
