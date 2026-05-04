@@ -63,15 +63,28 @@ if [ -f "$HOME/.wandb_env" ]; then
   source "$HOME/.wandb_env"
 fi
 
-ENTRYPOINT="${KLDM_ENTRYPOINT:-src/kldm/run_experiment.py}"
 # Follow the submitted LSF job name by default so one submit flag controls both
 # the queue label and the selected config file.
 CONFIG_NAME="${LSB_JOBNAME:-${KLDM_CONFIG_NAME:-mp20_lattice_eps_em}}"
-CONFIG_PATH="${KLDM_CONFIG:-configs/mp20/${CONFIG_NAME}.yaml}"
+CONFIG_DIR="${KLDM_CONFIG_DIR:-configs/mp20}"
+CONFIG_PATH="${KLDM_CONFIG:-${CONFIG_DIR}/${CONFIG_NAME}.yaml}"
 
 if [ ! -f "$CONFIG_PATH" ]; then
   echo "error: config file not found: $CONFIG_PATH" >&2
   exit 1
+fi
+
+if [ -z "${KLDM_ENTRYPOINT:-}" ]; then
+  case "$CONFIG_PATH" in
+    configs/kldm_plus/*)
+      ENTRYPOINT="src/kldmPlus/run_experiment.py"
+      ;;
+    *)
+      ENTRYPOINT="src/kldm/run_experiment.py"
+      ;;
+  esac
+else
+  ENTRYPOINT="$KLDM_ENTRYPOINT"
 fi
 
 date
@@ -82,7 +95,7 @@ echo "config_name=$CONFIG_NAME"
 echo "config=$CONFIG_PATH"
 echo "tmpdir=$TMPDIR"
 echo "config_preview:"
-grep -E '^(experiment_name:|sampler_config:|  lattice_parameterization:|  wrapped_normal_K:|  tdm_velocity_scale:|  batch_size:)' "$CONFIG_PATH" || true
+grep -E '^(experiment_name:|sampler_config:|  lattice_parameterization:|  wrapped_normal_K:|  tdm_velocity_scale:|  tdm_sigma_norm_estimator:|  tdm_centered_sigma_norm_correction:|  batch_size:)' "$CONFIG_PATH" || true
 nvidia-smi || true
 
 CMD=(

@@ -38,6 +38,7 @@ def build_model(config: dict[str, Any], device: torch.device) -> ModelKLDM:
         tdm_sigma_norm_density_K=cfg.get("tdm_sigma_norm_density_K"),
         tdm_sigma_norm_grid_points=int(cfg.get("tdm_sigma_norm_grid_points", 4096)),
         tdm_sigma_norm_mc_samples=int(cfg.get("tdm_sigma_norm_mc_samples", 20000)),
+        tdm_centered_sigma_norm_correction=bool(cfg.get("tdm_centered_sigma_norm_correction", False)),
         lattice_parameterization=str(cfg.get("lattice_parameterization", "eps")),
         score_network_kwargs=score_network,
     ).to(device)

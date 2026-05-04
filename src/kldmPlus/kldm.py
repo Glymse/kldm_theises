@@ -40,6 +40,7 @@ class ModelKLDM(nn.Module):
         tdm_sigma_norm_density_K: int | None = None,
         tdm_sigma_norm_grid_points: int = 4096,
         tdm_sigma_norm_mc_samples: int = 20000,
+        tdm_centered_sigma_norm_correction: bool = False,
         lattice_parameterization: str = "eps",
         *,
         score_network_kwargs: dict[str, Any],
@@ -61,6 +62,7 @@ class ModelKLDM(nn.Module):
             sigma_norm_density_K=tdm_sigma_norm_density_K,
             sigma_norm_grid_points=tdm_sigma_norm_grid_points,
             sigma_norm_mc_samples=tdm_sigma_norm_mc_samples,
+            centered_sigma_norm_correction=tdm_centered_sigma_norm_correction,
         )
         self.diffusion_l = ContinuousVPDiffusion(
             eps=eps,
@@ -229,6 +231,7 @@ class ModelKLDM(nn.Module):
                     t=times.now.nodes,
                     v_t=state["v_t"],
                     pred_v=preds_curr["v"],
+                    index=state["node_index"],
                 )
 
                 # Algorithm 3 update for (f_t, v_t): one exponential-Euler step.
@@ -312,6 +315,7 @@ class ModelKLDM(nn.Module):
                     f_t=state["f_t"],
                     v_t=state["v_t"],
                     pred_v=preds_curr["v"],
+                    index=state["node_index"],
                     dt=times.dt,
                 )
 
