@@ -81,9 +81,10 @@ def decode_lattice(
     n_atoms: int,
     lattice_transform: ContinuousIntervalLattice | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    del n_atoms
+    # Forward the graph size so x0 lattice decode can choose the right stats.
     lengths, angles = _lattice_transform(lattice_transform).invert_to_lengths_angles(
-        l=_row_tensor(l)
+        l=_row_tensor(l),
+        num_atoms=n_atoms,
     )
     return lengths.squeeze(0), torch.rad2deg(angles.squeeze(0))
 
