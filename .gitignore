@@ -192,3 +192,5 @@ cython_debug/
 src/kldm/diffusionModels/TDMdev.py
 src/kldm/utils/pdf_reader.py
 tests/test_run_experiment.py
+src/kldmPlus/todo.txt
+src/kldm/diffusionModels/TDMdev.py
