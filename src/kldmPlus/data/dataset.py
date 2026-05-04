@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from pathlib import Path
-import shutil
 
 import requests
 from mattergen.common.data.chemgraph import ChemGraph
@@ -88,31 +87,6 @@ class CrystalDatasetWrapper(Dataset):
         #Convert a list of ChemGraph samples into one PyG Batch.
         return Batch.from_data_list(samples)
 
-    def _build_from_csv(self) -> CrystalDataset:
-        # Build the processed cache from the raw CSV split.
-        if not self.raw_csv.exists():
-            raise RuntimeError(
-                f"Raw split not found at {self.raw_csv}. Pass download=True to fetch it first."
-            )
-
-        builder = CrystalDatasetBuilder.from_csv(
-            csv_path=str(self.raw_csv),
-            cache_path=str(self.processed_split_folder),
-            transforms=self.transforms,
-        )
-        return builder.build(
-            dataset_class=CrystalDataset,
-            dataset_transforms=self.dataset_transforms,
-        )
-
-    @staticmethod
-    def _validate_dataset_cache(dataset: CrystalDataset) -> None:
-        # Touch core cached arrays early so truncated .npy files fail here.
-        _ = len(dataset)
-        _ = dataset.pos
-        _ = dataset.cell
-        _ = dataset.atomic_numbers
-
     def _build(self) -> CrystalDataset:
         """Load processed cache or build it from raw CSV.
 
@@ -120,27 +94,27 @@ class CrystalDatasetWrapper(Dataset):
             MatterGen CrystalDataset.
         """
         if self.processed_split_folder.exists():
-            # Fast path: load cached arrays. If the cache is truncated or otherwise
-            # corrupted, remove just this split cache and rebuild from the raw CSV.
-            try:
-                builder = CrystalDatasetBuilder.from_cache_path(
-                    cache_path=str(self.processed_split_folder),
-                    transforms=self.transforms,
+            # Fast path: load cached arrays.
+            builder = CrystalDatasetBuilder.from_cache_path(
+                cache_path=str(self.processed_split_folder),
+                transforms=self.transforms,
+            )
+        else:
+            # Slow path: parse raw CSV and create processed cache.
+            if not self.raw_csv.exists():
+                raise RuntimeError(
+                    f"Raw split not found at {self.raw_csv}. Pass download=True to fetch it first."
                 )
-                dataset = builder.build(
-                    dataset_class=CrystalDataset,
-                    dataset_transforms=self.dataset_transforms,
-                )
-                self._validate_dataset_cache(dataset)
-                return dataset
-            except (EOFError, ValueError, OSError) as exc:
-                print(
-                    f"warning: corrupted processed cache for {self.dataset_name}/{self.split} "
-                    f"at {self.processed_split_folder}; rebuilding from raw CSV ({exc})"
-                )
-                shutil.rmtree(self.processed_split_folder, ignore_errors=True)
+            builder = CrystalDatasetBuilder.from_csv(
+                csv_path=str(self.raw_csv),
+                cache_path=str(self.processed_split_folder),
+                transforms=self.transforms,
+            )
 
-        return self._build_from_csv()
+        return builder.build(
+            dataset_class=CrystalDataset,
+            dataset_transforms=self.dataset_transforms,
+        )
 
     def download(self) -> None:
         """
