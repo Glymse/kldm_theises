@@ -117,34 +117,27 @@ class WrappedNormalSigmaNormMC:
 class WrappedNormalSigmaNormQuadrature:
     K_score: int = 3
     K_density: int = 40
-    num_grid_points: int = 4097
+    num_grid_points: int = 8193
     sigma_batch_size: int = 512
-    sigma_switch_factor: float = 5.0
-    tanh_beta: float = 3.0
+    # Small-sigma switch tuned from the Gaussian-limit quadrature error:
+    # once sigma is about one grid spacing, plain trapz is already accurate.
+    sigma_switch_factor: float = 1.0
     eps: float = 1e-8
 
     def __call__(self, sigma_grid: torch.Tensor) -> torch.Tensor:
         sigma_grid = sigma_grid.reshape(-1).clamp_min(self.eps)
         score_norm_grid = torch.empty_like(sigma_grid)
 
-        u_grid = torch.linspace(
-            -1.0,
-            1.0,
+        r_grid = torch.linspace(
+            -0.5,
+            0.5,
             self.num_grid_points,
             device=sigma_grid.device,
             dtype=sigma_grid.dtype,
         )
-        beta = torch.as_tensor(
-            self.tanh_beta,
-            device=sigma_grid.device,
-            dtype=sigma_grid.dtype,
-        )
-        r_grid = 0.5 * torch.tanh(beta * u_grid) / torch.tanh(beta).clamp_min(self.eps)
         r = r_grid[:, None]
         dr = (r_grid[1:] - r_grid[:-1]).clamp_min(self.eps)
-        center = self.num_grid_points // 2
-        center_spacing = dr[max(center - 1, 0): min(center + 2, dr.numel())].min()
-        sigma_switch = self.sigma_switch_factor * center_spacing
+        sigma_switch = self.sigma_switch_factor * dr[0]
         k_density = torch.arange(
             -self.K_density,
             self.K_density + 1,
@@ -199,12 +192,11 @@ class WrappedNormalSigmaNorm:
     K: int = 3
     estimator: Literal["quadrature", "mc"] = "quadrature"
     K_density: int | None = None
-    num_grid_points: int = 4097
+    num_grid_points: int = 8193
     sigma_batch_size: int = 512
     num_monte_carlo_samples: int = 20000
     sample_batch_size: int = 2048
-    sigma_switch_factor: float = 5.0
-    tanh_beta: float = 3.0
+    sigma_switch_factor: float = 1.0
     eps: float = 1e-8
 
     def __call__(self, sigma_grid: torch.Tensor) -> torch.Tensor:
@@ -224,7 +216,6 @@ class WrappedNormalSigmaNorm:
             num_grid_points=self.num_grid_points,
             sigma_batch_size=self.sigma_batch_size,
             sigma_switch_factor=self.sigma_switch_factor,
-            tanh_beta=self.tanh_beta,
             eps=self.eps,
         )(sigma_grid)
 
@@ -236,7 +227,8 @@ def compare_sigma_norm_estimators(
     K_score: int = 3,
     K_density: int = 40,
     mc_samples: int = 20000,
-    grid_points: int = 4097,
+    grid_points: int = 8193,
+    sigma_switch_factor: float = 1.0,
     eps: float = 1e-8,
 ) -> dict[str, torch.Tensor]:
     mc = WrappedNormalSigmaNormMC(
@@ -249,6 +241,7 @@ def compare_sigma_norm_estimators(
         K_score=K_score,
         K_density=K_density,
         num_grid_points=grid_points,
+        sigma_switch_factor=sigma_switch_factor,
         eps=eps,
     )(sigma_grid)
 
@@ -268,7 +261,8 @@ def run_sigma_norm_experiment(
     K_score: int = 3,
     K_density: int = 40,
     mc_samples: int = 20000,
-    grid_points: int = 4097,
+    grid_points: int = 8193,
+    sigma_switch_factor: float = 1.0,
     num_sigmas: int = 12,
     sigma_min: float = 1e-4,
     sigma_max: float = 0.25,
@@ -297,6 +291,7 @@ def run_sigma_norm_experiment(
         K_density=K_density,
         mc_samples=mc_samples,
         grid_points=grid_points,
+        sigma_switch_factor=sigma_switch_factor,
         eps=eps,
     )
 
@@ -306,16 +301,11 @@ def run_sigma_norm_experiment(
         f"K_score={K_score} K_density={K_density} "
         f"mc_samples={mc_samples} grid_points={grid_points}"
     )
-    beta = torch.as_tensor(3.0, device=resolved_device, dtype=dtype)
-    u_grid = torch.linspace(-1.0, 1.0, grid_points, device=resolved_device, dtype=dtype)
-    r_grid = 0.5 * torch.tanh(beta * u_grid) / torch.tanh(beta).clamp_min(eps)
+    r_grid = torch.linspace(-0.5, 0.5, grid_points, device=resolved_device, dtype=dtype)
     dr = torch.diff(r_grid).clamp_min(eps)
-    center = grid_points // 2
-    center_spacing = dr[max(center - 1, 0): min(center + 2, dr.numel())].min()
     print(
-        f"center_spacing={float(center_spacing):.6e} "
-        f"sigma_switch={5.0 * float(center_spacing):.6e} "
-        f"tanh_beta={float(beta):.1f}"
+        f"grid_spacing={float(dr[0]):.6e} "
+        f"sigma_switch={sigma_switch_factor * float(dr[0]):.6e}"
     )
     print(
         "mean_relative_error="

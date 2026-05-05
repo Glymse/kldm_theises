@@ -36,7 +36,7 @@ def build_model(config: dict[str, Any], device: torch.device) -> ModelKLDM:
         tdm_velocity_scale=cfg.get("tdm_velocity_scale"),
         tdm_sigma_norm_estimator=str(cfg.get("tdm_sigma_norm_estimator", "quadrature")),
         tdm_sigma_norm_density_K=cfg.get("tdm_sigma_norm_density_K"),
-        tdm_sigma_norm_grid_points=int(cfg.get("tdm_sigma_norm_grid_points", 4096)),
+        tdm_sigma_norm_grid_points=int(cfg.get("tdm_sigma_norm_grid_points", 8193)),
         tdm_sigma_norm_mc_samples=int(cfg.get("tdm_sigma_norm_mc_samples", 20000)),
         tdm_centered_sigma_norm_correction=bool(cfg.get("tdm_centered_sigma_norm_correction", False)),
         lattice_parameterization=str(cfg.get("lattice_parameterization", "eps")),
@@ -60,11 +60,22 @@ def build_ema(model: ModelKLDM, config: dict[str, Any]) -> EMA | None:
     cfg = _section(config, "ema")
     if not bool(cfg.get("enabled", True)):
         return None
-    return EMA(
-        model=model,
-        decay=float(cfg.get("decay", 0.999)),
-        start_epoch=int(cfg.get("start_epoch", 500)),
-    )
+    ema_type = str(cfg.get("type", "power" if "gamma" in cfg else "fixed"))
+
+    if ema_type == "power":
+        return EMA(
+            model=model,
+            gamma=float(cfg.get("gamma", 6.94)),
+        )
+
+    if ema_type == "fixed":
+        return EMA(
+            model=model,
+            decay=float(cfg.get("decay", 0.999)),
+            start_epoch=int(cfg.get("start_epoch", 500)),
+        )
+
+    raise ValueError(f"Unknown ema.type={ema_type!r}")
 
 
 def build_training_components(

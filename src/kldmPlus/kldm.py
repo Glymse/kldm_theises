@@ -38,7 +38,7 @@ class ModelKLDM(nn.Module):
         tdm_velocity_scale: float | None = None,
         tdm_sigma_norm_estimator: str = "quadrature",
         tdm_sigma_norm_density_K: int | None = None,
-        tdm_sigma_norm_grid_points: int = 4096,
+        tdm_sigma_norm_grid_points: int = 8193,
         tdm_sigma_norm_mc_samples: int = 20000,
         tdm_centered_sigma_norm_correction: bool = False,
         lattice_parameterization: str = "eps",
