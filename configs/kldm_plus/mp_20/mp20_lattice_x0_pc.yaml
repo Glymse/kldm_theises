@@ -9,6 +9,20 @@ dataset:
   num_workers: 1
   pin_memory: true
 
+time_sampler:
+  type: loss_second_moment
+  n_bins: 64
+  history_per_bin: 10
+  alpha: 0.5
+  min_prob: 0.002
+  max_prob: 0.10
+  velocity_weight: 0.7
+  lattice_weight: 0.3
+  use_importance_weights: false
+  clip_importance_weights: true
+  weight_clip_min: 0.5
+  weight_clip_max: 2.0
+
 model:
   eps: 1.0e-6
   lattice_parameterization: x0

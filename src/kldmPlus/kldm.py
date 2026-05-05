@@ -137,6 +137,7 @@ class ModelKLDM(nn.Module):
         self,
         batch: Data | Batch,
         t: torch.Tensor,
+        time_weight: torch.Tensor | None = None,
         debug: bool = False,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """
@@ -172,13 +173,34 @@ class ModelKLDM(nn.Module):
         out_v = preds["v"]
         out_l = preds["l"]
 
-        loss_l = self.mse_loss_per_sample(out_l, target_l).mean()
-        loss_v = self.mse_loss_per_sample(out_v, target_v).mean()
-        total_loss = loss_v + loss_l
+        loss_v_node = self.mse_loss_per_sample(out_v, target_v)
+        loss_l_graph = self.mse_loss_per_sample(out_l, target_l)
+        num_graphs = int(batch.num_graphs)
+
+        loss_v_sum = torch.zeros(num_graphs, device=device, dtype=loss_v_node.dtype)
+        loss_v_sum = loss_v_sum.index_add(0, index, loss_v_node)
+
+        counts = torch.bincount(index, minlength=num_graphs).to(
+            device=device,
+            dtype=loss_v_node.dtype,
+        ).clamp_min(1.0)
+
+        loss_v_graph = loss_v_sum / counts
+        loss_graph = loss_v_graph + loss_l_graph
+
+        if time_weight is not None:
+            weight = time_weight.reshape(-1).to(device=device, dtype=loss_graph.dtype)
+            total_loss = (weight * loss_graph).mean()
+        else:
+            total_loss = loss_graph.mean()
+
         metrics = {
             "loss": total_loss.detach(),
-            "loss_v": loss_v.detach(),
-            "loss_l": loss_l.detach(),
+            "loss_v": loss_v_graph.mean().detach(),
+            "loss_l": loss_l_graph.mean().detach(),
+            "loss_graph": loss_graph.detach(),
+            "loss_v_graph": loss_v_graph.detach(),
+            "loss_l_graph": loss_l_graph.detach(),
         }
 
         return total_loss, metrics

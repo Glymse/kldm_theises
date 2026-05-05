@@ -20,6 +20,10 @@ import yaml
 
 from kldmPlus.utils.device import get_default_device
 from kldmPlus.utils.time import sample_times
+from kldmPlus.utils.time_sampler import (
+    KLDMUniformTimeSampler,
+    LossSecondMomentTimeSampler,
+)
 
 try:
     import wandb
@@ -189,6 +193,7 @@ class ExperimentRunner:
         # Runtime objects: device, data, model, optimizer, EMA
         # -------------------------------------------------
         self.device = get_default_device()
+        self.time_sampler = self.build_time_sampler()
         self.train_loader, self.val_loader, self.lattice_transform = self.create_loaders()
 
         self.model, self.optimizer, self.ema = build_training_components(
@@ -212,6 +217,36 @@ class ExperimentRunner:
                 prefer_ema_weights=False,
             )
             self.start_epoch = int(checkpoint["epoch"])
+
+    def build_time_sampler(self):
+        cfg = dict(self.config.get("time_sampler", {}))
+        sampler_type = str(cfg.get("type", "uniform"))
+
+        if sampler_type == "uniform":
+            return KLDMUniformTimeSampler(
+                lower_bound=TIME_LOWER_BOUND,
+                seed=TRAIN_SEED,
+            )
+
+        if sampler_type == "loss_second_moment":
+            return LossSecondMomentTimeSampler(
+                n_bins=int(cfg.get("n_bins", 64)),
+                lower_bound=TIME_LOWER_BOUND,
+                history_per_bin=int(cfg.get("history_per_bin", 10)),
+                alpha=float(cfg.get("alpha", 0.5)),
+                min_prob=float(cfg.get("min_prob", 0.002)),
+                max_prob=float(cfg.get("max_prob", 0.10)),
+                velocity_weight=float(cfg.get("velocity_weight", 0.7)),
+                lattice_weight=float(cfg.get("lattice_weight", 0.3)),
+                use_importance_weights=bool(cfg.get("use_importance_weights", False)),
+                clip_importance_weights=bool(cfg.get("clip_importance_weights", True)),
+                weight_clip_min=float(cfg.get("weight_clip_min", 0.5)),
+                weight_clip_max=float(cfg.get("weight_clip_max", 2.0)),
+                seed=TRAIN_SEED,
+                device=self.device,
+            )
+
+        raise ValueError(f"Unknown time_sampler.type={sampler_type!r}")
 
     def create_loaders(self) -> tuple[DataLoader, DataLoader, Any]:
         from kldmPlus.data import CSPTask, resolve_data_root
@@ -269,7 +304,7 @@ class ExperimentRunner:
         self.model.train()
 
         total_loss_v = total_loss_l = 0.0
-        total_nodes = total_graphs = 0
+        total_graphs = 0
 
         for batch in self.train_loader:
             if STOP_REQUESTED:
@@ -277,36 +312,48 @@ class ExperimentRunner:
 
             batch = batch.to(self.device)
 
-            # One shared diffusion time per material graph.
-            t_graph = sample_times(batch, lower_bound=TIME_LOWER_BOUND)
+            sampled_time = self.time_sampler.sample(batch)
 
             self.optimizer.zero_grad(set_to_none=True)
-            loss, metrics = self.model.algorithm2_loss(batch=batch, t=t_graph, debug=False)
+            loss, metrics = self.model.algorithm2_loss(
+                batch=batch,
+                t=sampled_time.t,
+                time_weight=sampled_time.weights,
+                debug=False,
+            )
             loss.backward()
             self.optimizer.step()
+
+            if isinstance(self.time_sampler, LossSecondMomentTimeSampler):
+                self.time_sampler.update(
+                    bins=sampled_time.bins,
+                    loss_v_graph=metrics["loss_v_graph"],
+                    loss_l_graph=metrics["loss_l_graph"],
+                )
 
             if self.ema is not None:
                 self.ema.update(self.model, current_epoch=epoch)
 
-            total_loss_v += float(metrics["loss_v"]) * int(batch.pos.shape[0])
+            total_loss_v += float(metrics["loss_v"]) * int(batch.num_graphs)
             total_loss_l += float(metrics["loss_l"]) * int(batch.num_graphs)
-            total_nodes += int(batch.pos.shape[0])
             total_graphs += int(batch.num_graphs)
 
-        if total_nodes == 0 or total_graphs == 0:
+        if total_graphs == 0:
             raise RuntimeError("Training stopped before any batches were processed.")
 
-        return {
-            "loss_v": total_loss_v / total_nodes,
+        metrics = {
+            "loss_v": total_loss_v / total_graphs,
             "loss_l": total_loss_l / total_graphs,
-            "loss_weighted": (total_loss_v / total_nodes) + (total_loss_l / total_graphs),
+            "loss_weighted": (total_loss_v / total_graphs) + (total_loss_l / total_graphs),
         }
+        metrics.update(self.time_sampler.diagnostics())
+        return metrics
 
     def evaluate_loss(self) -> dict[str, float]:
         self.model.eval()
 
         total_loss_v = total_loss_l = 0.0
-        total_nodes = total_graphs = 0
+        total_graphs = 0
 
         for batch in self.val_loader:
             batch = batch.to(self.device)
@@ -317,18 +364,17 @@ class ExperimentRunner:
             with torch.no_grad():
                 _, metrics = self.model.algorithm2_loss(batch=batch, t=t_graph, debug=False)
 
-            total_loss_v += float(metrics["loss_v"]) * int(batch.pos.shape[0])
+            total_loss_v += float(metrics["loss_v"]) * int(batch.num_graphs)
             total_loss_l += float(metrics["loss_l"]) * int(batch.num_graphs)
-            total_nodes += int(batch.pos.shape[0])
             total_graphs += int(batch.num_graphs)
 
-        if total_nodes == 0 or total_graphs == 0:
+        if total_graphs == 0:
             raise RuntimeError("Validation loader is empty.")
 
         return {
-            "loss_v": total_loss_v / total_nodes,
+            "loss_v": total_loss_v / total_graphs,
             "loss_l": total_loss_l / total_graphs,
-            "loss_weighted": (total_loss_v / total_nodes) + (total_loss_l / total_graphs),
+            "loss_weighted": (total_loss_v / total_graphs) + (total_loss_l / total_graphs),
         }
 
     def run_sampling_evaluation(self) -> dict[str, float | int | None]:
@@ -536,6 +582,7 @@ class ExperimentRunner:
         print(f"run_experiment config={self.config_path}", flush=True)
         print(f"device={self.device.type} experiment={self.experiment_name}", flush=True)
         print(f"data_splits train={TRAIN_SPLIT} val={VAL_SPLIT}", flush=True)
+        print(f"time_sampler={self.config.get('time_sampler', {'type': 'uniform'})}", flush=True)
         print(f"sampler={self.sampler_cfg}", flush=True)
 
         epoch = self.start_epoch + 1
@@ -544,15 +591,16 @@ class ExperimentRunner:
                 train_metrics = self.train_epoch(epoch)
 
                 if epoch % self.train_every_epochs == 0:
-                    wandb.log(
-                        {
-                            "epoch": epoch,
-                            "train/loss_v": train_metrics["loss_v"],
-                            "train/loss_l": train_metrics["loss_l"],
-                            "train/loss_weighted": train_metrics["loss_weighted"],
-                        },
-                        step=epoch,
-                    )
+                    log_data = {
+                        "epoch": epoch,
+                        "train/loss_v": train_metrics["loss_v"],
+                        "train/loss_l": train_metrics["loss_l"],
+                        "train/loss_weighted": train_metrics["loss_weighted"],
+                    }
+                    for key, value in train_metrics.items():
+                        if key.startswith("time_sampler/"):
+                            log_data[key] = value
+                    wandb.log(log_data, step=epoch)
 
                     print(
                         f"epoch={epoch:04d} train_loss_weighted={train_metrics['loss_weighted']:.6f} "
