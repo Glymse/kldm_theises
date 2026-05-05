@@ -184,6 +184,8 @@ class ExperimentRunner:
         self.logging_cfg = dict(self.config["logging"])
         self.validation_cfg = dict(self.config["validation"])
         self.checkpoint_cfg = dict(self.config["checkpoint"])
+        self.wandb_project = str(self.logging_cfg.get("wandb_project", self.experiment_name))
+        self.wandb_run_name = str(self.logging_cfg.get("wandb_run_name", self.experiment_name))
         set_global_training_seed(TRAIN_SEED)
 
         self.train_every_epochs = int(self.logging_cfg["train_every_epochs"])
@@ -566,14 +568,14 @@ class ExperimentRunner:
         # Start one wandb run for the whole experiment.
         wandb_resume_id = self.checkpoint_cfg.get("wandb_resume_id")
         init_kwargs = {
-            "project": self.experiment_name,
+            "project": self.wandb_project,
             "config": self.config | {"start_epoch": self.start_epoch},
         }
         if wandb_resume_id:
             init_kwargs["id"] = str(wandb_resume_id)
             init_kwargs["resume"] = "must"
         else:
-            init_kwargs["name"] = build_run_name()
+            init_kwargs["name"] = self.wandb_run_name
 
         self.run = wandb.init(
             **init_kwargs,
