@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 from contextlib import nullcontext
 from datetime import datetime
+import random
 import signal
 from pathlib import Path
 import sys
@@ -12,6 +13,7 @@ from typing import Any, Mapping
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+import numpy as np
 import torch
 from torch.utils.data import DataLoader, Subset
 import yaml
@@ -31,6 +33,28 @@ TIME_LOWER_BOUND = 1e-3
 STOP_REQUESTED = False
 TRAIN_SPLIT = "train"
 VAL_SPLIT = "val"
+TRAIN_SEED = 2002
+
+
+def set_global_training_seed(seed: int = TRAIN_SEED) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+def _seed_worker_factory(base_seed: int):
+    def seed_worker(worker_id: int) -> None:
+        worker_seed = base_seed + worker_id
+        random.seed(worker_seed)
+        np.random.seed(worker_seed)
+        torch.manual_seed(worker_seed)
+
+    return seed_worker
 
 
 def _request_stop(_signum=None, _frame=None) -> None:
@@ -156,6 +180,7 @@ class ExperimentRunner:
         self.logging_cfg = dict(self.config["logging"])
         self.validation_cfg = dict(self.config["validation"])
         self.checkpoint_cfg = dict(self.config["checkpoint"])
+        set_global_training_seed(TRAIN_SEED)
 
         self.train_every_epochs = int(self.logging_cfg["train_every_epochs"])
         self.validate_every_epochs = int(self.validation_cfg["every_n_epochs"])
@@ -203,6 +228,8 @@ class ExperimentRunner:
         batch_size = int(dataset_cfg["batch_size"])
         num_workers = int(dataset_cfg["num_workers"])
         pin_memory = bool(dataset_cfg["pin_memory"])
+        train_generator = torch.Generator().manual_seed(TRAIN_SEED)
+        worker_init_fn = _seed_worker_factory(TRAIN_SEED)
 
         # Keep training/validation splits fixed so experiment metrics are always
         # comparable across runs.
@@ -214,6 +241,8 @@ class ExperimentRunner:
             num_workers=num_workers,
             pin_memory=pin_memory,
             download=True,
+            generator=train_generator,
+            worker_init_fn=worker_init_fn,
         )
 
         # Validation always uses the validation split, optionally with a fixed
@@ -230,6 +259,7 @@ class ExperimentRunner:
             shuffle=False,
             num_workers=num_workers,
             pin_memory=pin_memory,
+            worker_init_fn=worker_init_fn,
             collate_fn=val_dataset_full.collate_fn,
         )
 

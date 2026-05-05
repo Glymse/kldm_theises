@@ -222,6 +222,8 @@ class CSPTask:
         num_workers: int = 2,
         pin_memory: bool = False,
         download: bool = False,
+        generator=None,
+        worker_init_fn=None,
     ) -> DataLoader:
         """Create a PyTorch dataloader for CSP.
 
@@ -278,5 +280,7 @@ class CSPTask:
             shuffle=shuffle,
             num_workers=num_workers,
             pin_memory=pin_memory,
+            generator=generator,
+            worker_init_fn=worker_init_fn,
             collate_fn=dataset.collate_fn,
         )
